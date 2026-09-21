@@ -1,0 +1,35 @@
+[
+  {
+    "name": "Acme Corp",
+    "domain": "acme.com",
+    "careers_url": "https://boards.greenhouse.io/acme",
+    "portal_type": "Greenhouse",
+    "tech_stack": "Python, Go, PostgreSQL, Kubernetes, AWS",
+    "description": "Example technology company. Replace this file (backend/companies_config.json) with your own target organizations.",
+    "recent_news": "Example entry shipped so the app has a working catalog out of the box.",
+    "salary_insights": "Competitive market-rate compensation.",
+    "hiring_process": "Recruiter Screen -> Technical Screen -> Onsite."
+  },
+  {
+    "name": "Example Inc",
+    "domain": "example.com",
+    "careers_url": "https://jobs.lever.co/example",
+    "portal_type": "Lever",
+    "tech_stack": "TypeScript, Node.js, React, GCP",
+    "description": "Example company used for local demos and tests.",
+    "recent_news": "Placeholder organization — not a real employer.",
+    "salary_insights": "Varies by role and location.",
+    "hiring_process": "Intro Call -> Coding -> System Design -> Team Fit."
+  },
+  {
+    "name": "Sample Labs",
+    "domain": "samplelabs.dev",
+    "careers_url": "https://jobs.ashbyhq.com/samplelabs",
+    "portal_type": "Ashby",
+    "tech_stack": "Rust, Python, PyTorch, Kubernetes",
+    "description": "Placeholder research lab entry for the default catalog.",
+    "recent_news": "Placeholder organization — not a real employer.",
+    "salary_insights": "Varies by role and location.",
+    "hiring_process": "Recruiter Screen -> Technical Deep Dive -> Onsite."
+  }
+]

@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Job Alert Agent Copilot</title>
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <!-- Header Bar -->
+  <header class="sp-header">
+    <div class="sp-brand">
+      <div class="sp-logo-circle">⚡</div>
+      <div class="sp-brand-text">
+        <h1>Job Agent</h1>
+        <span class="sp-badge-version">v1.0 Copilot</span>
+      </div>
+    </div>
+    <div class="sp-status-indicator" id="sp-connection-status">
+      <span class="sp-status-dot"></span>
+      <span class="sp-status-text" id="sp-status-label">Checking...</span>
+    </div>
+  </header>
+
+  <!-- Navigation Tabs -->
+  <nav class="sp-nav">
+    <button class="sp-tab-btn active" data-tab="tab-analyzer">
+      <span>📊</span> Analyzer
+    </button>
+    <button class="sp-tab-btn" data-tab="tab-copilot">
+      <span>🤖</span> Copilot
+    </button>
+    <button class="sp-tab-btn" data-tab="tab-qa">
+      <span>🧠</span> Q&A Cache
+    </button>
+    <button class="sp-tab-btn" data-tab="tab-profile">
+      <span>⚙️</span> Profile
+    </button>
+  </nav>
+
+  <!-- Main Content Container -->
+  <main class="sp-content">
+    
+    <!-- Tab 1: Live Job Analyzer -->
+    <section class="sp-tab-pane active" id="tab-analyzer">
+      <div class="sp-card">
+        <div class="sp-card-header">
+          <h3>Active Page Inspector</h3>
+          <button class="sp-btn-secondary" id="btn-inspect-page">
+            <span>🔄 Inspect Current Tab</span>
+          </button>
+        </div>
+        
+        <div class="sp-job-card" id="sp-active-job-details">
+          <div class="sp-job-meta">
+            <span class="sp-meta-pill" id="sp-job-portal">Detecting Portal...</span>
+            <span class="sp-meta-pill" id="sp-job-company">Company</span>
+          </div>
+          <h2 class="sp-job-title" id="sp-job-title">Navigate to a job posting...</h2>
+          <p class="sp-job-desc-snippet" id="sp-job-snippet">Click "Inspect Current Tab" on any Greenhouse, Lever, Ashby, Workday, or custom page (LinkedIn works on demand).</p>
+        </div>
+
+        <div class="sp-match-section" id="sp-match-section">
+          <div class="sp-match-score-card">
+            <div class="sp-score-circle" id="sp-score-circle">--</div>
+            <div class="sp-score-info">
+              <h4>ATS Resume Match Score</h4>
+              <p id="sp-score-tier-label">Inspect page to compute alignment</p>
+            </div>
+          </div>
+          
+          <div class="sp-match-analysis" id="sp-match-analysis-text">
+            <!-- Dynamic analysis output -->
+          </div>
+        </div>
+
+        <!-- Telemetry & Form Analysis Section -->
+        <div class="sp-telemetry-banner" id="sp-telemetry-banner" style="display: none;">
+          <div class="sp-telemetry-header">
+            <span class="sp-telemetry-pill" id="sp-telemetry-summary">💡 Form Analysis: 0 fields detected</span>
+          </div>
+        </div>
+
+        <!-- Detected Screener Questions & Grounded Pitch Generator -->
+        <div class="sp-detected-questions-section" id="sp-detected-questions-section" style="display: none;">
+          <div class="sp-section-title" style="display: flex; align-items: center; justify-content: space-between;">
+            <div>
+              <h4>🎯 Custom Screener Questions (<span id="sp-detected-count">0</span>)</h4>
+              <span class="sp-hint-inline">Generate 3-5 line anti-slop pitch</span>
+            </div>
+            <button id="btn-draft-all-questions" class="sp-btn-secondary" style="font-size: 11px; padding: 4px 8px;">
+              <span>⚡ Draft All</span>
+            </button>
+          </div>
+          <div class="sp-detected-questions-list" id="sp-detected-questions-list">
+            <!-- Dynamic detected question cards -->
+          </div>
+        </div>
+
+        <div class="sp-action-cluster">
+          <div class="sp-autofill-options" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; font-size: 11px; color: var(--sp-text-muted, #94a3b8); width: 100%;">
+            <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none;" title="When unchecked (Safe Mode), autofill preserves pre-filled or previously edited data on the application form">
+              <input type="checkbox" id="sp-opt-overwrite" style="cursor: pointer; accent-color: #3b82f6;">
+              <span>Overwrite pre-filled fields</span>
+            </label>
+            <span class="sp-badge-safe" id="sp-autofill-mode-badge" style="font-size: 10px; padding: 2px 6px; border-radius: 4px; background: rgba(16, 185, 129, 0.15); color: #10b981; font-weight: 500;">🛡️ Safe Mode</span>
+          </div>
+          <button class="sp-btn-primary" id="btn-autofill-app">
+            <span>⚡ 1-Click Auto-Fill Application</span>
+          </button>
+          <button class="sp-btn-outline" id="btn-shortlist-job">
+            <span>⭐ Shortlist to Pipeline</span>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Tab 2: AI Career Copilot -->
+    <section class="sp-tab-pane" id="tab-copilot">
+      <div class="sp-chat-container">
+        <div class="sp-chat-messages" id="sp-chat-history">
+          <div class="sp-message sp-message-assistant">
+            <div class="sp-msg-bubble">
+              👋 Hi! I am your <strong>AI Career Copilot</strong>. I have direct context on your resume, active job search pipeline, and current tab. How can I help you land this role?
+            </div>
+          </div>
+        </div>
+
+        <div class="sp-quick-prompts">
+          <button class="sp-prompt-chip" data-prompt="Prepare STAR answers for this role">🎯 Interview Prep</button>
+          <button class="sp-prompt-chip" data-prompt="Tailor my resume bullets for this posting">📝 Tailor Resume</button>
+          <button class="sp-prompt-chip" data-prompt="Draft a cold outreach note to the recruiter">✉️ Outreach Note</button>
+        </div>
+
+        <div class="sp-chat-input-box">
+          <textarea id="sp-chat-input" placeholder="Ask about interview prep, tailoring, or pipeline..." rows="2"></textarea>
+          <button id="sp-chat-send-btn" class="sp-btn-send">➔</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Tab 3: Q&A Memory Bank -->
+    <section class="sp-tab-pane" id="tab-qa">
+      <div class="sp-card">
+        <div class="sp-card-header">
+          <h3>Application Q&A Cache</h3>
+          <span class="sp-pill" id="sp-qa-stats-count">0 Cached</span>
+        </div>
+        <input type="text" class="sp-input" id="sp-qa-search-input" placeholder="🔍 Search saved essay questions..." />
+        
+        <div class="sp-qa-list" id="sp-qa-list-container">
+          <!-- Dynamic Q&A cards -->
+          <div class="sp-empty-state">No cached answers found yet. Auto-fills will automatically learn here.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Tab 4: Settings & Profile -->
+    <section class="sp-tab-pane" id="tab-profile">
+      <div class="sp-card">
+        <div class="sp-card-header">
+          <h3>Candidate Autofill Profile</h3>
+          <button class="sp-btn-secondary" id="btn-sync-profile-api" title="Fetch decrypted resume & QA bank from backend">
+            <span>🔄 Sync from Backend</span>
+          </button>
+        </div>
+        <p class="sp-hint">Used to instantly fill ATS application forms on Greenhouse, Lever, Ashby, Workday, custom company portals, and LinkedIn (on demand).</p>
+
+        <div class="sp-form-row">
+          <div class="sp-form-group">
+            <label>First Name / Given Name</label>
+            <input type="text" class="sp-input" id="prof-firstname" placeholder="e.g. Alex Jordan" />
+          </div>
+          <div class="sp-form-group">
+            <label>Last Name / Family Name</label>
+            <input type="text" class="sp-input" id="prof-lastname" placeholder="e.g. Morgan" />
+          </div>
+        </div>
+
+        <div class="sp-form-group">
+          <label>Full Legal Name</label>
+          <input type="text" class="sp-input" id="prof-fullname" placeholder="e.g. Alex Jordan Morgan" />
+        </div>
+
+        <div class="sp-form-row">
+          <div class="sp-form-group">
+            <label>Email Address</label>
+            <input type="email" class="sp-input" id="prof-email" placeholder="jane@example.com" />
+          </div>
+          <div class="sp-form-group">
+            <label>Phone Number</label>
+            <input type="tel" class="sp-input" id="prof-phone" placeholder="+1 (555) 019-2834" />
+          </div>
+        </div>
+
+        <div class="sp-form-group">
+          <label>Current Location / City</label>
+          <input type="text" class="sp-input" id="prof-location" placeholder="e.g. San Francisco, CA" />
+        </div>
+
+        <div class="sp-form-group">
+          <label>LinkedIn URL</label>
+          <input type="url" class="sp-input" id="prof-linkedin" placeholder="https://linkedin.com/in/janedoe" />
+        </div>
+
+        <div class="sp-form-group">
+          <label>GitHub URL</label>
+          <input type="url" class="sp-input" id="prof-github" placeholder="https://github.com/janedoe" />
+        </div>
+
+        <div class="sp-form-group">
+          <label>Portfolio / Website</label>
+          <input type="url" class="sp-input" id="prof-portfolio" placeholder="https://janedoe.dev" />
+        </div>
+
+        <div class="sp-form-group">
+          <label>CV / Resume Link (Google Drive / Cloud URL)</label>
+          <input type="url" class="sp-input" id="prof-resumelink" placeholder="https://drive.google.com/... or https://..." />
+        </div>
+
+        <div class="sp-form-row">
+          <div class="sp-form-group">
+            <label>Current Company</label>
+            <input type="text" class="sp-input" id="prof-company" placeholder="e.g. Acme Corp" />
+          </div>
+          <div class="sp-form-group">
+            <label>Current Title</label>
+            <input type="text" class="sp-input" id="prof-title" placeholder="e.g. Principal Software Engineer" />
+          </div>
+        </div>
+
+        <div class="sp-form-row">
+          <div class="sp-form-group">
+            <label>Years of Experience</label>
+            <input type="text" class="sp-input" id="prof-experience" placeholder="e.g. 10+" />
+          </div>
+          <div class="sp-form-group">
+            <label>Notice Period / Availability</label>
+            <input type="text" class="sp-input" id="prof-noticeperiod" placeholder="e.g. Immediately / 30 Days" />
+          </div>
+        </div>
+
+        <div class="sp-form-row">
+          <div class="sp-form-group">
+            <label>Authorized to work in region?</label>
+            <select class="sp-input" id="prof-auth">
+              <option value="Yes">Yes</option>
+              <option value="No">No</option>
+            </select>
+          </div>
+          <div class="sp-form-group">
+            <label>Require Sponsorship?</label>
+            <select class="sp-input" id="prof-sponsorship">
+              <option value="No">No</option>
+              <option value="Yes">Yes</option>
+            </select>
+          </div>
+        </div>
+
+        <h3 style="margin-top: 20px;">Runtime & Agent Mode</h3>
+        <div class="sp-form-group">
+          <label>FastAPI Backend URL</label>
+          <input type="text" class="sp-input" id="cfg-backend-url" value="http://localhost:8000" />
+        </div>
+
+        <div class="sp-form-group">
+          <label>Backend API Key (X-API-Key)</label>
+          <input type="password" class="sp-input" id="cfg-api-key" placeholder="Enter API Key (from .api_key)" />
+        </div>
+
+        <div class="sp-form-group">
+          <label>Execution Mode</label>
+          <select class="sp-input" id="cfg-mode">
+            <option value="connected">Connected Mode (FastAPI + Local Database)</option>
+            <option value="standalone">Standalone Mode (100% On-Device in Chrome)</option>
+          </select>
+        </div>
+
+        <button class="sp-btn-primary" id="btn-save-profile" style="margin-top: 15px;">
+          <span>💾 Save Profile & Settings</span>
+        </button>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Notification Toast -->
+  <div class="sp-toast" id="sp-toast">Settings Saved!</div>
+
+  <!-- Scripts -->
+  <script src="../js/runtime-adapter.js"></script>
+  <script src="sidepanel.js"></script>
+</body>
+</html>

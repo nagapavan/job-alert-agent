@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "Job Alert Agent - AI Career Copilot & ATS Autofill",
+  "version": "1.0.0",
+  "description": "AI Career Copilot and 1-Click ATS Application Autofiller with dynamic job match scoring and STAR interview coaching.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "Open Job Agent Copilot"
+  },
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "tabs",
+    "scripting",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "http://localhost:8000/*",
+    "http://127.0.0.1:8000/*",
+    "https://*.greenhouse.io/*",
+    "https://*.lever.co/*",
+    "https://*.ashbyhq.com/*",
+    "https://*.myworkdayjobs.com/*",
+    "https://*.google.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.greenhouse.io/*",
+        "https://*.lever.co/*",
+        "https://*.ashbyhq.com/*",
+        "https://*.myworkdayjobs.com/*"
+      ],
+      "js": ["content/ats-autofill.js"],
+      "css": ["content/ats-autofill.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -1,0 +1,2190 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Job Alert Agent - AI Job Search & Auto-Apply Assistant</title>
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="icon"
+        href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💼</text></svg>">
+    <link rel="stylesheet" href="styles.css?v=20260907_8.7">
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div>
+                <div class="logo-area">
+                    <span class="logo-indicator"></span>
+                    <div>
+                        <h1>JobAgent <span class="version-tag">AI</span></h1>
+                        <span class="logo-subtitle">Autonomous Job Search &amp; Application Assistant</span>
+                    </div>
+                </div>
+                <nav class="nav-menu">
+                    <button class="nav-item active" data-section="dashboard">
+                        <span class="nav-icon">📊</span> Job Feed & Alerts
+                    </button>
+                    <button class="nav-item" data-section="tracker">
+                        <span class="nav-icon">📋</span> Application Tracker
+                    </button>
+                    <button class="nav-item" data-section="companies">
+                        <span class="nav-icon">🏢</span> Target Companies
+                    </button>
+                    <button class="nav-item" data-section="resume">
+                        <span class="nav-icon">👤</span> Profile & Resume
+                    </button>
+                    <button class="nav-item" data-section="tasks">
+                        <span class="nav-icon">⚡</span> Background Jobs &amp; Queue
+                    </button>
+                    <button class="nav-item" data-section="settings">
+                        <span class="nav-icon">⚙️</span> Settings
+                    </button>
+                </nav>
+            </div>
+
+            <div class="sidebar-footer">
+                <div class="llm-info">
+                    <span class="badge active" id="llm-status-badge">AI Engine: Online</span>
+                    <span class="badge" id="llm-queue-badge"
+                        style="display:none; margin-top:4px; font-size:11px; background:rgba(137,180,250,0.15); color:#89b4fa;">Queue:
+                        0 tasks</span>
+
+                    <div id="llm-token-usage-card" class="token-usage-card" onclick="openTokenAnalyticsModal()"
+                        title="Click to view full Token & Cost Analytics">
+                        <div style="display:flex; justify-content:space-between; align-items:center; font-size:11px;">
+                            <span style="color:#a6adc8; display:flex; align-items:center; gap:4px;">
+                                ⚡ LLM Tokens:
+                                <button type="button" onclick="event.stopPropagation(); fetchTokenUsage(true);"
+                                    title="Refresh token counts"
+                                    style="background:none; border:none; color:#89b4fa; cursor:pointer; font-size:11px; padding:0 2px; line-height:1;">🔄</button>
+                            </span>
+                            <span id="sidebar-token-count" style="color:#cdd6f4; font-weight:700;">0 (0 reqs)</span>
+                        </div>
+                        <div
+                            style="display:flex; justify-content:space-between; align-items:center; font-size:11px; margin-top:3px;">
+                            <span style="color:#a6adc8;">💰 Local Cost:</span>
+                            <span style="color:#a6e3a1; font-weight:700;">$0.00 (<span id="sidebar-savings-usd">+$0.00
+                                    saved</span>)</span>
+                        </div>
+                    </div>
+
+                    <p class="profile-note">Profile: <code>.chrome_profile/</code></p>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Workspace -->
+        <main class="main-content">
+            <!-- Header Area -->
+            <header class="app-header">
+                <div class="welcome-text">
+                    <h2 id="page-title">Job Feed & Discovery</h2>
+                    <p id="page-subtitle">Real-time alerts, ATS match scores, due diligence checks, and assisted
+                        applications.</p>
+                </div>
+                <div class="header-actions">
+                    <div id="header-task-pill" class="header-task-pill hidden" onclick="navigateToSection('tasks')"
+                        title="Click to view Active Background Tasks">
+                        <span class="spinner-dot"></span>
+                        <span id="header-task-pill-text">1 Task Active</span>
+                    </div>
+                    <button id="btn-operations-log" class="btn btn-outline" onclick="openOperationsModal()"
+                        title="View persistent log of all syncs, scrapes, and form fills">
+                        <span class="btn-icon">📜</span> Operations Log
+                    </button>
+                    <button id="btn-login-portals" class="btn btn-outline" onclick="openBrowserAuthModal()"
+                        title="Launch dedicated browser to sign in to LinkedIn and Job Portals">
+                        <span class="btn-icon">🔐</span> Login to Portals
+                    </button>
+                </div>
+            </header>
+
+            <!-- GUIDED ONBOARDING WIZARD -->
+            <section id="onboarding-section" class="content-section hidden">
+                <div class="onboarding-container">
+                    <div class="onboarding-header">
+                        <div class="onboarding-badge">🚀 Welcome & Setup</div>
+                        <h2>Let's Configure Your Target Career Profile</h2>
+                        <p>Upload your resume and choose your target roles and location preferences to discover
+                            high-match opportunities without generic noise.</p>
+                    </div>
+
+                    <!-- Step Progress Indicator -->
+                    <div class="wizard-steps-indicator">
+                        <div class="step-node active" id="step-node-1">
+                            <span class="step-num">1</span>
+                            <span class="step-name">Resume & Skills</span>
+                        </div>
+                        <div class="step-line" id="step-line-1"></div>
+                        <div class="step-node" id="step-node-2">
+                            <span class="step-num">2</span>
+                            <span class="step-name">Roles & Location</span>
+                        </div>
+                        <div class="step-line" id="step-line-2"></div>
+                        <div class="step-node" id="step-node-3">
+                            <span class="step-num">3</span>
+                            <span class="step-name">Target Companies</span>
+                        </div>
+                    </div>
+
+                    <!-- Step 1: Resume Upload & Skill Confirmation -->
+                    <div id="onboarding-step-1" class="wizard-step-pane active">
+                        <div class="onboarding-card">
+                            <h3>📄 Step 1: Upload Your Active Resume</h3>
+                            <p class="step-desc">Drag & drop your PDF or Markdown resume. We will parse your technical
+                                background locally and encrypt your profile.</p>
+
+                            <div class="upload-zone" id="onboarding-upload-zone">
+                                <div class="upload-icon">📂</div>
+                                <h4>Drop your resume file here</h4>
+                                <p>Supports .pdf, .txt, .md (Stored with military-grade AES-256 / Fernet encryption)</p>
+                                <input type="file" id="onboarding-resume-input" accept=".pdf,.txt,.md"
+                                    style="display:none;">
+                                <button type="button" class="btn btn-outline"
+                                    onclick="document.getElementById('onboarding-resume-input').click()">
+                                    Browse Files
+                                </button>
+                            </div>
+
+                            <div id="onboarding-resume-loading" class="upload-loading hidden">
+                                <div class="spinner"></div>
+                                <p>Extracting profile and parsing technical skills...</p>
+                            </div>
+
+                            <div id="onboarding-resume-preview" class="onboarding-preview-box hidden">
+                                <div class="preview-header">
+                                    <h4>✓ Parsed Candidate Profile</h4>
+                                    <span class="badge verified" id="onboarding-resume-filename">resume.pdf</span>
+                                </div>
+                                <div class="onboarding-fields-grid">
+                                    <div class="form-group">
+                                        <label>Full Name</label>
+                                        <input type="text" id="onboarding-name" class="form-input"
+                                            placeholder="Your Name">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Email Address</label>
+                                        <input type="email" id="onboarding-email" class="form-input"
+                                            placeholder="you@example.com">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Total Experience</label>
+                                        <input type="text" id="onboarding-experience" class="form-input"
+                                            placeholder="e.g. 8+ Years">
+                                    </div>
+                                </div>
+
+                                <div class="form-group" style="margin-top: 14px;">
+                                    <label>Confirmed Technical Skills (Click ✕ to remove, type below to add)</label>
+                                    <div class="skills-tags-editable" id="onboarding-skills-tags">
+                                        <!-- Editable skill tags -->
+                                    </div>
+                                    <div class="skill-input-row">
+                                        <input type="text" id="onboarding-new-skill-input"
+                                            placeholder="Add technical skill (e.g. Distributed Systems, Kubernetes)..."
+                                            onkeydown="if(event.key==='Enter'){event.preventDefault(); addOnboardingSkill();}">
+                                        <button type="button" class="btn btn-sm btn-outline"
+                                            onclick="addOnboardingSkill()">+ Add Skill</button>
+                                    </div>
+                                </div>
+
+                                <div class="wizard-actions">
+                                    <button type="button" class="btn btn-primary"
+                                        onclick="proceedToOnboardingStep2()">Next: Target Roles & Locations →</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Step 2: Target Criteria Selection -->
+                    <div id="onboarding-step-2" class="wizard-step-pane hidden">
+                        <div class="onboarding-card">
+                            <h3>🎯 Step 2: Target Roles & Geographic Preferences</h3>
+                            <p class="step-desc">Specify exactly which opportunities to scan for. The agent will ignore
+                                non-matching jobs to protect API token budgets.</p>
+
+                            <div class="form-group">
+                                <label><span class="pref-icon">🎯</span> Target Roles & Keywords (Multi-Select)</label>
+                                <div class="roles-chips-container" id="onboarding-roles-chips">
+                                    <!-- Dynamic role chips -->
+                                </div>
+                                <div class="role-input-group">
+                                    <input type="text" id="onboarding-role-input"
+                                        placeholder="Type a role keyword and press Enter (e.g. Staff Backend, Distributed Systems)..."
+                                        onkeydown="if(event.key==='Enter'){event.preventDefault(); handleAddRoleFromOnboardingInput();}">
+                                    <button type="button" class="btn btn-sm btn-outline"
+                                        onclick="handleAddRoleFromOnboardingInput()">+ Add</button>
+                                </div>
+                                <div class="quick-roles-pills">
+                                    <span class="pills-label">Quick Add:</span>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Staff Software Engineer')">+ Staff Engineer</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Principal Engineer')">+ Principal Engineer</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Backend Engineer')">+ Backend</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Distributed Systems')">+ Distributed Systems</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Full Stack Engineer')">+ Full Stack</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Platform Engineer')">+ Platform</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Machine Learning Engineer')">+ AI / ML</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Engineering Manager')">+ Eng Manager</button>
+                                </div>
+                            </div>
+
+                            <div class="form-group" style="margin-top: 14px;">
+                                <label><span class="pref-icon">🏙️</span> Target Cities & Tech Hubs
+                                    (Multi-Select)</label>
+                                <div class="roles-chips-container" id="onboarding-cities-chips">
+                                    <!-- Dynamic city chips -->
+                                </div>
+                                <div class="foreign-cities-notice" id="onboarding-foreign-cities-notice"
+                                    style="display:none;">
+                                    <!-- Populated when selected cities fall outside the active country -->
+                                </div>
+                                <div class="role-input-group">
+                                    <input type="text" id="onboarding-city-input" list="city-suggestions-list"
+                                        placeholder="Type a city name or state (e.g. Bengaluru, San Francisco, London)..."
+                                        onkeydown="if(event.key==='Enter'){event.preventDefault(); handleAddCityFromOnboardingInput();}">
+                                    <button type="button" class="btn btn-sm btn-outline"
+                                        onclick="handleAddCityFromOnboardingInput()">+ Add City</button>
+                                </div>
+                                <div class="quick-roles-pills" id="onboarding-quick-cities-pills">
+                                    <!-- Populated dynamically based on selected country -->
+                                </div>
+                            </div>
+
+                            <div class="form-row-2col" style="margin-top: 14px;">
+                                <div class="form-group">
+                                    <label>📍 Target Country / Region</label>
+                                    <select id="onboarding-target-country" class="form-select"
+                                        onchange="handleCountrySelectChange(this.value)">
+                                        <!-- Populated dynamically via app.js -->
+                                    </select>
+                                </div>
+
+                                <div class="form-group">
+                                    <label>💼 Work Mode / Job Type</label>
+                                    <select id="onboarding-work-mode" class="form-select">
+                                        <option value="all" selected>🌐 Any (incl. Remote)</option>
+                                        <option value="remote">🏠 100% Remote</option>
+                                        <option value="hybrid">🏢 Hybrid</option>
+                                        <option value="onsite">📍 Onsite</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div class="wizard-actions">
+                                <button type="button" class="btn btn-outline" onclick="goToOnboardingStep(1)">←
+                                    Back</button>
+                                <button type="button" class="btn btn-primary" onclick="proceedToOnboardingStep3()">Next:
+                                    Target Companies →</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Step 3: Target Companies Selection & Launch -->
+                    <div id="onboarding-step-3" class="wizard-step-pane hidden">
+                        <div class="onboarding-card">
+                            <h3>🏢 Step 3: Select Target Organizations</h3>
+                            <p class="step-desc">Choose which companies to monitor first. You can add or import more
+                                anytime from the Target Companies tab.</p>
+
+                            <div class="onboarding-companies-grid" id="onboarding-companies-list">
+                                <!-- Company items with checkboxes are rendered dynamically -->
+                            </div>
+
+                            <div class="onboarding-add-company-row">
+                                <input type="text" id="onboarding-company-input"
+                                    placeholder="Add a target company (e.g. Acme Corp)"
+                                    onkeydown="if(event.key==='Enter'){event.preventDefault();addOnboardingCompanyFromInput();}">
+                                <button type="button" class="btn btn-outline"
+                                    onclick="addOnboardingCompanyFromInput()">+ Add</button>
+                            </div>
+
+                            <div class="onboarding-opt-row">
+                                <label class="onboarding-chk-label">
+                                    <input type="checkbox" id="onboarding-clean-slate-chk" checked>
+                                    <span><strong>Clean Slate:</strong> Purge existing generic jobs cache and populate
+                                        only selected companies</span>
+                                </label>
+                            </div>
+
+                            <div class="wizard-actions">
+                                <button type="button" class="btn btn-outline" onclick="goToOnboardingStep(2)">←
+                                    Back</button>
+                                <button type="button" class="btn btn-success btn-lg"
+                                    onclick="finishOnboardingAndScan()">
+                                    🚀 Launch Automated Job Discovery
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- SECTION 1: Job Feed & Dashboard -->
+            <section id="dashboard-section" class="content-section">
+                <!-- Discovery Radar & Channels Toolbar -->
+                <div class="discovery-radar-bar">
+                    <div class="discovery-radar-title">
+                        <span class="discovery-radar-pulse"></span>
+                        <div>
+                            <h4>⚡ Live Job Discovery Radar</h4>
+                            <p>Scan direct career boards, sync subscribed LinkedIn alerts, and rank hiring-intent
+                                opportunities.</p>
+                        </div>
+                    </div>
+                    <div class="discovery-radar-actions">
+                        <button id="trigger-sync-all-btn" class="btn btn-secondary" onclick="triggerSyncAll()"
+                            title="Run every enabled discovery & application-status channel in one background task">
+                            <span class="btn-icon">🔁</span> Sync All (<span id="sync-all-enabled-count">0</span>
+                            enabled)
+                        </button>
+                        <button id="trigger-scrape-btn" class="btn btn-primary"
+                            title="Scan configured target company career boards for new openings">
+                            <span class="btn-icon">⚡</span> Scan Portals
+                        </button>
+                        <button id="btn-stop-scrape" class="btn btn-danger btn-sm hidden" onclick="stopScrape()">
+                            🛑 Stop Scan
+                        </button>
+                        <button id="trigger-linkedin-sync-btn" class="btn btn-outline"
+                            title="Fetch live LinkedIn subscribed job alerts and synchronize saved jobs">
+                            <span class="btn-icon">🔗</span> Sync LinkedIn
+                        </button>
+                        <button id="btn-stop-linkedin-sync" class="btn btn-danger btn-sm hidden"
+                            onclick="stopLinkedInSync()">
+                            🛑 Stop Sync
+                        </button>
+                        <button id="trigger-google-jobs-btn" class="btn btn-outline" onclick="openGoogleJobsModal()"
+                            title="Discover open opportunities directly from Google for Jobs (ibp=htl;jobs)">
+                            <span class="btn-icon">🌐</span> Google Jobs
+                        </button>
+                        <button id="trigger-radar-btn" class="btn btn-outline" onclick="openOpportunityRadarModal()"
+                            title="Rank hiring-intent opportunities from your structured sources (LinkedIn alerts/recommendations, ATS, Google Jobs)">
+                            <span class="btn-icon">🛰️</span> Opportunity Radar
+                        </button>
+                        <button id="btn-clean-feed" class="btn btn-outline" onclick="cleanSystemFeedCache()"
+                            title="Purge unapplied generic jobs from cache">
+                            <span class="btn-icon">🧹</span> Clean Cache
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Summary KPI Cards -->
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-header">
+                            <h3>Active Pipeline</h3>
+                            <span class="stat-icon">🎯</span>
+                        </div>
+                        <p class="stat-value text-primary" id="stat-active">0</p>
+                        <span class="stat-desc">Applications in progress</span>
+                    </div>
+
+                    <div class="stat-card">
+                        <div class="stat-header">
+                            <h3>High Match Roles</h3>
+                            <span class="stat-icon">⭐</span>
+                        </div>
+                        <p class="stat-value text-success" id="stat-high-match">0</p>
+                        <span class="stat-desc">Match score ≥ 70%</span>
+                    </div>
+
+                    <div class="stat-card">
+                        <div class="stat-header">
+                            <h3>Due Diligence Alerts</h3>
+                            <span class="stat-icon">⚠️</span>
+                        </div>
+                        <p class="stat-value text-warning" id="stat-ghost">0</p>
+                        <span class="stat-desc">Ghost / Reposted role alerts</span>
+                    </div>
+
+                    <div class="stat-card">
+                        <div class="stat-header">
+                            <h3>Verified Genuine</h3>
+                            <span class="stat-icon">🛡️</span>
+                        </div>
+                        <p class="stat-value text-accent" id="stat-genuine">0</p>
+                        <span class="stat-desc">Verified direct on career boards</span>
+                    </div>
+                </div>
+
+                <!-- Job Listings Filter & Container -->
+                <div class="listings-container">
+                    <!-- Compact Active Target Criteria Bar -->
+                    <div class="active-criteria-bar">
+                        <div class="criteria-left">
+                            <span class="criteria-badge-icon">🎯</span>
+                            <div class="criteria-tags" id="criteria-summary-tags">
+                                <span class="criteria-tag"><strong>Roles:</strong> All</span>
+                                <span class="criteria-tag"><strong>Location:</strong> Global</span>
+                                <span class="criteria-tag"><strong>Mode:</strong> Any</span>
+                            </div>
+                        </div>
+                        <div class="criteria-actions">
+                            <button id="btn-toggle-criteria-filter" class="btn btn-sm criteria-btn active-filter"
+                                onclick="toggleCriteriaFilter()"
+                                title="Toggle filtering feed by your target preferences vs showing all opportunities">
+                                🎯 <span id="criteria-filter-btn-text">Filter: Active</span>
+                            </button>
+                            <button class="btn btn-sm btn-outline criteria-btn" onclick="navigateToSection('settings')"
+                                title="Edit target roles, cities, and preferences in Settings">
+                                ⚙️ Edit Preferences
+                            </button>
+                            <button class="btn btn-sm btn-primary criteria-btn" onclick="saveAndScanTargetedJobs()"
+                                title="Scan career boards for positions matching your target roles and cities">
+                                ⚡ Scan Feed
+                            </button>
+                            <button class="btn btn-sm btn-outline criteria-btn" onclick="pruneNonMatchingJobs()"
+                                title="Prune non-matching roles from your feed">
+                                🧹 Prune
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="panel-header">
+                        <div class="search-box">
+                            <input type="text" id="job-search-input"
+                                placeholder="Search by job title, company, or keyword...">
+                        </div>
+                        <div class="filter-group">
+                            <select id="status-filter" class="filter-select">
+                                <option value="all">All Active Opportunities</option>
+                                <option value="Shortlisted">⭐ Shortlisted</option>
+                                <option value="To Apply">⚪ To Apply</option>
+                                <option value="Applied">🚀 Applied</option>
+                                <option value="Screening">📋 Screening</option>
+                                <option value="Interview">🎙️ Interview</option>
+                                <option value="Offered">🎉 Offered</option>
+                                <option value="Rejected">📫 Rejected</option>
+                                <option value="Not Interested">🚫 Not Interested (Dismissed)</option>
+                            </select>
+                            <select id="score-filter" class="filter-select">
+                                <option value="0">All Match Scores</option>
+                                <option value="80">High Match (80%+)</option>
+                                <option value="60">Good Match (60%+)</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Quick Feed Navigation Tabs -->
+                    <div class="feed-tabs-row" id="feed-tabs-container">
+                        <button class="feed-tab-btn active" data-feed-tab="all" onclick="setFeedTab('all')">
+                            🌐 Active Feed (<span id="feed-count-all">0</span>)
+                        </button>
+                        <button class="feed-tab-btn" data-feed-tab="Shortlisted" onclick="setFeedTab('Shortlisted')">
+                            ⭐ Shortlisted (<span id="feed-count-shortlisted">0</span>)
+                        </button>
+                        <button class="feed-tab-btn" data-feed-tab="To Apply" onclick="setFeedTab('To Apply')">
+                            ⚪ To Apply (<span id="feed-count-to-apply">0</span>)
+                        </button>
+                        <button class="feed-tab-btn" data-feed-tab="Applied" onclick="setFeedTab('Applied')">
+                            🚀 Applied (<span id="feed-count-applied">0</span>)
+                        </button>
+                        <button class="feed-tab-btn" data-feed-tab="Not Interested"
+                            onclick="setFeedTab('Not Interested')">
+                            🚫 Dismissed (<span id="feed-count-dismissed">0</span>)
+                        </button>
+                    </div>
+
+                    <!-- Floating Bulk Action & Cart Bar -->
+                    <div id="batch-action-bar" class="batch-action-bar hidden">
+                        <div class="batch-info">
+                            <span class="batch-icon">🛒</span>
+                            <span id="batch-selected-count">0</span> jobs selected in Apply Cart
+                        </div>
+                        <div class="batch-options-row">
+                            <label class="token-toggle-label" title="Generate customized resume bullet recommendations">
+                                <input type="checkbox" id="batch-opt-resume" checked>
+                                <span>⚡ Tailor Resume</span>
+                            </label>
+                            <label class="token-toggle-label" title="Draft tailored cover letters">
+                                <input type="checkbox" id="batch-opt-cover" checked>
+                                <span>✉️ Cover Letter</span>
+                            </label>
+                            <label class="token-toggle-label" title="Draft LinkedIn recruiter outreach note">
+                                <input type="checkbox" id="batch-opt-outreach" checked>
+                                <span>💬 Cold Outreach</span>
+                            </label>
+                        </div>
+                        <div class="batch-actions">
+                            <button class="btn btn-sm btn-outline" onclick="bulkSetStatus('Shortlisted')">
+                                ⭐ Shortlist
+                            </button>
+                            <button class="btn btn-sm btn-secondary" onclick="bulkTailorSelectedJobs()">
+                                ⚡ Prepare Materials
+                            </button>
+                            <button class="btn btn-sm btn-success" onclick="bulkApplySelectedJobs()">
+                                🚀 Apply Now
+                            </button>
+                            <button class="btn btn-sm btn-outline"
+                                style="color:#f38ba8; border-color:rgba(243,139,168,0.4);"
+                                onclick="bulkSetStatus('Not Interested')"
+                                title="Hide selected positions from active feed">
+                                🚫 Dismiss
+                            </button>
+                            <button class="btn btn-sm btn-outline" onclick="clearBatchSelection()">
+                                ✕ Clear
+                            </button>
+                        </div>
+                    </div>
+
+                    <div id="job-feed" class="job-list-feed">
+                        <!-- Job Cards rendered via app.js -->
+                    </div>
+                </div>
+            </section>
+
+            <!-- SECTION 2: Application Tracker -->
+            <section id="tracker-section" class="content-section hidden">
+                <div class="panel-container">
+                    <div class="panel-header-row">
+                        <div>
+                            <h3>Application Lifecycle Pipeline</h3>
+                            <p class="section-desc">Track active submissions, interview stages, and decision updates
+                                synchronized across portals.</p>
+                        </div>
+                        <div class="panel-actions-group">
+                            <button id="trigger-external-sync-btn" class="btn btn-primary"
+                                onclick="triggerExternalSync()"
+                                title="Synchronize candidate application statuses across Hirist.tech, Greenhouse, and decision emails">
+                                <span class="btn-icon">🔄</span> Sync Application Statuses
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="tracker-filter-bar">
+                        <div class="tab-group">
+                            <button class="tab-btn active" data-filter="in_progress">🚀 Applied / In Progress (<span
+                                    id="tracker-in-progress-count">0</span>)</button>
+                            <button class="tab-btn" data-filter="shortlisted">⭐ Shortlisted (<span
+                                    id="tracker-shortlisted-count">0</span>)</button>
+                            <button class="tab-btn" data-filter="to_apply">⚪ To Apply (<span
+                                    id="tracker-to-apply-count">0</span>)</button>
+                            <button class="tab-btn" data-filter="all">All Opportunities (<span
+                                    id="tracker-all-count">0</span>)</button>
+                            <button class="tab-btn" data-filter="rejected">📫 Archived / Rejected (<span
+                                    id="tracker-rejected-count">0</span>)</button>
+                            <button class="tab-btn" data-filter="not_interested">🚫 Dismissed (<span
+                                    id="tracker-dismissed-count">0</span>)</button>
+                        </div>
+                    </div>
+
+                    <div id="tracker-list" class="tracker-list-container">
+                        <!-- Tracker Cards rendered via app.js -->
+                    </div>
+                </div>
+            </section>
+
+            <!-- SECTION 3: Target Companies -->
+            <section id="companies-section" class="content-section hidden">
+                <div class="panel-container">
+                    <div class="panel-header-row">
+                        <div>
+                            <h3>Monitored Organizations & Portals <span class="badge badge-primary"
+                                    id="companies-count-badge">0</span></h3>
+                            <p class="section-desc">Add or import target tech companies to automatically track their
+                                career boards.</p>
+                        </div>
+                        <div class="panel-actions-group">
+                            <button id="btn-toggle-add-company" class="btn btn-outline"
+                                onclick="toggleAddCompanyForm()">
+                                ➕ Add Company
+                            </button>
+                            <input type="file" id="company-file-input" accept=".csv,.json,.md,.txt"
+                                style="display: none;">
+                            <button id="btn-import-companies" class="btn btn-outline"
+                                onclick="document.getElementById('company-file-input').click()">
+                                📁 Import List
+                            </button>
+                            <button id="btn-seed-catalog" class="btn btn-secondary" onclick="seedCompanyCatalog()">
+                                ⭐ Seed Top Tech Orgs
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Collapsible Add Company Form -->
+                    <form id="add-company-form" class="company-form collapsible-form hidden">
+                        <div class="form-row">
+                            <div class="form-group flex-2">
+                                <label for="company-name">Company Name</label>
+                                <input type="text" id="company-name" placeholder="e.g. Acme Corp" required>
+                            </div>
+                            <div class="form-group flex-2">
+                                <label for="company-domain">Domain (Optional)</label>
+                                <input type="text" id="company-domain" placeholder="e.g. stripe.com">
+                            </div>
+                            <div class="form-group flex-3">
+                                <label for="company-careers">Careers URL (Optional)</label>
+                                <input type="url" id="company-careers"
+                                    placeholder="https://boards.greenhouse.io/stripe">
+                            </div>
+                            <div class="form-group flex-1 form-btn-group">
+                                <button type="submit" class="btn btn-primary" style="margin-top: 24px; width: 100%;">
+                                    ➕ Save Company
+                                </button>
+                            </div>
+                        </div>
+                    </form>
+
+                    <!-- Quick Add Catalog Recommendations -->
+                    <div class="catalog-section">
+                        <h4 class="catalog-title">⭐ Recommended Direct Portals</h4>
+                        <div id="catalog-chips-container" class="catalog-chips-wrapper">
+                            <!-- Populated dynamically via app.js -->
+                        </div>
+                    </div>
+
+                    <!-- Company Filter & Layout Toolbar -->
+                    <div class="company-toolbar-container">
+                        <div class="company-search-box">
+                            <input type="text" id="company-search-input"
+                                placeholder="🔍 Search companies by name, domain, or notes..."
+                                oninput="onCompanySearchChange(event)">
+                        </div>
+                        <div class="company-filter-tabs">
+                            <button class="tab-btn active" id="tab-comp-all" onclick="setCompanyFilter('all')">All
+                                (<span id="company-filter-all-count">0</span>)</button>
+                            <button class="tab-btn" id="tab-comp-direct" onclick="setCompanyFilter('direct')">⭐ Direct
+                                Portals (<span id="company-filter-direct-count">0</span>)</button>
+                            <button class="tab-btn" id="tab-comp-network" onclick="setCompanyFilter('network')">🌐
+                                Enterprise / Network (<span id="company-filter-network-count">0</span>)</button>
+                        </div>
+                        <div class="view-toggle-group">
+                            <button id="btn-company-view-grid" class="view-toggle-btn active"
+                                onclick="setCompanyLayout('grid')" title="Tile Grid View">⊞ Grid</button>
+                            <button id="btn-company-view-list" class="view-toggle-btn"
+                                onclick="setCompanyLayout('list')" title="Compact List View">☰ List</button>
+                        </div>
+                    </div>
+
+                    <div id="companies-list" class="companies-grid">
+                        <!-- Company Cards rendered via app.js -->
+                    </div>
+                </div>
+            </section>
+
+            <!-- SECTION 4: Candidate Profile & Resume -->
+            <section id="resume-section" class="content-section hidden">
+                <div class="panel-container">
+                    <div class="panel-header-row">
+                        <div>
+                            <h3>👤 Candidate Profile &amp; Resume</h3>
+                            <p class="section-desc">Manage your encrypted resume and AI ATS-extracted profile. Job
+                                search preferences live in <b>Settings → Preferences</b>.</p>
+                        </div>
+                    </div>
+
+                    <div class="preferences-dashboard-grid profile-dashboard-grid">
+                        <!-- Card 3: Encrypted Resume & ATS Background -->
+                        <div class="pref-card pref-card-wide">
+                            <div class="pref-card-header">
+                                <div class="pref-header-title">
+                                    <span class="pref-header-icon">📄</span>
+                                    <h4>Active Resume & Verified Skills</h4>
+                                </div>
+                                <div class="resume-header-actions"
+                                    style="display: flex; gap: 8px; align-items: center;">
+                                    <button id="btn-upload-another-resume" class="btn btn-secondary btn-sm"
+                                        onclick="document.getElementById('resume-file-input').click()">➕ Upload
+                                        New</button>
+                                    <button id="btn-delete-active-resume" class="btn btn-danger btn-sm"
+                                        style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #f87171;">🗑️
+                                        Delete</button>
+                                </div>
+                            </div>
+
+                            <div class="upload-zone" id="upload-zone">
+                                <div class="upload-icon">📤</div>
+                                <p>Drag & drop your resume file here, or <span class="highlight">browse files</span></p>
+                                <span class="upload-formats">Supported formats: .pdf, .md, .txt (AES-256
+                                    Encrypted)</span>
+                                <input type="file" id="resume-file-input" accept=".pdf,.txt,.md" style="display: none;">
+                            </div>
+
+                            <div id="resume-loading" class="resume-loading hidden">
+                                <div class="spinner"></div>
+                                <p>Encrypting & running ATS structural analysis with AI...</p>
+                            </div>
+
+                            <div id="resume-details" class="resume-details-container hidden">
+                                <div class="resume-header">
+                                    <div class="resume-header-info">
+                                        <div class="resume-file-icon">📄</div>
+                                        <div class="resume-title-group">
+                                            <div
+                                                style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+                                                <h4 id="resume-filename">resume.pdf</h4>
+                                                <div id="resume-selector-wrapper" class="resume-selector-wrapper hidden"
+                                                    style="display: inline-flex; align-items: center; gap: 6px;">
+                                                    <span
+                                                        style="font-size: 11px; color: var(--text-dim);">Profile:</span>
+                                                    <select id="resume-select-dropdown" class="resume-select-dropdown"
+                                                        style="background: var(--card-bg); border: 1px solid var(--border-color); color: var(--text-main); font-size: 12px; padding: 4px 8px; border-radius: 6px;"></select>
+                                                </div>
+                                            </div>
+                                            <div class="resume-tags-row">
+                                                <span class="status-pill synced" id="resume-status-badge">
+                                                    <span class="pulse-dot"></span> Active ATS Profile
+                                                </span>
+                                                <span class="badge verified">🔒 Fernet Encrypted</span>
+                                                <span id="resume-upload-date" class="date-tag">📅 Uploaded
+                                                    recently</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="parsed-data-grid">
+                                    <div class="parsed-card">
+                                        <h5>Candidate Contact & Summary</h5>
+                                        <p><strong>Name:</strong> <span id="parsed-name">-</span></p>
+                                        <p><strong>Email:</strong> <span id="parsed-email">-</span></p>
+                                        <p><strong>Phone:</strong> <span id="parsed-phone">-</span></p>
+                                        <p><strong>Summary:</strong></p>
+                                        <div id="parsed-summary" class="summary-box">-</div>
+                                    </div>
+
+                                    <div class="parsed-card">
+                                        <h5>Extracted Technical Skills</h5>
+                                        <div id="parsed-skills" class="skills-tags"></div>
+                                    </div>
+                                </div>
+
+                                <div class="experience-card">
+                                    <h5>Work Experience & Achievements</h5>
+                                    <div id="parsed-experience" class="timeline-container"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Card 4: Application Q&A Memory Bank -->
+                        <div class="pref-card">
+                            <div class="pref-card-header">
+                                <div class="pref-header-title">
+                                    <span class="pref-header-icon">🧠</span>
+                                    <h4>Application Question & Answer Memory Bank (Semantic RAG)</h4>
+                                </div>
+                                <span class="badge verified" id="badge-qa-count">0 Answers Saved</span>
+                            </div>
+                            <p class="pref-card-desc">Save frequently requested application screener and essay questions
+                                (e.g. Work Authorization, System Outages, Why This Role). The engine uses vector
+                                embeddings for semantic 1-click retrieval.</p>
+
+                            <!-- Search & Add Bar -->
+                            <div style="display: flex; gap: 10px; margin-top: 6px; flex-wrap: wrap;">
+                                <input type="text" id="qa-search-input"
+                                    placeholder="🔍 Test Semantic Search: type any application question..."
+                                    style="flex: 1; min-width: 260px;" oninput="debounceSearchQAMemory(this.value)">
+                                <button type="button" class="btn btn-sm btn-outline" onclick="toggleAddQAModal()">+ Add
+                                    New Q&A</button>
+                            </div>
+
+                            <!-- Q&A Add Form (collapsible) -->
+                            <div id="qa-add-form" class="hidden"
+                                style="background: rgba(255,255,255,0.03); border: 1px solid var(--border-color); border-radius: 10px; padding: 14px; margin-top: 10px; display: flex; flex-direction: column; gap: 10px;">
+                                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                                    <input type="text" id="qa-new-question"
+                                        placeholder="Application Question (e.g. Describe a time you resolved a major production outage...)"
+                                        style="flex: 2; min-width: 240px;">
+                                    <select id="qa-new-category"
+                                        style="flex: 1; min-width: 140px; background: var(--card-bg); border: 1px solid var(--border-color); color: var(--text-main); border-radius: 8px; padding: 6px 10px;">
+                                        <option value="technical">Technical / Architecture</option>
+                                        <option value="behavioral">Behavioral / Leadership</option>
+                                        <option value="experience">Experience / Stack</option>
+                                        <option value="salary">Salary & Comp</option>
+                                        <option value="logistics">Work Auth / Logistics</option>
+                                    </select>
+                                </div>
+                                <textarea id="qa-new-answer" rows="3"
+                                    placeholder="Your standard / best answer to this question..."
+                                    style="width: 100%; background: var(--card-bg); border: 1px solid var(--border-color); color: var(--text-main); border-radius: 8px; padding: 8px 12px; resize: vertical; font-family: inherit; font-size: 13px;"></textarea>
+                                <div style="display: flex; justify-content: flex-end; gap: 8px;">
+                                    <button type="button" class="btn btn-sm btn-outline"
+                                        onclick="toggleAddQAModal()">Cancel</button>
+                                    <button type="button" class="btn btn-sm btn-primary"
+                                        onclick="submitNewQAMemory()">💾 Save Answer</button>
+                                </div>
+                            </div>
+
+                            <!-- Dynamic Q&A Items List -->
+                            <div id="qa-memory-list"
+                                style="display: flex; flex-direction: column; gap: 10px; margin-top: 10px; max-height: 340px; overflow-y: auto;">
+                                <!-- Rendered via app.js -->
+                            </div>
+                        </div>
+
+                        <!-- Card 5: Zero-Token Semantic Ignore Rules -->
+                        <div class="pref-card">
+                            <div class="pref-card-header">
+                                <div class="pref-header-title">
+                                    <span class="pref-header-icon">🚫</span>
+                                    <h4>Learned Negative Role Memory (Zero-Token Ignore Rules)</h4>
+                                </div>
+                                <span class="badge"
+                                    style="background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.4);"
+                                    id="badge-dismissed-count">0 Learned Rules</span>
+                            </div>
+                            <p class="pref-card-desc">Jobs you marked as 'Not Interested' or 'Ignored' are memorized as
+                                <strong>company + role</strong> rules here. Future scrapes and syncs matching the same
+                                role <em>at the same company</em> (≥82% semantic similarity) are auto-filtered with 0
+                                LLM tokens — the same role at other companies is still surfaced.
+                            </p>
+
+                            <div id="dismissed-patterns-list"
+                                style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px;">
+                                <!-- Rendered via app.js -->
+                            </div>
+                        </div>
+
+
+                    </div>
+                </div>
+            </section>
+
+            <!-- BACKGROUND TASKS & QUEUE SECTION -->
+            <section id="tasks-section" class="content-section hidden">
+                <div class="tasks-container"
+                    style="max-width: 1200px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px;">
+
+                    <!-- Section Header -->
+                    <div
+                        style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #313244; padding-bottom: 15px;">
+                        <div>
+                            <h3
+                                style="font-size: 20px; font-weight: 700; color: #cdd6f4; display: flex; align-items: center; gap: 8px;">
+                                <span>⚡</span> Background Tasks, LLM Queue &amp; Scheduled Discovery
+                            </h3>
+                            <p style="color: #a6adc8; font-size: 13px; margin-top: 4px;">
+                                Scrapes and synchronizations execute asynchronously without locking your UI. Track live
+                                progress, priority inference, and periodic cron triggers.
+                            </p>
+                        </div>
+                        <div style="display: flex; gap: 8px;">
+                            <button type="button" class="btn btn-outline btn-sm" onclick="fetchTasksStatus(true)">🔄
+                                Refresh</button>
+                            <button type="button" class="btn btn-outline btn-sm" onclick="clearCompletedTasks()">🧹
+                                Clear Completed</button>
+                        </div>
+                    </div>
+
+                    <!-- Top 3-Column Grid: Active Tasks + LLM Queue + Discovery Channels -->
+                    <div style="display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 20px;">
+
+                        <!-- Panel 1: Active & Running Background Tasks -->
+                        <div class="pref-card" style="margin: 0;">
+                            <div class="pref-card-header"
+                                style="border-bottom: 1px solid #313244; padding-bottom: 10px; margin-bottom: 12px;">
+                                <div class="pref-header-title">
+                                    <span class="pref-header-icon">⚡</span>
+                                    <h4>Active Background Operations</h4>
+                                </div>
+                                <span class="badge" id="tasks-active-badge"
+                                    style="background: rgba(137, 180, 250, 0.15); color: #89b4fa; font-size: 11px;">0
+                                    Running</span>
+                            </div>
+
+                            <div id="active-tasks-list"
+                                style="display: flex; flex-direction: column; gap: 12px; min-height: 140px;">
+                                <!-- Populated dynamically by app.js -->
+                                <div class="empty-state" style="padding: 30px 10px; text-align: center;">
+                                    <span style="font-size: 28px;">☕</span>
+                                    <p style="color: #6c7086; font-size: 13px; margin-top: 6px;">No active background
+                                        tasks running right now.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Panel 2: LLM Inference Queue & Concurrency Pool -->
+                        <div class="pref-card" style="margin: 0;">
+                            <div class="pref-card-header"
+                                style="border-bottom: 1px solid #313244; padding-bottom: 10px; margin-bottom: 12px;">
+                                <div class="pref-header-title">
+                                    <span class="pref-header-icon">🧠</span>
+                                    <h4>LLM Priority Queue &amp; Workers</h4>
+                                </div>
+                                <span class="badge" id="llm-workers-badge"
+                                    style="background: rgba(166, 227, 161, 0.15); color: #a6e3a1; font-size: 11px;">Local
+                                    Paced</span>
+                            </div>
+
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px;">
+                                <div
+                                    style="background: #11111b; border: 1px solid #313244; border-radius: 8px; padding: 10px; text-align: center;">
+                                    <span style="font-size: 10px; color: #a6adc8; text-transform: uppercase;">Queue
+                                        Depth</span>
+                                    <h4 id="queue-depth-metric"
+                                        style="font-size: 18px; color: #89b4fa; margin-top: 2px;">0 tasks</h4>
+                                    <span style="font-size: 10px; color: #6c7086;">Priority 1-3</span>
+                                </div>
+                                <div
+                                    style="background: #11111b; border: 1px solid #313244; border-radius: 8px; padding: 10px; text-align: center;">
+                                    <span style="font-size: 10px; color: #a6adc8; text-transform: uppercase;">Worker
+                                        Pool</span>
+                                    <h4 id="queue-workers-metric"
+                                        style="font-size: 18px; color: #a6e3a1; margin-top: 2px;">1 Worker</h4>
+                                    <span style="font-size: 10px; color: #6c7086;">0.2s Paced</span>
+                                </div>
+                            </div>
+
+                            <div
+                                style="background: #11111b; border: 1px solid #313244; border-radius: 8px; padding: 12px;">
+                                <div
+                                    style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px;">
+                                    <span style="color: #a6adc8;">Active Generation:</span>
+                                    <span id="queue-active-task-name"
+                                        style="color: #cdd6f4; font-weight: 600;">Idle</span>
+                                </div>
+                                <div
+                                    style="display: flex; justify-content: space-between; font-size: 11px; color: #6c7086;">
+                                    <span>Average Latency:</span>
+                                    <span id="queue-avg-latency">0.0 ms</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Panel 3: Discovery Channels & Sync Engines (Right Column) -->
+                        <div class="pref-card" style="margin: 0; display: flex; flex-direction: column;">
+                            <div class="pref-card-header"
+                                style="border-bottom: 1px solid #313244; padding-bottom: 10px; margin-bottom: 12px;">
+                                <div class="pref-header-title">
+                                    <span class="pref-header-icon">📡</span>
+                                    <h4>Discovery Engines</h4>
+                                </div>
+                                <span class="badge active" style="font-size: 10px;">6 Available</span>
+                            </div>
+
+                            <div class="discovery-channels-sidebar">
+                                <!-- Channel 1: Direct Portal Scrapers -->
+                                <div class="discovery-channel-item">
+                                    <div class="discovery-channel-item-header">
+                                        <span class="discovery-channel-item-icon">⚡</span>
+                                        <h5 class="discovery-channel-item-title">Direct Portals</h5>
+                                        <button type="button" class="btn btn-sm btn-primary discovery-channel-btn"
+                                            onclick="triggerScrape()">Scan</button>
+                                    </div>
+                                    <p class="discovery-channel-item-desc">Greenhouse, Lever, Ashby, custom ATS</p>
+                                </div>
+
+                                <!-- Channel 2: LinkedIn Alerts & Saved Jobs -->
+                                <div class="discovery-channel-item">
+                                    <div class="discovery-channel-item-header">
+                                        <span class="discovery-channel-item-icon">🔗</span>
+                                        <h5 class="discovery-channel-item-title">LinkedIn Sync</h5>
+                                        <button type="button" class="btn btn-sm btn-outline discovery-channel-btn"
+                                            onclick="triggerLinkedInSync()">Sync</button>
+                                    </div>
+                                    <p class="discovery-channel-item-desc">Alerts &amp; saved jobs sync</p>
+                                </div>
+
+                                <!-- Channel 3: Application Portals & Email Sync -->
+                                <div class="discovery-channel-item">
+                                    <div class="discovery-channel-item-header">
+                                        <span class="discovery-channel-item-icon">🔄</span>
+                                        <h5 class="discovery-channel-item-title">Application Sync</h5>
+                                        <button type="button" class="btn btn-sm btn-outline discovery-channel-btn"
+                                            onclick="triggerExternalSync()">Sync</button>
+                                    </div>
+                                    <p class="discovery-channel-item-desc">Hirist, Greenhouse, Gmail</p>
+                                </div>
+
+                                <!-- Channel 4: Google for Jobs Scanner -->
+                                <div class="discovery-channel-item">
+                                    <div class="discovery-channel-item-header">
+                                        <span class="discovery-channel-item-icon">🌐</span>
+                                        <h5 class="discovery-channel-item-title">Google Jobs</h5>
+                                        <button type="button" class="btn btn-sm btn-outline discovery-channel-btn"
+                                            onclick="openGoogleJobsModal()">Scan</button>
+                                    </div>
+                                    <p class="discovery-channel-item-desc">Followed searches &amp; high-intent cards</p>
+                                </div>
+
+                                <!-- Channel 5: Opportunity Radar -->
+                                <div class="discovery-channel-item">
+                                    <div class="discovery-channel-item-header">
+                                        <span class="discovery-channel-item-icon">🛰️</span>
+                                        <h5 class="discovery-channel-item-title">Opportunity Radar</h5>
+                                        <button type="button" class="btn btn-sm btn-outline discovery-channel-btn"
+                                            onclick="openOpportunityRadarModal()">Open</button>
+                                    </div>
+                                    <p class="discovery-channel-item-desc">Ranked hiring-intent feed</p>
+                                </div>
+
+                                <!-- Channel 6: Dedicated Browser Authentication -->
+                                <div class="discovery-channel-item">
+                                    <div class="discovery-channel-item-header">
+                                        <span class="discovery-channel-item-icon">🔐</span>
+                                        <h5 class="discovery-channel-item-title">Portal Auth</h5>
+                                        <button type="button" class="btn btn-sm btn-outline discovery-channel-btn"
+                                            onclick="openBrowserAuthModal()">Login</button>
+                                    </div>
+                                    <p class="discovery-channel-item-desc">Manage login sessions</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Panel 5: Automated Periodic Discovery Schedules -->
+                    <div class="pref-card" style="margin: 0;">
+                        <div class="pref-card-header"
+                            style="border-bottom: 1px solid #313244; padding-bottom: 10px; margin-bottom: 12px;">
+                            <div class="pref-header-title">
+                                <span class="pref-header-icon">⏰</span>
+                                <h4>Periodic Discovery &amp; Sync Automations</h4>
+                            </div>
+                            <span class="badge"
+                                style="background: rgba(203, 166, 247, 0.15); color: #cba6f7; font-size: 11px;">Hands-Free
+                                Discovery</span>
+                        </div>
+
+                        <div id="schedules-list-container" style="display: flex; flex-direction: column; gap: 10px;">
+                            <!-- Populated dynamically by app.js -->
+                        </div>
+                    </div>
+
+                    <!-- Panel 6: Recent Tasks Execution History -->
+                    <div class="pref-card" style="margin: 0;">
+                        <div class="pref-card-header"
+                            style="border-bottom: 1px solid #313244; padding-bottom: 10px; margin-bottom: 12px;">
+                            <div class="pref-header-title">
+                                <span class="pref-header-icon">📜</span>
+                                <h4>Recent Task History</h4>
+                            </div>
+                            <span id="tasks-history-count" style="font-size: 11px; color: #6c7086;">0 tasks</span>
+                        </div>
+
+                        <div id="tasks-history-table-container" style="max-height: 280px; overflow-y: auto;">
+                            <!-- Table populated dynamically -->
+                            <table class="data-table" style="width: 100%; border-collapse: collapse; font-size: 12px;">
+                                <thead>
+                                    <tr style="border-bottom: 1px solid #313244; color: #a6adc8; text-align: left;">
+                                        <th style="padding: 8px 10px;">Task Name</th>
+                                        <th style="padding: 8px 10px;">Status</th>
+                                        <th style="padding: 8px 10px;">Roles / Items</th>
+                                        <th style="padding: 8px 10px;">Duration</th>
+                                        <th style="padding: 8px 10px;">Completed At</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tasks-history-tbody">
+                                    <tr>
+                                        <td colspan="5" style="text-align: center; padding: 20px; color: #6c7086;">No
+                                            completed tasks recorded yet.</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                </div>
+            </section>
+            <!-- SETTINGS SECTION -->
+            <section id="settings-section" class="content-section hidden">
+                <div class="settings-card">
+                    <div class="settings-tabbar">
+                        <button class="btn btn-sm settings-tab-btn" data-settings-tab="preferences"
+                            onclick="switchSettingsTab('preferences')">Preferences</button>
+                        <button class="btn btn-sm settings-tab-btn" data-settings-tab="sources"
+                            onclick="switchSettingsTab('sources')">Sources</button>
+                        <button class="btn btn-sm settings-tab-btn" data-settings-tab="features"
+                            onclick="switchSettingsTab('features')">Discovery Features</button>
+                        <button class="btn btn-sm settings-tab-btn" data-settings-tab="models"
+                            onclick="switchSettingsTab('models')">Cloud Models</button>
+                        <button class="btn btn-sm settings-tab-btn" data-settings-tab="gmail"
+                            onclick="switchSettingsTab('gmail')">Gmail API</button>
+                    </div>
+
+                    <div id="settings-tab-preferences" class="settings-tab-panel">
+                        <h4 class="settings-title">Discovery Preferences <span class="settings-hint">(saved server-side;
+                                used by manual &amp; scheduled scans)</span></h4>
+                        <div class="preferences-dashboard-grid settings-preferences-grid">
+                            <!-- Card 1: Target Career Roles -->
+                            <div class="pref-card">
+                                <div class="pref-card-header">
+                                    <div class="pref-header-title">
+                                        <span class="pref-header-icon">🎯</span>
+                                        <h4>Target Roles &amp; Keywords</h4>
+                                    </div>
+                                    <span class="badge active" id="badge-roles-count">0 Active</span>
+                                </div>
+                                <p class="pref-card-desc">Specify roles to discover. The engine uses smart synonym and
+                                    seniority matching.</p>
+                                <div class="roles-chips-container" id="target-roles-chips">
+                                    <!-- Dynamic role chips -->
+                                </div>
+                                <div class="role-input-group" style="margin-top: 10px;">
+                                    <input type="text" id="add-role-input"
+                                        placeholder="Type a job title or keyword and press Enter..."
+                                        onkeydown="if(event.key==='Enter'){event.preventDefault(); handleAddRoleFromInput();}">
+                                    <button type="button" class="btn btn-sm btn-outline"
+                                        onclick="handleAddRoleFromInput()">+ Add</button>
+                                </div>
+                                <div class="quick-roles-pills" style="margin-top: 10px;">
+                                    <span class="pills-label">Quick Add:</span>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Staff Software Engineer')">+ Staff Engineer</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Principal Engineer')">+ Principal Engineer</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Backend Engineer')">+ Backend</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Distributed Systems')">+ Distributed Systems</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Full Stack Engineer')">+ Full Stack</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Platform Engineer')">+ Platform</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Machine Learning Engineer')">+ AI / ML</button>
+                                    <button type="button" class="role-pill"
+                                        onclick="addRoleKeyword('Engineering Manager')">+ Eng Manager</button>
+                                </div>
+                                <div
+                                    style="margin-top: 10px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                                    <button type="button" class="btn btn-sm btn-outline"
+                                        onclick="suggestRelatedRoles()">✨ Suggest related titles</button>
+                                    <span class="pref-hint" style="margin: 0;">Broader titles improve ATS recall without
+                                        changing your precision</span>
+                                </div>
+                                <div class="quick-roles-pills" id="role-suggestions" style="margin-top: 8px;">
+                                    <!-- Populated on demand from /api/roles/enrich -->
+                                </div>
+                            </div>
+
+                            <!-- Card 2: Target Cities & Location -->
+                            <div class="pref-card">
+                                <div class="pref-card-header">
+                                    <div class="pref-header-title">
+                                        <span class="pref-header-icon">🏙️</span>
+                                        <h4>Target Cities &amp; Locations</h4>
+                                    </div>
+                                    <div class="pref-header-actions">
+                                        <span class="badge verified" id="badge-cities-count">0 Cities</span>
+                                        <button type="button" class="btn btn-sm btn-outline" id="btn-clear-cities"
+                                            onclick="clearAllCities()" title="Remove all selected cities">Clear
+                                            all</button>
+                                    </div>
+                                </div>
+                                <p class="pref-card-desc">Pick the countries and cities you're targeting. Remote /
+                                    hybrid / onsite eligibility is controlled by the Work Mode selector below.</p>
+                                <div class="roles-chips-container" id="target-cities-chips">
+                                    <!-- Dynamic city chips -->
+                                </div>
+                                <div class="foreign-cities-notice" id="foreign-cities-notice" style="display:none;">
+                                    <!-- Populated when selected cities fall outside the active country -->
+                                </div>
+                                <div class="role-input-group" style="margin-top: 10px;">
+                                    <input type="text" id="add-city-input" list="city-suggestions-list"
+                                        placeholder="Type a city name or state (e.g. Bengaluru, San Francisco, London)..."
+                                        onkeydown="if(event.key==='Enter'){event.preventDefault(); handleAddCityFromInput();}">
+                                    <button type="button" class="btn btn-sm btn-outline"
+                                        onclick="handleAddCityFromInput()">+ Add City</button>
+                                </div>
+                                <div class="quick-roles-pills" id="quick-cities-pills" style="margin-top: 10px;">
+                                    <!-- Populated dynamically based on selected country -->
+                                </div>
+                                <div class="form-row-2col" style="margin-top: 14px;">
+                                    <div class="form-group">
+                                        <label>📍 Country / Region</label>
+                                        <select id="target-country-select" class="form-select"
+                                            onchange="handleCountrySelectChange(this.value)">
+                                            <!-- Populated dynamically via app.js -->
+                                        </select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label>💼 Work Mode / Job Type</label>
+                                        <select id="target-workmode-select" class="form-select"
+                                            onchange="handleTargetPrefChange()">
+                                            <option value="all">🌐 Any (incl. Remote)</option>
+                                            <option value="remote">🏠 100% Remote</option>
+                                            <option value="hybrid">🏢 Hybrid</option>
+                                            <option value="onsite">📍 Onsite</option>
+                                        </select>
+                                        <span class="pref-hint">📍 Remote roles are matched only when Work Mode allows
+                                            it.</span>
+                                    </div>
+                                </div>
+                                <datalist id="city-suggestions-list">
+                                    <!-- Populated dynamically based on selected country -->
+                                </datalist>
+                            </div>
+
+                            <!-- Profile & Display Preferences -->
+                            <div class="pref-card pref-card-wide">
+                                <div class="pref-card-header">
+                                    <div class="pref-header-title">
+                                        <span class="pref-header-icon">🕒</span>
+                                        <h4>Profile &amp; Display</h4>
+                                    </div>
+                                </div>
+                                <p class="pref-card-desc">Choose the timezone used for scan, task, and activity
+                                    timestamps.</p>
+                                <div class="form-group">
+                                    <label>🌍 Timezone</label>
+                                    <select id="set-timezone" class="form-select"
+                                        onchange="handleTimezoneChange(this.value)">
+                                        <!-- Populated dynamically via app.js -->
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="settings-tab-sources" class="settings-tab-panel" style="display:none;">
+                        <h4 class="settings-title">Discovery Sources <span class="settings-hint">(followed Google for
+                                Jobs searches)</span></h4>
+                        <div class="preferences-dashboard-grid">
+                            <div class="pref-card">
+                                <div class="pref-card-header">
+                                    <div class="pref-header-title">
+                                        <span class="pref-header-icon">🌐</span>
+                                        <h4>Followed Google Job Searches</h4>
+                                    </div>
+                                    <span class="badge" id="badge-profile-google-searches-count"
+                                        style="background: rgba(137, 180, 250, 0.2); color: #89b4fa; font-size: 11px;">0
+                                        Alerts</span>
+                                </div>
+                                <p class="pref-card-desc">Alert searches synced from your Google for Jobs 'Following'
+                                    tab or added manually.</p>
+                                <div class="roles-chips-container" id="profile-google-searches-chips">
+                                    <!-- Dynamic search query chips -->
+                                </div>
+                                <div class="role-input-group" style="margin-top: 10px;">
+                                    <input type="text" id="add-profile-google-search-input"
+                                        placeholder="e.g. Acme india jobs..."
+                                        onkeydown="if(event.key==='Enter'){event.preventDefault(); handleAddGoogleSearchFromProfile();}">
+                                    <button type="button" class="btn btn-sm btn-outline"
+                                        onclick="handleAddGoogleSearchFromProfile()">+ Add</button>
+                                </div>
+                                <div
+                                    style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px; gap: 8px;">
+                                    <button type="button" class="btn btn-xs btn-outline"
+                                        onclick="syncGoogleFollowedQueries()" style="font-size: 11px;">🔄 Sync from
+                                        Google</button>
+                                    <button type="button" class="btn btn-xs btn-primary" onclick="openGoogleJobsModal()"
+                                        style="font-size: 11px;">🚀 Scan Google Jobs</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="settings-tab-features" class="settings-tab-panel" style="display:none;">
+                        <h4 class="settings-title">Opt-in Discovery Features <span class="settings-hint">(disabled
+                                channels are hidden &amp; skipped)</span></h4>
+
+                        <!-- Direct / official channels -->
+                        <div class="settings-group">
+                            <div class="settings-group-title">✅ Direct &amp; official channels</div>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-ats_portals"> ATS portal
+                                scanning (master switch)</label>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-google_jobs"> Google for
+                                Jobs</label>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-ats_hirist"> Hirist
+                                application status sync <span class="settings-hint">(candidate portal)</span></label>
+                        </div>
+
+                        <!-- Official ATS portals (public APIs) -->
+                        <div class="settings-group">
+                            <div class="settings-group-title">🏢 Official ATS portals <span
+                                    class="settings-hint">(public APIs)</span></div>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-ats_greenhouse">
+                                Greenhouse</label>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-ats_lever"> Lever</label>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-ats_ashby"> Ashby</label>
+                        </div>
+
+                        <!-- Experimental / unofficial sources -->
+                        <div class="settings-group settings-group-risk">
+                            <div class="settings-group-title">⚠️ Experimental &amp; unofficial sources <span
+                                    class="settings-hint">(opt-in at your own risk)</span></div>
+                            <div class="settings-warn">These use unofficial or ambiguous endpoints. Enable only if you
+                                accept the risk and each site's terms of service; you are responsible for complying with
+                                the terms of any site you scan.</div>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-jobspy_google"> Google
+                                Jobs via JobSpy <span class="settings-hint">(unofficial, open-source; requires the
+                                    <code>python-jobspy</code> package)</span></label>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-ats_smartrecruiters">
+                                SmartRecruiters <span class="settings-hint">(public API; ToS restricts automated
+                                    agents)</span></label>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-ats_workable"> Workable
+                                <span class="settings-hint">(unofficial widget endpoint)</span></label>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-ats_workday"> Workday
+                                <span class="settings-hint">(unofficial CXS API)</span></label>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-ats_uber"> Uber careers
+                                <span class="settings-hint">(unofficial internal API)</span></label>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-ats_custom_html"> Custom
+                                HTML careers pages <span class="settings-hint">(arbitrary scraping)</span></label>
+                        </div>
+
+                        <!-- Session / inbox access (highest risk) -->
+                        <div class="settings-group settings-group-risk">
+                            <div class="settings-group-title">🔐 LinkedIn &amp; Gmail <span
+                                    class="settings-hint">(session / inbox access)</span></div>
+                            <div class="settings-warn">⚠️ LinkedIn automation drives your logged-in session and reads
+                                its DOM. This may conflict with LinkedIn's User Agreement and can risk account limits.
+                                Enable only if you accept that risk.</div>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-linkedin_sync"> LinkedIn
+                                automation (session-based scraping)</label>
+                            <div class="settings-hint" id="linkedin-free-hint"></div>
+                            <div class="settings-warn">⚠️ Reads your Gmail inbox (API preferred, browser fallback). Off
+                                by default for privacy. Enable only if you accept that.</div>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-gmail_sync"> Gmail inbox
+                                sync (read interview/rejection emails via Sync External Applications)</label>
+                        </div>
+
+                        <!-- Employer / domain blocklist -->
+                        <div class="settings-group">
+                            <div class="settings-group-title">🚫 Excluded companies / domains</div>
+                            <div class="settings-hint" style="margin-bottom:6px;">Comma-separated; never scanned.</div>
+                            <input id="set-excluded-companies" class="settings-input" placeholder="amazon" />
+                        </div>
+                    </div>
+
+                    <div id="settings-tab-models" class="settings-tab-panel" style="display:none;">
+                        <h4 class="settings-title">BYOK Cloud Models <span class="settings-hint">(encrypted locally; env
+                                vars take precedence)</span></h4>
+                        <label class="settings-check"><input type="checkbox" id="set-allow-cloud"> Allow cloud fallback
+                            when local models are unavailable</label>
+                        <label>OpenAI API Key <span id="set-openai-status" class="settings-hint"></span></label>
+                        <input id="set-openai-key" type="password" class="settings-input"
+                            placeholder="Leave blank to keep current" />
+                        <label>Gemini API Key <span id="set-gemini-status" class="settings-hint"></span></label>
+                        <input id="set-gemini-key" type="password" class="settings-input"
+                            placeholder="Leave blank to keep current" />
+                        <label>Anthropic API Key <span id="set-anthropic-status" class="settings-hint"></span></label>
+                        <input id="set-anthropic-key" type="password" class="settings-input"
+                            placeholder="Leave blank to keep current" />
+                    </div>
+
+                    <div id="settings-tab-gmail" class="settings-tab-panel" style="display:none;">
+                        <h4 class="settings-title">Gmail API <span class="settings-hint">(optional, BYOK — metadata +
+                                snippet only, narrow query)</span></h4>
+                        <div id="gmail-status" class="settings-hint" style="margin:4px 0 10px;">Checking…</div>
+                        <label>Google OAuth Client ID</label>
+                        <input id="gmail-client-id" class="settings-input"
+                            placeholder="xxxxxxx.apps.googleusercontent.com" />
+                        <label>Google OAuth Client Secret</label>
+                        <input id="gmail-client-secret" type="password" class="settings-input"
+                            placeholder="Leave blank to keep current" />
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                            <button class="btn btn-outline btn-sm" onclick="saveGmailCredentials()">Save Client</button>
+                            <button class="btn btn-primary btn-sm" onclick="connectGmail()">Connect Gmail</button>
+                            <button class="btn btn-outline btn-sm" onclick="disconnectGmail()">Disconnect</button>
+                        </div>
+                        <details style="margin-top:10px;">
+                            <summary style="cursor:pointer;font-size:12px;">How to get your Google OAuth client ID
+                            </summary>
+                            <ol class="settings-help-list">
+                                <li>Google Cloud Console → <b>APIs &amp; Services → Library</b>: create/select a project
+                                    and enable the <b>Gmail API</b>.</li>
+                                <li><b>OAuth consent screen</b>: External → add your account as a <b>Test user</b> → add
+                                    scope <code>.../auth/gmail.readonly</code>.</li>
+                                <li><b>Credentials → Create OAuth client ID</b>: type <b>Desktop app</b> (or Web app
+                                    with redirect <code>http://localhost:8000/api/gmail/oauth2callback</code>).</li>
+                                <li>Paste the <b>Client ID</b> / <b>Client secret</b> above → <b>Save Client</b> →
+                                    <b>Connect Gmail</b>.
+                                </li>
+                                <li>While the consent screen is in “Testing”, refresh tokens expire every <b>7 days</b>;
+                                    set it to “In production” (<i>Advanced → Continue</i>) to avoid reconnecting.</li>
+                            </ol>
+                        </details>
+                    </div>
+
+                    <div class="settings-footer">
+                        <button class="btn btn-primary" onclick="saveSettingsModal()">Save Settings</button>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <div id="details-modal" class="modal-overlay drawer-overlay hidden">
+        <div class="modal-drawer">
+            <div class="modal-header">
+                <div>
+                    <h3 id="modal-job-title">Senior Backend Engineer</h3>
+                    <div style="display: flex; align-items: center; gap: 8px; margin-top: 4px;">
+                        <span id="modal-company-name" class="modal-subtitle">Company • Location</span>
+                        <span class="badge verified" id="modal-llm-badge">⚡ AI: Detecting...</span>
+                    </div>
+                </div>
+                <button id="modal-close-btn" class="btn-close">✕</button>
+            </div>
+
+            <!-- Modal Navigation Tabs -->
+            <div class="modal-tabs">
+                <button class="modal-tab-btn active" data-tab="match">AI Match Score</button>
+                <button class="modal-tab-btn" data-tab="hiring-team">👥 Hiring Team</button>
+                <button class="modal-tab-btn" data-tab="activity">🕑 Activity</button>
+                <button class="modal-tab-btn" data-tab="cover-letter">Cover Letter</button>
+                <button class="modal-tab-btn" data-tab="tailoring">Resume Tips</button>
+                <button class="modal-tab-btn" data-tab="outreach">Cold Note</button>
+                <button class="modal-tab-btn" data-tab="chat">💬 Interview Coach</button>
+            </div>
+
+            <!-- Modal Body Content -->
+            <div class="modal-body">
+                <!-- Tab 1: Match Analysis -->
+                <div id="tab-match" class="modal-tab-content active">
+                    <div class="match-score-banner">
+                        <div class="match-score-circle" id="modal-score-circle">—</div>
+                        <div>
+                            <h4>ATS Compatibility Assessment</h4>
+                            <p id="modal-match-summary">Detailed comparison against your active profile.</p>
+                        </div>
+                    </div>
+
+                    <!-- Tech Stack & Requirements Alignment Matrix -->
+                    <div class="stack-compatibility-card" id="modal-stack-card">
+                        <div class="stack-header">
+                            <div class="stack-title-group">
+                                <span class="stack-icon">🛠️</span>
+                                <div>
+                                    <h5 style="margin:0; font-size:13.5px; font-weight:700; color:var(--text-main);">
+                                        Tech Stack & Requirements Alignment</h5>
+                                    <p id="modal-stack-summary"
+                                        style="margin:0; font-size:12px; color:var(--text-dim);">Evaluating stack
+                                        compatibility against active resume...</p>
+                                </div>
+                            </div>
+                            <span class="badge active" id="modal-stack-badge">0% Stack Match</span>
+                        </div>
+
+                        <!-- Compatibility Progress Meter -->
+                        <div class="stack-meter-container">
+                            <div class="stack-meter-bar">
+                                <div id="modal-stack-progress-fill" class="stack-meter-fill" style="width: 0%;"></div>
+                            </div>
+                            <div class="stack-meter-legend">
+                                <span id="modal-stack-count-matched" style="color: #a6e3a1; font-weight: 600;">0
+                                    Matched</span>
+                                <span id="modal-stack-count-gaps" style="color: #fab387; font-weight: 600;">0 Growth
+                                    Areas</span>
+                            </div>
+                        </div>
+
+                        <!-- Matched Skills Group -->
+                        <div style="margin-top: 10px;">
+                            <span
+                                style="font-size: 11px; text-transform: uppercase; color: #a6e3a1; font-weight: 700; letter-spacing: 0.5px;">✓
+                                Matched Stack (In Your Resume)</span>
+                            <div id="modal-matched-skills-grid" class="skills-chips-grid" style="margin-top: 4px;">
+                                <!-- Populated dynamically -->
+                            </div>
+                        </div>
+
+                        <!-- Gap / Growth Skills Group -->
+                        <div style="margin-top: 12px;">
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <span
+                                    style="font-size: 11px; text-transform: uppercase; color: #fab387; font-weight: 700; letter-spacing: 0.5px;">⚡
+                                    Key Job Requirements (Growth / Target Areas)</span>
+                                <span style="font-size: 11px; color: var(--text-dim);">Click chip to include in
+                                    tailoring tips</span>
+                            </div>
+                            <div id="modal-gap-skills-grid" class="skills-chips-grid" style="margin-top: 4px;">
+                                <!-- Populated dynamically -->
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="tailor-control-card">
+                        <div class="tailor-card-header">
+                            <div>
+                                <h5
+                                    style="margin:0 0 2px 0; font-size:13.5px; font-weight:600; color:var(--text-main);">
+                                    ⚡ AI Application Package Generator</h5>
+                                <p style="margin:0; font-size:12px; color:var(--text-dim);">Select only the materials
+                                    you need to conserve API token costs.</p>
+                            </div>
+                            <button id="modal-tailor-btn" class="btn btn-sm btn-primary"
+                                onclick="tailorCurrentModalJob()">
+                                ⚡ Generate Materials
+                            </button>
+                        </div>
+                        <div class="tailor-options-row">
+                            <label class="token-toggle-label">
+                                <input type="checkbox" id="modal-opt-resume" checked>
+                                <span>Tailor Resume Points</span>
+                            </label>
+                            <label class="token-toggle-label">
+                                <input type="checkbox" id="modal-opt-cover" checked>
+                                <span>Cover Letter</span>
+                            </label>
+                            <label class="token-toggle-label">
+                                <input type="checkbox" id="modal-opt-outreach" checked>
+                                <span>Cold Outreach Note</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="analysis-box" id="modal-analysis-details"></div>
+                </div>
+
+                <!-- Tab: Hiring Team & Key Contacts -->
+                <div id="tab-hiring-team" class="modal-tab-content">
+                    <div class="tab-action-bar">
+                        <p class="tab-tip">Direct hiring managers, talent partners, and recruiters for this company:</p>
+                        <button class="btn btn-sm btn-outline" onclick="loadJobHiringTeam(state.activeJobModal?.id)">🔄
+                            Refresh Contacts</button>
+                    </div>
+                    <div id="modal-hiring-team-list" class="hiring-team-container">
+                        <!-- Populated dynamically -->
+                    </div>
+                </div>
+
+                <div id="tab-activity" class="modal-tab-content">
+                    <div class="tab-action-bar">
+                        <p class="tab-tip">Full history of this role: scans, status changes, emails, and notes.</p>
+                        <button class="btn btn-sm btn-outline" onclick="loadJobActivity(state.activeJobModal?.id)">🔄
+                            Refresh</button>
+                    </div>
+                    <div id="modal-activity-timeline" class="activity-timeline">
+                        <!-- Populated dynamically -->
+                    </div>
+                </div>
+
+                <!-- Tab 2: Cover Letter -->
+                <div id="tab-cover-letter" class="modal-tab-content">
+                    <div class="tab-action-bar">
+                        <p class="tab-tip">Tailored 250-300 word cover letter ready to submit.</p>
+                        <button id="copy-cover-letter-btn" class="btn btn-sm btn-primary">Copy Cover Letter</button>
+                    </div>
+                    <textarea id="modal-cover-letter-text" class="text-area-view" readonly></textarea>
+                </div>
+
+                <!-- Tab 3: Resume Tailoring -->
+                <div id="tab-tailoring" class="modal-tab-content">
+                    <p class="tab-tip">Specific bullet points and keywords to add for ATS ranking:</p>
+                    <div id="modal-tailoring-text" class="tailoring-tips-box"></div>
+                </div>
+
+                <!-- Tab 4: Cold Outreach -->
+                <div id="tab-outreach" class="modal-tab-content">
+                    <div class="tab-action-bar">
+                        <p class="tab-tip">Under 300 characters for LinkedIn connection requests:</p>
+                        <button id="copy-cold-msg-btn" class="btn btn-sm btn-primary">Copy Note</button>
+                    </div>
+                    <textarea id="modal-cold-msg-text" class="text-area-view note-box" readonly></textarea>
+                </div>
+
+                <!-- Tab 5: RAG Interview Coach -->
+                <div id="tab-chat" class="modal-tab-content">
+                    <p class="tab-tip">Ask specific interview prep questions tailored to this role and company:</p>
+                    <div id="chat-messages" class="chat-messages-container">
+                        <div class="chat-msg coach">
+                            Hello! I am your AI interview coach for this role. Ask me anything about system design,
+                            behavioral questions, or company background!
+                        </div>
+                    </div>
+                    <form id="chat-input-form" class="chat-form">
+                        <input type="text" id="chat-user-input"
+                            placeholder="e.g. How should I answer why I want to work here?" required>
+                        <button type="submit" class="btn btn-primary">Send</button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Modal Footer Action -->
+            <div class="modal-footer">
+                <button id="modal-apply-browser-btn" class="btn btn-success btn-block">
+                    🚀 Launch Playwright Assisted Apply Session
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Company Modal -->
+    <div id="edit-company-modal" class="modal-overlay dialog-overlay hidden">
+        <div class="modal-card modal-sm">
+            <div class="modal-header">
+                <div class="modal-title-group">
+                    <h3 id="edit-modal-title">✏️ Edit Target Company</h3>
+                    <p class="modal-subtitle">Update company careers portal URL, domain, or intelligence</p>
+                </div>
+                <button class="modal-close" onclick="closeEditCompanyModal()">&times;</button>
+            </div>
+            <form id="edit-company-form" class="edit-company-form" onsubmit="saveCompanyEdit(event)">
+                <input type="hidden" id="edit-company-id">
+                <div class="form-group">
+                    <label>Company Name</label>
+                    <input type="text" id="edit-company-name" required>
+                </div>
+                <div class="form-group">
+                    <label>Company Domain</label>
+                    <input type="text" id="edit-company-domain" placeholder="e.g. stripe.com">
+                </div>
+                <div class="form-group">
+                    <label>Careers Portal URL (Direct / Greenhouse / Lever / Ashby / Workday)</label>
+                    <input type="url" id="edit-company-careers" placeholder="e.g. https://jobs.lever.co/anthropic">
+                </div>
+                <div class="form-group">
+                    <label>Description & Business Model</label>
+                    <textarea id="edit-company-desc" rows="2"
+                        placeholder="Summary of products and tech stack..."></textarea>
+                </div>
+                <div class="modal-footer"
+                    style="padding-top: 15px; display: flex; gap: 10px; justify-content: flex-end;">
+                    <button type="button" class="btn btn-outline" onclick="closeEditCompanyModal()">Cancel</button>
+                    <button type="submit" class="btn btn-success">Save Changes</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Opt-in Risk Consent Modal -->
+    <div id="consent-modal" class="modal-overlay dialog-overlay hidden">
+        <div class="modal-card modal-sm">
+            <div class="modal-header">
+                <div class="modal-title-group">
+                    <h3>⚠️ Automated Session Warning &amp; Acknowledgment</h3>
+                    <p class="modal-subtitle">Enabling automated browsing may violate third-party Terms of Service.</p>
+                </div>
+                <button class="modal-close" onclick="closeConsentModal()">&times;</button>
+            </div>
+            <div style="padding: 4px 0;">
+                <p style="font-size: 13px; color: #a6adc8; line-height: 1.55;">
+                    You are enabling an experimental browser-automation feature. Review the operating risks
+                    before proceeding:
+                </p>
+                <ul style="font-size: 13px; color: #a6adc8; line-height: 1.6; margin: 10px 0; padding-left: 20px;">
+                    <li><b>Account penalty risk:</b> interacting with services via browser automation can
+                        trigger security checkpoints, CAPTCHAs, temporary suspensions, or permanent account
+                        bans.</li>
+                    <li><b>Sole responsibility:</b> you assume full responsibility for any credentials,
+                        sessions, and actions performed through this tool.</li>
+                    <li><b>No liability:</b> the maintainers provide this feature strictly for personal,
+                        educational/testing use and accept no liability for actions a third-party platform
+                        takes against your account.</li>
+                </ul>
+                <label class="settings-check" style="margin-top: 6px;">
+                    <input type="checkbox" id="consent-ack"> I understand that using automation on
+                    authenticated platforms carries an inherent risk of account suspension, and I agree to use
+                    this feature at my own discretion and risk.
+                </label>
+            </div>
+            <div class="modal-footer"
+                style="padding-top: 15px; display: flex; gap: 10px; justify-content: flex-end;">
+                <button type="button" class="btn btn-outline" onclick="closeConsentModal()">Cancel</button>
+                <button type="button" class="btn btn-success" id="consent-enable-btn" onclick="confirmConsent()"
+                    disabled>Enable Feature</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Browser Authentication & Profile Login Modal -->
+    <div id="browser-auth-modal" class="modal-overlay dialog-overlay hidden">
+        <div class="modal-card modal-sm">
+            <div class="modal-header">
+                <div class="modal-title-group">
+                    <h3>🔐 Dedicated Browser Profile Login</h3>
+                    <p class="modal-subtitle">Log in to your accounts once. Cookies & sessions persist automatically in
+                        <code>.chrome_profile</code>.
+                    </p>
+                </div>
+                <button class="modal-close" onclick="closeBrowserAuthModal()">&times;</button>
+            </div>
+            <div style="padding: 10px 0; display: flex; flex-direction: column; gap: 12px;">
+                <p style="font-size: 13px; color: #a6adc8; line-height: 1.5;">
+                    The agent uses an isolated, secure Chrome profile to read your LinkedIn job recommendations, sync
+                    saved applications, and perform Assisted Apply.
+                </p>
+                <div style="display: flex; flex-direction: column; gap: 10px;">
+                    <button class="btn btn-outline"
+                        style="justify-content: flex-start; padding: 10px 14px; font-size: 13px;"
+                        onclick="launchBrowserAuth('https://www.linkedin.com/login')">
+                        🔗 <strong>Launch LinkedIn Login</strong> <span
+                            style="margin-left:auto; font-size:11px; color:#6c7086;">linkedin.com</span>
+                    </button>
+                    <button class="btn btn-outline"
+                        style="justify-content: flex-start; padding: 10px 14px; font-size: 13px;"
+                        onclick="launchBrowserAuth('https://www.hirist.tech/login')">
+                        ⚡ <strong>Launch Hirist.tech Login</strong> <span
+                            style="margin-left:auto; font-size:11px; color:#6c7086;">hirist.tech</span>
+                    </button>
+                    <div style="margin-top: 6px;">
+                        <label style="font-size: 12px; font-weight: 600; margin-bottom: 6px; display: block;">🌐 Or Open
+                            Custom Portal URL:</label>
+                        <div style="display: flex; gap: 8px;">
+                            <input type="url" id="custom-auth-url" placeholder="https://..." class="form-input"
+                                style="flex:1; padding: 6px 10px; font-size: 13px; background:#181825; border:1px solid #313244; border-radius:6px; color:#cdd6f4;">
+                            <button class="btn btn-primary btn-sm" onclick="launchCustomBrowserAuth()">Launch</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer" style="padding-top: 15px; display: flex; justify-content: flex-end;">
+                <button type="button" class="btn btn-outline" onclick="closeBrowserAuthModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Operations & Sync History Modal -->
+    <div id="operations-log-modal" class="modal-overlay dialog-overlay hidden">
+        <div class="modal-card modal-lg" style="max-width: 880px;">
+            <div class="modal-header">
+                <div class="modal-title-group">
+                    <h3 class="modal-title">📜 Operations & Sync History</h3>
+                    <p class="modal-subtitle">Persistent chronological audit trail of all background syncs, ATS
+                        discoveries, and form fills</p>
+                </div>
+                <button class="modal-close" onclick="closeOperationsModal()">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 15px 0;">
+                <div
+                    style="display: flex; gap: 10px; justify-content: space-between; align-items: center; padding: 0 15px 12px 15px; border-bottom: 1px solid #313244;">
+                    <div class="filter-tabs" style="display: flex; gap: 6px;">
+                        <button class="filter-tab-btn active" data-op-filter="all"
+                            onclick="filterOperationLogs('all')">All (<span id="op-count-all">0</span>)</button>
+                        <button class="filter-tab-btn" data-op-filter="linkedin_sync"
+                            onclick="filterOperationLogs('linkedin_sync')">LinkedIn Sync (<span
+                                id="op-count-li">0</span>)</button>
+                        <button class="filter-tab-btn" data-op-filter="ats_scrape"
+                            onclick="filterOperationLogs('ats_scrape')">ATS Scrapes (<span
+                                id="op-count-ats">0</span>)</button>
+                        <button class="filter-tab-btn" data-op-filter="assisted_apply"
+                            onclick="filterOperationLogs('assisted_apply')">Applications (<span
+                                id="op-count-apply">0</span>)</button>
+                    </div>
+                    <div style="display: flex; gap: 8px;">
+                        <button class="btn btn-outline btn-sm" onclick="fetchOperationLogs(true)">🔄 Refresh</button>
+                        <button class="btn btn-outline btn-sm"
+                            style="color: #f87171; border-color: rgba(248,113,113,0.3);"
+                            onclick="clearOperationHistory()">🗑️ Clear Logs</button>
+                    </div>
+                </div>
+
+                <div id="operations-loading" class="upload-loading hidden" style="padding: 30px; text-align: center;">
+                    <div class="spinner"></div>
+                    <p style="margin-top: 10px; color: #a6adc8;">Loading operation logs...</p>
+                </div>
+
+                <div id="operations-empty" class="empty-state hidden" style="padding: 40px 20px; text-align: center;">
+                    <span style="font-size: 32px; display: block; margin-bottom: 8px;">📋</span>
+                    <p style="color: #a6adc8;">No operations recorded yet. Background syncs and application form-fills
+                        will appear here automatically.</p>
+                </div>
+
+                <div id="operations-log-list"
+                    style="max-height: 460px; overflow-y: auto; padding: 12px 15px; display: flex; flex-direction: column; gap: 10px;">
+                    <!-- Populated via app.js -->
+                </div>
+            </div>
+            <div class="modal-footer" style="padding-top: 15px; display: flex; justify-content: flex-end;">
+                <button type="button" class="btn btn-outline" onclick="closeOperationsModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- TOKEN USAGE & COST SAVINGS ANALYTICS MODAL -->
+    <div id="token-analytics-modal" class="modal-overlay hidden">
+        <div class="modal-container" style="max-width: 680px;">
+            <div class="modal-header">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <div
+                        style="font-size: 24px; background: rgba(166, 227, 161, 0.15); width: 40px; height: 40px; border-radius: 10px; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(166, 227, 161, 0.3);">
+                        💰</div>
+                    <div>
+                        <h3 class="modal-title">LLM Token Usage & Cost Analytics</h3>
+                        <p class="modal-subtitle">Track real-time token throughput and cost comparisons between Local
+                            LLMs and Paid Cloud APIs.</p>
+                    </div>
+                </div>
+                <button class="modal-close-btn" onclick="closeTokenAnalyticsModal()">×</button>
+            </div>
+            <div class="modal-body" style="padding: 20px;">
+                <!-- Summary Metrics Grid -->
+                <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 20px;">
+                    <div
+                        style="background: #11111b; border: 1px solid #28293d; border-radius: 8px; padding: 12px; text-align: center;">
+                        <span style="font-size: 11px; color: #a6adc8; text-transform: uppercase;">Total Tokens</span>
+                        <h3 id="analytics-total-tokens" style="font-size: 20px; color: #89b4fa; margin-top: 4px;">0</h3>
+                        <span id="analytics-token-split" style="font-size: 10px; color: #6c7086;">0 in / 0 out</span>
+                    </div>
+                    <div
+                        style="background: #11111b; border: 1px solid #28293d; border-radius: 8px; padding: 12px; text-align: center;">
+                        <span style="font-size: 11px; color: #a6adc8; text-transform: uppercase;">Inferences Run</span>
+                        <h3 id="analytics-total-calls" style="font-size: 20px; color: #cdd6f4; margin-top: 4px;">0</h3>
+                        <span style="font-size: 10px; color: #6c7086;">100% On-Device / Local</span>
+                    </div>
+                    <div
+                        style="background: #11111b; border: 1px solid rgba(166, 227, 161, 0.3); border-radius: 8px; padding: 12px; text-align: center;">
+                        <span style="font-size: 11px; color: #a6e3a1; text-transform: uppercase;">Total Dollars
+                            Saved</span>
+                        <h3 id="analytics-total-savings" style="font-size: 20px; color: #a6e3a1; margin-top: 4px;">
+                            +$0.00</h3>
+                        <span style="font-size: 10px; color: #6c7086;">vs GPT-4o Cloud Tier</span>
+                    </div>
+                </div>
+
+                <!-- Cost vs Speed Trade-Off Insight Callout -->
+                <div id="analytics-tradeoff-insight"
+                    style="background: rgba(137, 180, 250, 0.08); border: 1px solid rgba(137, 180, 250, 0.25); border-radius: 8px; padding: 12px 14px; margin-bottom: 16px; font-size: 12px; line-height: 1.5; color: #cdd6f4;">
+                    💡 <strong>Cost vs. Speed Trade-Off Insight:</strong> Running these <span id="insight-calls-count"
+                        style="font-weight: 600; color: #89b4fa;">0</span> inferences locally saved <span
+                        id="insight-saved" style="color: #a6e3a1; font-weight: 600;">$0.00</span> vs flagship GPT-4o.
+                    Running on <strong style="color: #89b4fa;">Gemini 2.0 Flash</strong> would cost only <span
+                        id="insight-flash-cost" style="color: #fab387; font-weight: 600;">$0.00</span> total.
+                </div>
+
+                <!-- Comparison Cost & Latency Table -->
+                <div
+                    style="background: #11111b; border: 1px solid #28293d; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
+                    <h4
+                        style="font-size: 13px; color: #f8fafc; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between;">
+                        <span>💵 Cost Comparison (Local vs Cloud Inference)</span>
+                        <span class="badge active" style="font-size: 10px;">Zero Cloud Bill</span>
+                    </h4>
+                    <table style="width: 100%; border-collapse: collapse; font-size: 12px; text-align: left;">
+                        <thead>
+                            <tr style="border-bottom: 1px solid #28293d; color: #a6adc8;">
+                                <th style="padding: 8px 6px;">Provider / Model</th>
+                                <th style="padding: 8px 6px;">Rate (In / Out / 1M)</th>
+                                <th style="padding: 8px 6px; text-align: right;">Estimated Cost</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr
+                                style="border-bottom: 1px solid rgba(255,255,255,0.05); color: #a6e3a1; font-weight: 600;">
+                                <td style="padding: 8px 6px;">🛡️ Local Engine (LM Studio / Ollama)</td>
+                                <td style="padding: 8px 6px;">$0.00 (Self-hosted)</td>
+                                <td style="padding: 8px 6px; text-align: right;">$0.0000</td>
+                            </tr>
+                            <tr style="border-bottom: 1px solid rgba(255,255,255,0.05); color: #cdd6f4;">
+                                <td style="padding: 8px 6px;">✨ Google Gemini 2.0 Flash</td>
+                                <td style="padding: 8px 6px;">$0.10 / $0.40</td>
+                                <td id="cost-gemini" style="padding: 8px 6px; text-align: right; color: #fab387;">
+                                    $0.0000</td>
+                            </tr>
+                            <tr style="border-bottom: 1px solid rgba(255,255,255,0.05); color: #cdd6f4;">
+                                <td style="padding: 8px 6px;">🟢 OpenAI GPT-4o-mini</td>
+                                <td style="padding: 8px 6px;">$0.15 / $0.60</td>
+                                <td id="cost-gpt4o-mini" style="padding: 8px 6px; text-align: right; color: #fab387;">
+                                    $0.0000</td>
+                            </tr>
+                            <tr style="border-bottom: 1px solid rgba(255,255,255,0.05); color: #cdd6f4;">
+                                <td style="padding: 8px 6px;">🔵 DeepSeek-V3</td>
+                                <td style="padding: 8px 6px;">$0.14 / $0.28</td>
+                                <td id="cost-deepseek" style="padding: 8px 6px; text-align: right; color: #fab387;">
+                                    $0.0000</td>
+                            </tr>
+                            <tr style="border-bottom: 1px solid rgba(255,255,255,0.05); color: #cdd6f4;">
+                                <td style="padding: 8px 6px;">🟢 OpenAI GPT-4o (Flagship)</td>
+                                <td style="padding: 8px 6px;">$2.50 / $10.00</td>
+                                <td id="cost-gpt4o" style="padding: 8px 6px; text-align: right; color: #f38ba8;">$0.0000
+                                </td>
+                            </tr>
+                            <tr style="color: #cdd6f4;">
+                                <td style="padding: 8px 6px;">🟣 Anthropic Claude 3.5 Sonnet</td>
+                                <td style="padding: 8px 6px;">$3.00 / $15.00</td>
+                                <td id="cost-claude" style="padding: 8px 6px; text-align: right; color: #f38ba8;">
+                                    $0.0000</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div style="display: flex; gap: 8px;">
+                        <button class="btn btn-outline btn-sm" onclick="resetTokenCounter()"
+                            style="color: #f38ba8; border-color: rgba(243,139,168,0.3);">
+                            🗑️ Reset Counter
+                        </button>
+                        <button class="btn btn-outline btn-sm" onclick="openTokenAnalyticsModal(true)"
+                            style="color: #89b4fa; border-color: rgba(137,180,250,0.3);">
+                            🔄 Refresh
+                        </button>
+                    </div>
+                    <button class="btn btn-primary btn-sm" onclick="closeTokenAnalyticsModal()">
+                        Done
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- GOOGLE FOR JOBS DISCOVERY MODAL -->
+    <div id="google-jobs-modal" class="modal-overlay hidden">
+        <div class="modal-container" style="max-width: 620px;">
+            <div class="modal-header">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <div
+                        style="font-size: 24px; background: rgba(137, 180, 250, 0.15); width: 40px; height: 40px; border-radius: 10px; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(137, 180, 250, 0.3);">
+                        🌐</div>
+                    <div>
+                        <h3 class="modal-title">Google for Jobs Alert Searches</h3>
+                        <p class="modal-subtitle">Configure followed alert queries and scan Google for Jobs
+                            (ibp=htl;jobs) in batch.</p>
+                    </div>
+                </div>
+                <button class="modal-close-btn" onclick="closeGoogleJobsModal()">×</button>
+            </div>
+            <div class="modal-body" style="padding: 20px;">
+                <!-- Followed Alert Queries Section -->
+                <div
+                    style="background: rgba(30, 30, 46, 0.7); border: 1px solid #313244; border-radius: 10px; padding: 14px; margin-bottom: 16px;">
+                    <div
+                        style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <span
+                            style="font-size: 13px; font-weight: 600; color: #cdd6f4; display: flex; align-items: center; gap: 6px;">
+                            📋 Configured Followed Queries
+                            <span id="google-searches-count-badge" class="badge"
+                                style="background: rgba(137, 180, 250, 0.2); color: #89b4fa; font-size: 11px;">0
+                                queries</span>
+                        </span>
+                        <button class="btn btn-outline btn-xs" onclick="syncGoogleFollowedQueries()"
+                            id="btn-sync-google-tabs"
+                            title="Import followed alert queries from Google for Jobs 'Following' tab"
+                            style="font-size: 11px; padding: 3px 8px;">
+                            🔄 Sync from Google
+                        </button>
+                    </div>
+
+                    <div id="google-searches-list"
+                        style="display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; max-height: 130px; overflow-y: auto; padding: 8px; background: #181825; border-radius: 8px; border: 1px solid #313244;">
+                        <!-- Populated dynamically via JS -->
+                        <span style="color: #6c7086; font-size: 12px;">Loading configured alert queries...</span>
+                    </div>
+
+                    <div style="display: flex; gap: 8px; margin-top: 8px;">
+                        <input type="text" id="google-new-query-input" class="form-input"
+                            placeholder="e.g. Product companies Senior Staff Software Engineer jobs in India"
+                            style="flex: 1; font-size: 12px; padding: 6px 10px;">
+                        <button class="btn btn-secondary btn-sm" onclick="addGoogleJobQuery()"
+                            style="font-size: 12px; padding: 6px 12px;">
+                            ➕ Add Alert
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Scan Parameters Section -->
+                <div style="margin-bottom: 14px;">
+                    <label
+                        style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: #cdd6f4; font-weight: 600; cursor: pointer; margin-bottom: 8px;">
+                        <input type="checkbox" id="google-jobs-scan-all-check" checked
+                            onchange="toggleGoogleJobsSingleQueryMode()">
+                        Scan All Configured Followed Queries in Batch
+                    </label>
+                </div>
+
+                <div id="google-jobs-single-query-group" class="form-group hidden" style="margin-bottom: 14px;">
+                    <label
+                        style="font-size: 12px; color: #a6adc8; font-weight: 500; display: block; margin-bottom: 4px;">Single
+                        Custom Query Override</label>
+                    <input type="text" id="google-jobs-query-input" class="form-input"
+                        placeholder="e.g. Senior Staff Backend Engineer" style="width: 100%; font-size: 13px;">
+                </div>
+
+                <div class="form-group" style="margin-bottom: 14px;">
+                    <label
+                        style="font-size: 12px; color: #a6adc8; font-weight: 500; display: block; margin-bottom: 4px;">Default
+                        Location / Region</label>
+                    <input type="text" id="google-jobs-location-input" class="form-input"
+                        placeholder="e.g. India, Remote, Hyderabad" value="India" style="width: 100%; font-size: 13px;">
+                </div>
+
+                <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 18px;">
+                    <label
+                        style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #a6adc8; cursor: pointer;">
+                        <input type="checkbox" id="google-jobs-browser-mode">
+                        Use Persistent Chrome Browser (Playwright)
+                    </label>
+                </div>
+
+                <div id="google-jobs-loading" class="upload-loading hidden"
+                    style="text-align: center; padding: 15px 0;">
+                    <div class="spinner"></div>
+                    <p style="margin-top: 8px; color: #89b4fa; font-size: 13px;">Scraping Google for Jobs and evaluating
+                        ATS alignment...</p>
+                </div>
+
+                <div style="display: flex; justify-content: flex-end; gap: 10px;">
+                    <button class="btn btn-outline" onclick="closeGoogleJobsModal()">Cancel</button>
+                    <button id="btn-submit-google-jobs-scrape" class="btn btn-primary"
+                        onclick="submitGoogleJobsScrape()">
+                        🚀 Run Discovery Scan
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- OPPORTUNITY RADAR MODAL -->
+    <div id="opportunity-radar-modal" class="modal-overlay dialog-overlay hidden">
+        <div class="modal-card modal-lg" style="max-width: 860px;">
+            <div class="modal-header">
+                <div class="modal-title-group">
+                    <h3 class="modal-title">🛰️ Opportunity Radar</h3>
+                    <p class="modal-subtitle">Ranked hiring-intent opportunities from your structured sources — LinkedIn
+                        job alerts &amp; recommendations, ATS portals, Google Jobs, and recruiter outreach.
+                        Structured-only; no fragile content scraping.</p>
+                </div>
+                <button class="modal-close" onclick="closeOpportunityRadarModal()">&times;</button>
+            </div>
+
+            <div class="modal-body" style="padding: 10px 0;">
+                <!-- Radar Controls -->
+                <div
+                    style="display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; padding: 0 15px 16px 15px; border-bottom: 1px solid #313244;">
+                    <div style="flex: 1; min-width: 130px;">
+                        <label
+                            style="font-size: 12px; color: #a6adc8; display: block; margin-bottom: 4px; font-weight: 500;">Min
+                            Intent</label>
+                        <select id="radar-min-intent" class="form-input" onchange="fetchOpportunityRadar()"
+                            style="width: 100%; padding: 8px 10px; font-size: 13px; background: #11111b; border: 1px solid #313244; border-radius: 6px; color: #cdd6f4;">
+                            <option value="0">Any</option>
+                            <option value="25">25+</option>
+                            <option value="50" selected>50+</option>
+                            <option value="75">75+</option>
+                        </select>
+                    </div>
+                    <div style="flex: 1.4; min-width: 180px;">
+                        <label
+                            style="font-size: 12px; color: #a6adc8; display: block; margin-bottom: 4px; font-weight: 500;">Scope</label>
+                        <select id="radar-scope" class="form-input" onchange="fetchOpportunityRadar()"
+                            style="width: 100%; padding: 8px 10px; font-size: 13px; background: #11111b; border: 1px solid #313244; border-radius: 6px; color: #cdd6f4;">
+                            <option value="active" selected>Actionable (To Apply / Shortlisted)</option>
+                            <option value="all">Include applied</option>
+                        </select>
+                    </div>
+                    <div style="flex: 1.6; min-width: 180px;">
+                        <label
+                            style="font-size: 12px; color: #a6adc8; display: block; margin-bottom: 4px; font-weight: 500;">Filter
+                            by Source</label>
+                        <input type="text" id="radar-source-filter" class="form-input"
+                            placeholder="e.g. LinkedIn, Greenhouse" oninput="renderOpportunityRadar()"
+                            style="width: 100%; padding: 8px 12px; font-size: 13px; background: #11111b; border: 1px solid #313244; border-radius: 6px; color: #cdd6f4;">
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 6px; padding-bottom: 9px;">
+                        <input type="checkbox" id="radar-respect-prefs" checked onchange="fetchOpportunityRadar()"
+                            style="cursor: pointer;">
+                        <label for="radar-respect-prefs" style="font-size: 12px; color: #a6adc8; cursor: pointer;"
+                            title="Limit results to your saved target roles, cities, and work mode">Match my
+                            preferences</label>
+                    </div>
+                    <div>
+                        <button id="btn-refresh-radar" class="btn btn-primary" onclick="fetchOpportunityRadar()"
+                            style="padding: 8px 16px; height: 38px;">↻ Refresh</button>
+                    </div>
+                </div>
+
+                <div style="padding: 8px 15px; display: flex; justify-content: space-between; align-items: center;">
+                    <span id="radar-count" style="font-size: 12px; color: #a6adc8;">0 opportunities</span>
+                </div>
+
+                <!-- Loading State -->
+                <div id="radar-loading" class="upload-loading hidden" style="padding: 35px; text-align: center;">
+                    <div class="spinner"></div>
+                    <p style="margin-top: 10px; color: #89b4fa; font-size: 13px;">Ranking opportunities from your
+                        structured sources...</p>
+                </div>
+
+                <!-- Empty State -->
+                <div id="radar-empty" class="empty-state" style="padding: 40px 20px; text-align: center;">
+                    <span style="font-size: 32px; display: block; margin-bottom: 8px;">🛰️</span>
+                    <p style="color: #a6adc8;" id="radar-empty-text">No ranked opportunities found. Run a LinkedIn sync
+                        or an ATS scan to populate structured sources.</p>
+                </div>
+
+                <!-- Results List -->
+                <div id="radar-results"
+                    style="max-height: 520px; overflow-y: auto; padding: 14px 15px; display: flex; flex-direction: column; gap: 12px;">
+                    <!-- Dynamically populated via app.js -->
+                </div>
+            </div>
+
+            <div class="modal-footer" style="padding-top: 15px; display: flex; justify-content: flex-end;">
+                <button type="button" class="btn btn-outline" onclick="closeOpportunityRadarModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Floating AI Copilot Trigger Button -->
+    <button id="btn-open-copilot" class="floating-copilot-btn" onclick="toggleCopilotDrawer()"
+        title="Open AI Career Copilot">
+        <span class="copilot-btn-sparkle">✨</span>
+        <span class="copilot-btn-text">AI Copilot</span>
+    </button>
+
+    <!-- Backdrop for Slide-Out Drawer -->
+    <div id="copilot-backdrop" class="copilot-backdrop hidden" onclick="toggleCopilotDrawer()"></div>
+
+    <!-- Slide-Out AI Career Copilot Drawer -->
+    <div id="copilot-drawer" class="copilot-drawer hidden">
+        <div class="copilot-drawer-header">
+            <div class="copilot-header-title">
+                <span class="copilot-header-icon">✨</span>
+                <div>
+                    <h3 style="margin: 0; font-size: 15px; color: #f8fafc; font-weight: 700;">Career Copilot</h3>
+                    <div style="font-size: 11px; color: #a6adc8; display: flex; align-items: center; gap: 6px;">
+                        <span class="pulse-dot"
+                            style="width: 6px; height: 6px; background: #a6e3a1; border-radius: 50%; display: inline-block;"></span>
+                        <span id="copilot-model-indicator">Local AI Ready</span>
+                    </div>
+                </div>
+            </div>
+            <div class="copilot-header-actions">
+                <button class="copilot-icon-btn" onclick="clearCopilotHistory()" title="Clear Chat History">🗑️</button>
+                <button class="copilot-icon-btn" onclick="toggleCopilotDrawer()" title="Close Copilot">✕</button>
+            </div>
+        </div>
+
+        <!-- Focus Job Header Pill (if chatting in context of specific job) -->
+        <div id="copilot-focus-job-bar" class="copilot-focus-job-bar hidden">
+            <span style="font-size: 11px; color: #89b4fa; font-weight: 600;" id="copilot-focus-job-title">Context: no
+                job selected</span>
+            <button class="copilot-clear-focus-btn" onclick="clearCopilotJobFocus()"
+                title="Clear Job Context">×</button>
+        </div>
+
+        <!-- Quick Prompt Chips -->
+        <div class="copilot-quick-pills" id="copilot-quick-pills">
+            <button class="quick-pill" onclick="handleCopilotQuickPrompt('What are my top 3 job matches right now?')">⚡
+                Top Matches</button>
+            <button class="quick-pill"
+                onclick="handleCopilotQuickPrompt('Give me a quick summary of my active pipeline')">📊 Pipeline
+                Summary</button>
+            <button class="quick-pill" onclick="handleCopilotQuickPrompt('Who is hiring?')">👥 Hiring Posts</button>
+            <button class="quick-pill"
+                onclick="handleCopilotQuickPrompt('How should I answer why I want to work in distributed systems?')">🎯
+                Mock Interview</button>
+            <button class="quick-pill" onclick="handleCopilotQuickPrompt('Find remote Staff Engineer roles')">💼 Search
+                Remote Roles</button>
+        </div>
+
+        <!-- Messages Thread -->
+        <div class="copilot-messages-container" id="copilot-messages-container">
+            <!-- Messages dynamically rendered here -->
+        </div>
+
+        <!-- Input Area -->
+        <div class="copilot-input-container">
+            <div class="copilot-input-wrapper">
+                <textarea id="copilot-input" class="copilot-textarea" placeholder="Ask your Career Copilot anything..."
+                    rows="1" onkeydown="handleCopilotInputKey(event)"></textarea>
+                <button id="btn-copilot-send" class="copilot-send-btn" onclick="sendCopilotMessage()"
+                    title="Send Message">
+                    <span>➤</span>
+                </button>
+            </div>
+            <div class="copilot-footer-note">
+                <span>Autonomous actions will update your pipeline in real time. Press Esc to close.</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification Toast -->
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="app.js?v=20260907_8.7"></script>
+</body>
+
+</html>
