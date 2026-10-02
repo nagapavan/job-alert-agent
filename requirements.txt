@@ -21,6 +21,8 @@ google-api-python-client==2.200.0
 python-jobspy>=1.1.0
 geonamescache==3.0.2
 pycountry==26.2.16
+# scikit-learn==1.5.2  # Optional: Install manually if needed for ML-trained classifier
+# On Python 3.14+, pre-built wheels may not be available; fallback heuristic is always active
 
 # NOTE: PyMuPDF (pymupdf / pymupdf4llm) is intentionally NOT a dependency because it is
 # dual-licensed AGPL-3.0 / Artifex Commercial, which is incompatible with this project's MIT

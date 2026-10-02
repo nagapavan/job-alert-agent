@@ -20,6 +20,8 @@ Where to look for the deep-dive topics:
 
 | Topic | Document / section |
 | :--- | :--- |
+| **AI/ML Portfolio Journey & Decision Making** | [`PORTFOLIO_JOURNEY.md`](PORTFOLIO_JOURNEY.md) (narrative arc from monolithic LLM → performance crisis → hybrid classifier breakthrough; why each decision was made, trade-offs analyzed, lessons learned; **for LinkedIn/interviews**) |
+| **Fast classifier + on-demand LLM analysis** | [`HYBRID_MATCHER_GUIDE.md`](HYBRID_MATCHER_GUIDE.md) (complete walkthrough: how it works, API reference, architecture, feature extraction, benchmarks, training) |
 | Architecture diagrams (Mermaid + text/ASCII) | [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §1–20 (text topology in §19) |
 | Code examples for every major component | [`PROJECT_INDEX.md`](../PROJECT_INDEX.md) → "Code Examples — Major Components" |
 | Database schema + explanations | [`AGENTS.md`](../AGENTS.md) §5 & §9 |
@@ -43,7 +45,6 @@ Where to look for the deep-dive topics:
 | Gmail API Flow (opt-in, BYOK) | [`GMAIL_API.md`](GMAIL_API.md) | Implemented design: loopback OAuth, encrypted token storage, narrow-query metadata-only fetch, dedup, endpoints, UI. |
 | ATS Portal Support & Probing | [`ATS_PORTALS.md`](ATS_PORTALS.md) | Design spec: supported portals (Greenhouse/Lever/Ashby/Uber/custom), scraper + filter contracts, requisition-active probing subsystem, and the SmartRecruiters/Workable/Workday roadmap with verified endpoints. |
 | One-Shot "Sync All" Orchestrator | [`SYNC_ALL_PLAN.md`](SYNC_ALL_PLAN.md) | Implemented plan: single `POST /api/tasks/sync/all` orchestrating ATS portals, Google Jobs, LinkedIn, and application-status sync with per-stage skip/fail handling. |
-| Antigravity planning artifacts | [`antigravity/`](antigravity/README.md) | Original requirements, implementation plan, task list, and walkthrough from the Antigravity IDE session (provenance). |
 
 ## Location filtering & aliases
 

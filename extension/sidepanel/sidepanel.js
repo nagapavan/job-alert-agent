@@ -221,6 +221,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     titleEl.innerText = "Inspecting active tab...";
     scoreCircle.innerText = "...";
+    scoreCircle.style.borderColor = "";
+    scoreCircle.style.color = "";
+    scoreLabel.innerText = "";
     analysisBox.innerHTML = "<p>Analyzing requirements against candidate resume...</p>";
 
     try {
@@ -315,7 +318,44 @@ document.addEventListener("DOMContentLoaded", async () => {
             '<button class="sp-btn-secondary" id="sp-reprocess-match" style="margin-top:10px;">🔄 Re-process match analysis</button>';
           document.getElementById("sp-reprocess-match")?.addEventListener("click", inspectActiveTab);
         } else {
-          analysisBox.innerHTML = escapeHtml(matchResult.analysis || "").replace(/\n/g, "<br/>");
+          let resultHtml = escapeHtml(matchResult.analysis || "").replace(/\n/g, "<br/>");
+          
+          // If score came from fast classifier, show "Explain" button for detailed LLM analysis
+          if (matchResult.analysis_source === "classifier" && matchResult.job_id) {
+            resultHtml += '<button class="sp-btn-secondary" id="sp-explain-analysis" style="margin-top:10px;">💡 View Detailed Analysis</button>';
+          }
+          
+          analysisBox.innerHTML = resultHtml;
+          
+          if (matchResult.analysis_source === "classifier" && matchResult.job_id) {
+            document.getElementById("sp-explain-analysis")?.addEventListener("click", async () => {
+              analysisBox.innerHTML = "<p>Loading detailed analysis...</p>";
+              try {
+                const detailedResp = await fetch(
+                  `${window.jobAgentRuntime.backendUrl}/api/match/${matchResult.job_id}/detailed-analysis`,
+                  {
+                    method: "POST",
+                    headers: window.jobAgentRuntime.getAuthHeaders()
+                  }
+                );
+                if (detailedResp.ok) {
+                  const detailedData = await detailedResp.json();
+                  const detailedHtml = `
+                    <h4>Detailed Analysis</h4>
+                    <div style="margin-top: 10px;">
+                      ${escapeHtml(detailedData.analysis || "").replace(/\n/g, "<br/>")}
+                    </div>
+                  `;
+                  analysisBox.innerHTML = detailedHtml;
+                } else {
+                  analysisBox.innerHTML = "<p>Error loading detailed analysis.</p>";
+                }
+              } catch (err) {
+                console.error("Failed to load detailed analysis:", err);
+                analysisBox.innerHTML = "<p>Error: Could not fetch detailed analysis.</p>";
+              }
+            });
+          }
         }
       });
     } catch (e) {

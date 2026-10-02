@@ -136,8 +136,8 @@ def stub_discovery_llm_scoring(monkeypatch):
         monkeypatch.setattr(main, "assess_job_requirements", _empty)
 
 
-@pytest.fixture(autouse=True)
 def override_get_db():
+    """Dependency override for FastAPI app testing (not a pytest fixture)."""
     db = TestingSessionLocal()
     try:
         yield db

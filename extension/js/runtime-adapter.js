@@ -156,6 +156,8 @@ class JobAgentRuntimeAdapter {
             return {
               matchScore: score,
               analysis: this._formatMatchAnalysis(score, res),
+              analysis_source: res.analysis_source || "llm",
+              job_id: res.job_id,
               mode: "connected"
             };
           }

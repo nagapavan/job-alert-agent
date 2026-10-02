@@ -24,3 +24,8 @@ data/resumes/
 .aider*
 logs/
 *.log
+
+# Internal development docs (team knowledge base, not for OSS)
+AGENTS.md
+PROJECT_INDEX.md
+DEVELOPMENT_NOTES.md

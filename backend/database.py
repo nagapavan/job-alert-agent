@@ -582,6 +582,7 @@ def init_db(custom_url: str = None):
     except Exception as mig_err:
         logger.warning(f"Schema auto-migration skipped: {mig_err}")
 
+    global SessionLocal
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
     # Secure file permissions on browser profile directory

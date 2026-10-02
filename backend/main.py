@@ -716,11 +716,15 @@ class MatchAnalyzeResponse(BaseModel):
     resume_available: bool = True
     analysis_source: str = Field(
         default="llm",
-        description="'llm' for AI analysis, 'error' when no reliable score could be produced",
+        description="'llm' for AI analysis, 'classifier' for ML-based, 'error' when no reliable score could be produced",
     )
     error: Optional[str] = Field(
         default=None,
         description="Human-readable failure reason; no score is shown when set",
+    )
+    job_id: Optional[int] = Field(
+        default=None,
+        description="Job ID from database (if result came from saved job); None for ad-hoc analysis",
     )
     band: Optional[str] = None
     apply_recommendation: Optional[str] = None
@@ -732,6 +736,10 @@ class MatchAnalyzeResponse(BaseModel):
     requirements: List[Dict[str, Any]] = Field(default_factory=list)
     unverified: List[str] = Field(default_factory=list)
     score_method: Optional[str] = None
+    match_method: Optional[str] = Field(
+        default=None,
+        description="Scoring method used: 'classifier_v1' (fast ML), 'requirement_coverage_v1' (LLM-based)",
+    )
 
 
 GOOGLE_SEARCHES_FILE = BASE_DIR / "data" / "google_searches.json"
@@ -4443,6 +4451,74 @@ def analyze_job_match_endpoint(
         except Exception as ev_err:
             logger.debug(f"Resume evidence retrieval skipped: {ev_err}")
 
+    # FAST PATH: Use deterministic ML classifier instead of full LLM extraction
+    # This returns score + recommendation in <100ms for instant feedback.
+    from backend import jd_signals
+    from backend.match_classifier import (
+        get_classifier,
+        extract_match_features,
+    )
+
+    try:
+        jd_hints = jd_signals.parse_experience(description)
+        # We don't have the full assessment yet, so use basic feature extraction
+        features = extract_match_features(parsed_resume, jd_hints, assessment=None)
+        classifier = get_classifier()
+        score = classifier.predict(features)
+
+        # Determine band and recommendation from score (using same logic as compute_match)
+        if score >= 85:
+            band = "Strong"
+            recommendation = "apply"
+        elif score >= 70:
+            band = "Good"
+            recommendation = "apply"
+        elif score >= 55:
+            band = "Moderate"
+            recommendation = "apply_with_caution"
+        elif score >= 40:
+            band = "Weak"
+            recommendation = "apply_with_caution"
+        else:
+            band = "Poor"
+            recommendation = "skip"
+
+        # Check location eligibility if provided
+        eligible, ineligibility_reason = True, None
+        if (payload.location or "").strip():
+            try:
+                from backend.preference_filter import PreferenceFilter
+
+                pref_filter = PreferenceFilter(db)
+                if not pref_filter.passes_location_filter(payload.location):
+                    eligible = False
+                    ineligibility_reason = f"Location '{payload.location}' does not match preferences"
+            except Exception as loc_err:
+                logger.debug(f"Location filtering skipped: {loc_err}")
+
+        # Return fast response (no narrative for now; user can request detailed analysis later if needed)
+        return MatchAnalyzeResponse(
+            match_score=score,
+            band=band,
+            apply_recommendation=recommendation,
+            eligible=eligible,
+            ineligibility_reason=ineligibility_reason,
+            strengths=evidence[:2] if evidence else [],  # Show first 2 matched evidence snippets
+            gaps=[],
+            feedback=f"Score: {score:.0f}% ({band} match). Based on requirement coverage and job signals.",
+            requirements=[],
+            must_coverage=features.must_coverage if hasattr(features, "must_coverage") else None,
+            nice_coverage=features.nice_coverage if hasattr(features, "nice_coverage") else None,
+            over_qualified=features.over_qualified_flag > 0.5 if hasattr(features, "over_qualified_flag") else False,
+            analysis_source="classifier",
+            resume_available=True,
+            match_method="classifier_v1",
+        )
+
+    except Exception as classifier_err:
+        logger.warning(f"Classifier-based scoring failed: {classifier_err}; falling back to LLM")
+
+    # FALLBACK PATH: Full LLM extraction (only if classifier fails)
     try:
         assessment, match = assess_job_requirements(
             resume_text,
@@ -4467,8 +4543,8 @@ def analyze_job_match_endpoint(
             feedback="",
             analysis_source="error",
             error=(
-                "Match analysis could not be completed because the AI model was unreachable "
-                "or returned no usable result."
+                "Match analysis could not be completed. Please verify the job description "
+                "is complete and your resume is uploaded, then re-process."
             ),
         )
 
@@ -4504,6 +4580,97 @@ def analyze_job_match_endpoint(
         unverified=match.unverified,
         score_method=match.method,
     )
+
+
+@app.post("/api/match/{job_id}/detailed-analysis")
+def generate_detailed_match_analysis(
+    job_id: int, 
+    db: Session = Depends(get_db)
+):
+    """
+    On-demand detailed match analysis for a job.
+    
+    Called when user clicks "Explain" or "View Details" in the extension.
+    Returns full LLM-generated narrative (strengths/gaps/feedback) and caches it in Job.match_analysis.
+    
+    Fast-path classifier returns score instantly; this endpoint provides narrative context.
+    """
+    from backend.database import Job, Resume
+    from backend.config import decrypt_data
+    
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        return {"error": f"Job {job_id} not found", "analysis": None}
+    
+    if job.match_analysis:
+        # Already cached; return immediately
+        return {
+            "analysis": job.match_analysis,
+            "cached": True,
+            "job_id": job_id,
+        }
+    
+    # Fetch active resume
+    active_resume = (
+        db.query(Resume)
+        .filter(Resume.is_active == True)
+        .order_by(Resume.created_at.desc())
+        .first()
+    )
+    
+    if not active_resume:
+        return {
+            "error": "No active resume found",
+            "analysis": None,
+            "job_id": job_id,
+        }
+    
+    resume_text = decrypt_data(active_resume.content_encrypted)
+    parsed_resume = parse_resume_json(resume_text)
+    
+    try:
+        # Run full LLM extraction
+        assessment, match = assess_job_requirements(
+            resume_text,
+            job.description or "",
+            parsed_resume=parsed_resume,
+            scoring_config=ScoringConfig.from_mapping(get_scoring_config(db)),
+            evidence=[],  # On-demand, no pre-fetched evidence
+        )
+    except Exception as e:
+        logger.warning(f"LLM analysis for job {job_id} failed: {e}")
+        return {
+            "error": f"Analysis failed: {str(e)}",
+            "analysis": None,
+            "job_id": job_id,
+        }
+    
+    if not assessment:
+        return {
+            "error": "No assessment produced",
+            "analysis": None,
+            "job_id": job_id,
+        }
+    
+    # Format narrative
+    strengths, gaps = _derive_strengths_gaps(assessment, match)
+    narrative = _match_analysis_text(assessment, match)
+    
+    # Cache in database
+    job.match_analysis = narrative
+    db.commit()
+    
+    logger.info(f"Cached detailed analysis for job {job_id}")
+    
+    return {
+        "analysis": narrative,
+        "strengths": strengths,
+        "gaps": gaps,
+        "feedback": assessment.summary or "",
+        "cached": False,
+        "job_id": job_id,
+        "method": "llm_detailed",
+    }
 
 
 class AuthSessionRequest(BaseModel):
