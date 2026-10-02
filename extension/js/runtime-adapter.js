@@ -232,16 +232,44 @@ class JobAgentRuntimeAdapter {
     const strengths = (data.strengths || []).map(s => String(s).trim()).filter(Boolean).slice(0, 6);
     const gaps = (data.gaps || []).map(g => String(g).trim()).filter(Boolean).slice(0, 6);
     const feedback = String(data.feedback || data.summary || "").trim();
+    const band = String(data.band || "").trim();
+    const rec = String(data.apply_recommendation || "").trim();
+    const missingMust = (data.requirements || [])
+      .filter(r => r && r.category === "must_have" && r.status === "missing")
+      .map(r => String(r.text || "").trim())
+      .filter(Boolean);
     // The side panel escapes HTML and converts newlines, so emit plain text (no markdown syntax).
-    const lines = [`Match Alignment: ${score}%`, ""];
+    const lines = [];
+    if (rec) {
+      const label = rec === "apply" ? "✅ Apply"
+        : rec === "apply_with_caution" ? "⚠️ Apply with caution"
+        : rec === "skip" ? "⛔ Skip"
+        : "Unverified";
+      lines.push(`Recommendation: ${label}${band ? ` (${band} match)` : ""}`);
+      lines.push("");
+    }
+    if (data.eligible === false && data.ineligibility_reason) {
+      lines.push(`⛔ Not eligible: ${String(data.ineligibility_reason).trim()}`);
+      lines.push("");
+    }
+    lines.push(`Match Alignment: ${score}%`, "");
     lines.push("Key Strengths Detected:");
     lines.push(strengths.length ? strengths.map(s => `• ${s}`).join("\n") : "• No direct strengths detected.");
     lines.push("");
     lines.push("Missing Keywords / Gaps:");
     lines.push(gaps.length ? gaps.map(g => `• ${g}`).join("\n") : "• None detected.");
+    if (missingMust.length) {
+      lines.push("");
+      lines.push("Missing Must-Haves:");
+      lines.push(missingMust.slice(0, 3).map(m => `• ${m}`).join("\n"));
+    }
+    if (data.over_qualified) {
+      lines.push("");
+      lines.push("Note: you appear over-qualified for this role (advisory — your call whether to apply).");
+    }
     if (feedback) {
       lines.push("");
-      lines.push("Recommendation:");
+      lines.push("Summary:");
       lines.push(feedback);
     }
     return lines.join("\n");

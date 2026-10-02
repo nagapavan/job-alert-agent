@@ -7,6 +7,7 @@ import re
 import threading
 import time
 import urllib.parse
+from collections import namedtuple
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -44,7 +45,8 @@ logger = logging.getLogger("api")
 from playwright.sync_api import sync_playwright
 
 from backend.ai_helper import (
-    analyze_job_match,
+    MIN_JOB_DESCRIPTION_CHARS,
+    assess_job_requirements,
     batch_autofill_essay_answers,
     check_semantic_dismissal,
     detect_active_llm_provider,
@@ -96,6 +98,7 @@ from backend.database import (
     get_consents,
     get_db,
     get_feature_flags,
+    get_scoring_config,
     get_user_preferences,
     has_consent,
     init_db,
@@ -105,6 +108,7 @@ from backend.database import (
 )
 from backend.llm_queue import LLMPriority, llm_queue
 from backend.matchers import check_title_match
+from backend.match_scoring import SCORE_METHOD, ScoringConfig
 from backend.observability import setup_observability, tail_log_file
 from backend.parser import (
     clean_job_description,
@@ -128,6 +132,7 @@ from backend.preference_filter import (
     check_location_match,
     check_workmode_match,
 )
+from backend.resume_index import index_resume_chunks, top_evidence
 from backend.scheduler import ScheduledJobConfig, scheduler
 from backend.scraper import (
     evaluate_job_due_diligence,
@@ -208,6 +213,11 @@ _extension_origin_regex = (
     + r")$"
     if _allowed_extension_ids
     else None
+)
+
+ScoringResult = namedtuple(
+    "ScoringResult",
+    ["score", "analysis", "scored", "method", "timestamp", "band", "recommendation"],
 )
 
 
@@ -564,6 +574,10 @@ class JobOut(BaseModel):
     repost_count: int
     submission_confirmed: bool = False
     match_scored: bool = False
+    score_method: Optional[str] = None
+    match_scored_at: Optional[datetime.datetime] = None
+    match_band: Optional[str] = None
+    apply_recommendation: Optional[str] = None
     applied_at: Optional[datetime.datetime] = None
     interview_scheduled_at: Optional[datetime.datetime] = None
     rejected_at: Optional[datetime.datetime] = None
@@ -687,13 +701,14 @@ class MatchAnalyzeRequest(BaseModel):
     job_title: str = Field(..., min_length=1, max_length=500)
     company: Optional[str] = Field(default="", max_length=255)
     job_description: Optional[str] = Field(default="", max_length=20000)
+    location: Optional[str] = Field(default="", max_length=255)
     resume_text: Optional[str] = Field(default=None, max_length=60000)
 
 
 class MatchAnalyzeResponse(BaseModel):
     match_score: Optional[float] = Field(
         default=None,
-        description="ATS alignment confidence score (0.0 to 100.0); None when the analysis failed",
+        description="Deterministic requirement-coverage score (0.0 to 100.0); None when analysis failed",
     )
     strengths: List[str] = Field(default_factory=list)
     gaps: List[str] = Field(default_factory=list)
@@ -707,6 +722,16 @@ class MatchAnalyzeResponse(BaseModel):
         default=None,
         description="Human-readable failure reason; no score is shown when set",
     )
+    band: Optional[str] = None
+    apply_recommendation: Optional[str] = None
+    must_coverage: Optional[float] = None
+    nice_coverage: Optional[float] = None
+    over_qualified: bool = False
+    eligible: bool = True
+    ineligibility_reason: Optional[str] = None
+    requirements: List[Dict[str, Any]] = Field(default_factory=list)
+    unverified: List[str] = Field(default_factory=list)
+    score_method: Optional[str] = None
 
 
 GOOGLE_SEARCHES_FILE = BASE_DIR / "data" / "google_searches.json"
@@ -2567,6 +2592,11 @@ async def upload_resume(file: UploadFile = File(...), db: Session = Depends(get_
     db.commit()
     db.refresh(new_resume)
 
+    try:
+        index_resume_chunks(db, new_resume)
+    except Exception as idx_err:
+        logger.debug(f"Resume chunk indexing skipped: {idx_err}")
+
     return ResumeOut(
         id=new_resume.id,
         filename=new_resume.filename,
@@ -2730,6 +2760,7 @@ class UserPreferenceIn(BaseModel):
     timezone: Optional[str] = None
     features: Optional[Dict[str, bool]] = None
     consents: Optional[Dict[str, Any]] = None
+    scoring_config: Optional[Dict[str, float]] = None
     excluded_companies: Optional[str] = None
 
 
@@ -2745,6 +2776,7 @@ class UserPreferenceOut(BaseModel):
     consents: Dict[str, Any] = {}
     consent_version: int = CONSENT_VERSION
     consent_required_features: List[str] = []
+    scoring_config: Dict[str, float] = {}
     excluded_companies: str = ""
 
 
@@ -2778,6 +2810,7 @@ def get_preferences(db: Session = Depends(get_db)):
         consents=get_consents(db),
         consent_version=CONSENT_VERSION,
         consent_required_features=list(CONSENT_REQUIRED_FEATURES),
+        scoring_config=get_scoring_config(db),
         excluded_companies=pref.excluded_companies
         if pref.excluded_companies is not None
         else "amazon",
@@ -2832,6 +2865,13 @@ def update_preferences(payload: UserPreferenceIn, db: Session = Depends(get_db))
                 ),
             )
         pref.features_json = json.dumps(current)
+    if payload.scoring_config is not None:
+        # Keep only known keys; merge over existing so partial updates are supported.
+        current = get_scoring_config(db)
+        for key, value in payload.scoring_config.items():
+            if key in current and value is not None:
+                current[key] = float(value)
+        pref.scoring_config_json = json.dumps(current)
     if payload.excluded_companies is not None:
         # Normalize to a clean comma-separated, lowercased blocklist.
         tokens = [
@@ -2965,6 +3005,11 @@ def update_resume_skills(
     target.parsed_json_encrypted = encrypt_data(json.dumps(parsed_json))
     db.commit()
     db.refresh(target)
+
+    try:
+        index_resume_chunks(db, target)
+    except Exception as idx_err:
+        logger.debug(f"Resume chunk indexing skipped: {idx_err}")
 
     decrypted_content = decrypt_data(target.content_encrypted)
     return ResumeOut(
@@ -3262,13 +3307,7 @@ def _execute_ats_scrape(
         .first()
     )
     resume_text = decrypt_data(active_resume.content_encrypted) if active_resume else ""
-    resume_skills = []
-    if active_resume and active_resume.parsed_json_encrypted:
-        try:
-            parsed = json.loads(decrypt_data(active_resume.parsed_json_encrypted))
-            resume_skills = [s.lower() for s in parsed.get("skills", [])]
-        except Exception:
-            pass
+    parsed_resume = _parsed_resume_of(active_resume)
 
     # Parse target criteria filters into the shared preference gate (single source of truth).
     title_filters = (
@@ -3483,14 +3522,27 @@ def _execute_ats_scrape(
                 else None
             )
 
-            # Fast keyword/semantic match score
+            # Requirement-coverage match score (deterministic engine).
             match_score = 0
-            if resume_skills and not dismissal_match:
-                job_text_lower = f"{j['title']} {j.get('description', '')}".lower()
-                matched_count = sum(1 for s in resume_skills if s in job_text_lower)
-                if resume_skills:
-                    ratio = matched_count / max(len(resume_skills), 1)
-                    match_score = round(min(98.0, max(50.0, 50.0 + (ratio * 50.0))), 1)
+            match_scored = False
+            score_method = match_scored_at = match_band = apply_recommendation = None
+            if not dismissal_match:
+                (
+                    match_score,
+                    engine_analysis,
+                    match_scored,
+                    score_method,
+                    match_scored_at,
+                    match_band,
+                    apply_recommendation,
+                ) = _score_job_with_engine(
+                    db,
+                    resume_text,
+                    j.get("description") or "",
+                    parsed_resume=parsed_resume,
+                )
+                if engine_analysis:
+                    match_analysis = engine_analysis
 
             job_emb = generate_embeddings(
                 f"{j['title']} {clean_job_description(j.get('description', '') or j['title'])}"
@@ -3509,6 +3561,11 @@ def _execute_ats_scrape(
                 status=job_status,
                 match_score=match_score,
                 match_analysis=match_analysis,
+                match_scored=match_scored,
+                score_method=score_method,
+                match_scored_at=match_scored_at,
+                match_band=match_band,
+                apply_recommendation=apply_recommendation,
                 cover_letter_draft=None,
                 tailored_resume_points=None,
                 cold_message_draft=None,
@@ -4244,23 +4301,78 @@ def career_copilot_chat(req: ChatAssistantRequest, db: Session = Depends(get_db)
         )
 
 
-def _match_result_lacks_detail(result: dict) -> bool:
+def _derive_strengths_gaps(assessment, match) -> tuple:
+    """Derive the strengths/gaps bullet lists from the requirement breakdown."""
+    reqs = assessment.requirements
+    strengths = [r.text for r in reqs if r.status == "met" and r.text]
+    if len(strengths) < 4:
+        strengths += [
+            r.text
+            for r in reqs
+            if r.status == "partial" and r.text and r.text not in strengths
+        ]
+    gaps = list(match.missing_must_haves)
+    for req in reqs:
+        if req.status in ("missing", "partial") and req.text and req.text not in gaps:
+            gaps.append(req.text)
+    return strengths[:4], gaps[:3]
+
+
+def _parsed_resume_of(resume):
+    """Decrypt and parse a resume's structured JSON, or None."""
+    if not (resume and getattr(resume, "parsed_json_encrypted", None)):
+        return None
+    try:
+        return json.loads(decrypt_data(resume.parsed_json_encrypted))
+    except Exception:
+        return None
+
+
+def _score_job_with_engine(
+    db, resume_text, description, parsed_resume=None
+) -> ScoringResult:
+    """Score a discovered job with the requirement-coverage engine.
+
+    Returns ``(match_score, match_analysis, match_scored, score_method, match_scored_at,
+    match_band, apply_recommendation)``. Failures degrade to an unscored baseline rather
+    than fabricating a score.
     """
-    True when the analyzer produced no usable detail: either the empty JobMatchResult default,
-    or one of its generic error sentinels when the model was unreachable. We surface this as an
-    explicit error rather than fabricating a score.
-    """
-    if result.get("match_score") is None:
-        return True
-    if [s for s in (result.get("strengths") or []) if s]:
-        return False
-    gaps = [str(g).strip() for g in (result.get("gaps") or []) if g]
-    feedback = str(result.get("feedback") or "").strip()
-    if feedback.lower().startswith("analysis encountered an error"):
-        return True
-    if gaps and all(g.lower() == "unable to complete ai comparison." for g in gaps):
-        return True
-    return not gaps and not feedback
+    unscored = (0, "", False, None, None, None, None)
+    if not (resume_text or "").strip() or not (description or "").strip():
+        return unscored
+    if len(description.strip()) < MIN_JOB_DESCRIPTION_CHARS:
+        # No substantive job description -> do not fabricate a score.
+        return unscored
+    try:
+        assessment, match = assess_job_requirements(
+            resume_text,
+            description,
+            parsed_resume=parsed_resume,
+            scoring_config=ScoringConfig.from_mapping(get_scoring_config(db)),
+        )
+    except Exception as e:
+        logger.warning(f"Match scoring skipped: {e}")
+        return unscored
+
+    if match.score is None or not assessment.requirements:
+        return ScoringResult(
+            score=0,
+            analysis=(assessment.summary if assessment else ""),
+            scored=False,
+            method=None,
+            timestamp=None,
+            band=None,
+            recommendation=None,
+        )
+    return ScoringResult(
+        score=match.score,
+        analysis=_match_analysis_text(assessment, match),
+        scored=True,
+        method=match.method,
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+        band=match.band,
+        recommendation=match.apply_recommendation,
+    )
 
 
 @app.post("/api/match/analyze", response_model=MatchAnalyzeResponse)
@@ -4274,17 +4386,15 @@ def analyze_job_match_endpoint(
     structured result, so the displayed score circle and the analysis text can never diverge.
     If no resume_text is supplied, the active resume stored in the backend is used.
     """
+    active_resume = (
+        db.query(Resume)
+        .filter(Resume.is_active == True)
+        .order_by(Resume.created_at.desc())
+        .first()
+    )
     resume_text = (payload.resume_text or "").strip()
-    if not resume_text:
-        active_resume = (
-            db.query(Resume)
-            .filter(Resume.is_active == True)
-            .order_by(Resume.created_at.desc())
-            .first()
-        )
-        resume_text = (
-            decrypt_data(active_resume.content_encrypted) if active_resume else ""
-        )
+    if not resume_text and active_resume:
+        resume_text = decrypt_data(active_resume.content_encrypted)
 
     if not resume_text:
         return MatchAnalyzeResponse(
@@ -4297,14 +4407,55 @@ def analyze_job_match_endpoint(
             error="No resume available. Upload a resume in the dashboard to enable ATS match scoring.",
         )
 
-    description = (payload.job_description or "").strip() or payload.job_title
-    try:
-        result = analyze_job_match(resume_text, description)
-    except Exception as e:
-        logger.warning(f"Structured match analysis failed: {e}")
-        result = {}
+    parsed_resume = _parsed_resume_of(active_resume)
 
-    if _match_result_lacks_detail(result):
+    # Lazily index the active resume's chunks so RAG-lite evidence retrieval works
+    # for resumes uploaded before chunking existed.
+    if active_resume and parsed_resume:
+        try:
+            from backend.database import ResumeChunk
+
+            if (
+                db.query(ResumeChunk)
+                .filter(ResumeChunk.resume_id == active_resume.id)
+                .count()
+                == 0
+            ):
+                index_resume_chunks(db, active_resume)
+        except Exception as idx_err:
+            logger.debug(f"Resume chunk indexing skipped: {idx_err}")
+
+    description = (payload.job_description or "").strip()
+    if len(description) < MIN_JOB_DESCRIPTION_CHARS:
+        return MatchAnalyzeResponse(
+            match_score=None,
+            strengths=[],
+            gaps=[],
+            feedback="",
+            analysis_source="error",
+            error="Job description is too short to score reliably. Open the full posting and retry.",
+        )
+
+    evidence = []
+    if active_resume:
+        try:
+            evidence = top_evidence(db, active_resume.id, description, k=4)
+        except Exception as ev_err:
+            logger.debug(f"Resume evidence retrieval skipped: {ev_err}")
+
+    try:
+        assessment, match = assess_job_requirements(
+            resume_text,
+            description,
+            parsed_resume=parsed_resume,
+            scoring_config=ScoringConfig.from_mapping(get_scoring_config(db)),
+            evidence=evidence,
+        )
+    except Exception as e:
+        logger.warning(f"Requirement-based match analysis failed: {e}")
+        assessment, match = None, None
+
+    if assessment is None or not assessment.requirements:
         # Never fabricate a score. Surface the failure explicitly so the UI can offer a re-process.
         logger.warning(
             "Match analysis produced no usable result; returning an error state."
@@ -4321,16 +4472,37 @@ def analyze_job_match_endpoint(
             ),
         )
 
+    strengths, gaps = _derive_strengths_gaps(assessment, match)
+
+    eligible, ineligibility_reason = True, None
+    if (payload.location or "").strip():
+        try:
+            from backend.preference_filter import PreferenceFilter
+
+            reason = PreferenceFilter.from_db(db).rejection_reason(
+                payload.job_title, payload.location
+            )
+            if reason:
+                eligible, ineligibility_reason = False, reason
+        except Exception as e:
+            logger.debug(f"Eligibility check skipped: {e}")
+
     return MatchAnalyzeResponse(
-        match_score=(
-            float(result["match_score"])
-            if result.get("match_score") is not None
-            else None
-        ),
-        strengths=[str(s) for s in (result.get("strengths") or []) if s],
-        gaps=[str(g) for g in (result.get("gaps") or []) if g],
-        feedback=str(result.get("feedback") or ""),
+        match_score=match.score,
+        strengths=strengths,
+        gaps=gaps,
+        feedback=assessment.summary or "",
         analysis_source="llm",
+        band=match.band,
+        apply_recommendation=match.apply_recommendation,
+        must_coverage=match.must_coverage,
+        nice_coverage=match.nice_coverage,
+        over_qualified=match.over_qualified,
+        eligible=eligible,
+        ineligibility_reason=ineligibility_reason,
+        requirements=[r.model_dump() for r in assessment.requirements],
+        unverified=match.unverified,
+        score_method=match.method,
     )
 
 
@@ -4499,6 +4671,7 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
         .first()
     )
     resume_text = decrypt_data(active_resume.content_encrypted) if active_resume else ""
+    parsed_resume = _parsed_resume_of(active_resume)
 
     # Prefer server-persisted user preferences; fall back to resume-derived targets.
     pref = get_user_preferences(db)
@@ -4626,21 +4799,31 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                         )
                         job_status = "Not Interested" if dismissal_match else "To Apply"
 
-                        match_scored = False
-                        match_score = 0
+                        score_method = None
+                        match_scored_at = None
+                        match_band = None
+                        apply_recommendation = None
                         if dismissal_match:
                             dismissed_filtered += 1
+                            match_score, match_scored = 0, False
                             match_analysis = f"Auto-filtered by semantic ignore rule (matched: '{dismissal_match['matched_title']}' with {int(dismissal_match['similarity'] * 100)}% similarity)"
                         else:
-                            match_analysis = "Direct LinkedIn Job Alert match."
-                            if resume_text:
-                                analysis = analyze_job_match(
-                                    resume_text, rec.get("description", rec["title"])
-                                )
-                                if analysis.get("match_score") is not None:
-                                    match_score = analysis["match_score"]
-                                    match_analysis = f"Strengths: {', '.join(analysis.get('strengths', []))}. Gaps: {', '.join(analysis.get('gaps', []))}"
-                                    match_scored = True
+                            (
+                                match_score,
+                                match_analysis,
+                                match_scored,
+                                score_method,
+                                match_scored_at,
+                                match_band,
+                                apply_recommendation,
+                            ) = _score_job_with_engine(
+                                db,
+                                resume_text,
+                                rec.get("description") or "",
+                                parsed_resume=parsed_resume,
+                            )
+                            if not match_analysis:
+                                match_analysis = "Direct LinkedIn Job Alert match."
 
                         job_emb = generate_embeddings(
                             f"{rec['title']} {clean_job_description(rec.get('description', '') or rec['title'])}"
@@ -4657,6 +4840,10 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                             match_score=match_score,
                             match_analysis=match_analysis,
                             match_scored=match_scored,
+                            score_method=score_method,
+                            match_scored_at=match_scored_at,
+                            match_band=match_band,
+                            apply_recommendation=apply_recommendation,
                             cover_letter_draft=None,
                             tailored_resume_points=None,
                             cold_message_draft=None,
@@ -4731,16 +4918,22 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                                 portal_jobs=[],
                             )
 
-                            match_analysis = "Saved directly on LinkedIn."
-                            match_scored = False
-                            match_score = 0
-
-                            if resume_text:
-                                analysis = analyze_job_match(resume_text, item["title"])
-                                if analysis.get("match_score") is not None:
-                                    match_score = analysis["match_score"]
-                                    match_analysis = f"Strengths: {', '.join(analysis.get('strengths', []))}. Gaps: {', '.join(analysis.get('gaps', []))}"
-                                    match_scored = True
+                            (
+                                match_score,
+                                match_analysis,
+                                match_scored,
+                                score_method,
+                                match_scored_at,
+                                match_band,
+                                apply_recommendation,
+                            ) = _score_job_with_engine(
+                                db,
+                                resume_text,
+                                item.get("description") or "",
+                                parsed_resume=parsed_resume,
+                            )
+                            if not match_analysis:
+                                match_analysis = "Saved directly on LinkedIn."
 
                             job_emb = generate_embeddings(
                                 f"{item['title']} {clean_job_description(item.get('description', '') or item['title'])}"
@@ -4757,6 +4950,10 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                                 match_score=match_score,
                                 match_analysis=match_analysis,
                                 match_scored=match_scored,
+                                score_method=score_method,
+                                match_scored_at=match_scored_at,
+                                match_band=match_band,
+                                apply_recommendation=apply_recommendation,
                                 cover_letter_draft=None,
                                 tailored_resume_points=None,
                                 cold_message_draft=None,
@@ -4929,17 +5126,9 @@ def scrape_google_jobs_endpoint(
 
     # Candidate active resume data for match scoring
     active_resume = db.query(Resume).filter(Resume.is_active == True).first()
-    resume_skills = []
-    if active_resume:
-        try:
-            parsed_data = (
-                json.loads(decrypt_data(active_resume.parsed_json_encrypted))
-                if active_resume.parsed_json_encrypted
-                else {}
-            )
-            resume_skills = parsed_data.get("skills", [])
-        except Exception:
-            pass
+    resume_text = decrypt_data(active_resume.content_encrypted) if active_resume else ""
+    parsed_resume = _parsed_resume_of(active_resume)
+    resume_skills = (parsed_resume or {}).get("skills", [])
 
     if not queries_to_run:
         default_q = "Software Engineer"
@@ -5068,24 +5257,32 @@ def scrape_google_jobs_endpoint(
                 job_status = "Not Interested" if dismissal_match else "To Apply"
 
                 match_score = 0
+                match_scored = False
+                score_method = match_scored_at = match_band = apply_recommendation = (
+                    None
+                )
                 if dismissal_match:
                     q_dismissed += 1
                     dismissed_filtered += 1
                     match_analysis = f"Auto-filtered by semantic ignore rule (matched: '{dismissal_match['matched_title']}' with {int(dismissal_match['similarity'] * 100)}% similarity)"
                 else:
-                    match_analysis = (
-                        f"Direct Google Jobs match for alert: '{query_str}'."
+                    (
+                        match_score,
+                        match_analysis,
+                        match_scored,
+                        score_method,
+                        match_scored_at,
+                        match_band,
+                        apply_recommendation,
+                    ) = _score_job_with_engine(
+                        db,
+                        resume_text,
+                        j.get("description") or "",
+                        parsed_resume=parsed_resume,
                     )
-                    if resume_skills:
-                        job_text_lower = (
-                            f"{job_title} {j.get('description', '')}".lower()
-                        )
-                        matched_count = sum(
-                            1 for s in resume_skills if s.lower() in job_text_lower
-                        )
-                        ratio = matched_count / max(len(resume_skills), 1)
-                        match_score = round(
-                            min(98.0, max(50.0, 50.0 + (ratio * 50.0))), 1
+                    if not match_analysis:
+                        match_analysis = (
+                            f"Direct Google Jobs match for alert: '{query_str}'."
                         )
 
                 # Vector Embedding
@@ -5108,6 +5305,11 @@ def scrape_google_jobs_endpoint(
                     status=job_status,
                     match_score=match_score,
                     match_analysis=match_analysis,
+                    match_scored=match_scored,
+                    score_method=score_method,
+                    match_scored_at=match_scored_at,
+                    match_band=match_band,
+                    apply_recommendation=apply_recommendation,
                     cover_letter_draft=None,
                     tailored_resume_points=None,
                     cold_message_draft=None,
@@ -5646,6 +5848,7 @@ def _execute_external_sync(
         if (active_resume and active_resume.content_encrypted)
         else ""
     )
+    parsed_resume = _parsed_resume_of(active_resume)
 
     if cancel_token:
         cancel_token.check()
@@ -5739,17 +5942,22 @@ def _execute_external_sync(
                             db.add(comp)
                             db.flush()
 
-                        match_analysis = f"Imported from Hirist candidate applications dashboard. Current Status: {raw_status}."
-                        match_scored = False
-                        match_score = 0
-                        if resume_text:
-                            try:
-                                analysis = analyze_job_match(resume_text, title)
-                                if analysis.get("match_score") is not None:
-                                    match_score = analysis["match_score"]
-                                    match_scored = True
-                            except Exception as mat_err:
-                                logger.debug(f"Hirist match analysis skipped: {mat_err}")
+                        (
+                            match_score,
+                            match_analysis,
+                            match_scored,
+                            score_method,
+                            match_scored_at,
+                            match_band,
+                            apply_recommendation,
+                        ) = _score_job_with_engine(
+                            db,
+                            resume_text,
+                            item.get("description") or "",
+                            parsed_resume=parsed_resume,
+                        )
+                        if not match_analysis:
+                            match_analysis = f"Imported from Hirist candidate applications dashboard. Current Status: {raw_status}."
 
                         job_emb = generate_embeddings(
                             f"{title} {comp.name} {item.get('location', '')}"
@@ -5767,6 +5975,10 @@ def _execute_external_sync(
                             match_score=match_score,
                             match_analysis=match_analysis,
                             match_scored=match_scored,
+                            score_method=score_method,
+                            match_scored_at=match_scored_at,
+                            match_band=match_band,
+                            apply_recommendation=apply_recommendation,
                             applied_at=now_utc
                             if target_status in ["Applied", "Interview", "Rejected"]
                             else None,
@@ -6218,7 +6430,9 @@ def _run_linkedin_sync_task_runner(
     try:
         # Defense in depth: the runner gates itself, so no caller (including a forced "Run now")
         # can dispatch authenticated LinkedIn automation without an explicit acknowledgment.
-        if not is_feature_enabled(db, "linkedin_sync") or not has_consent(db, "linkedin_sync"):
+        if not is_feature_enabled(db, "linkedin_sync") or not has_consent(
+            db, "linkedin_sync"
+        ):
             if progress_cb:
                 progress_cb(
                     step=1,
@@ -6624,6 +6838,155 @@ class TaskResponse(BaseModel):
     message: str
 
 
+class RescoreRequest(BaseModel):
+    limit: int = Field(default=200, ge=1, le=2000)
+
+
+def _match_analysis_text(assessment, match) -> str:
+    strengths, gaps = _derive_strengths_gaps(assessment, match)
+    if strengths or gaps:
+        return f"Strengths: {', '.join(strengths)}. Gaps: {', '.join(gaps)}"
+    return assessment.summary or ""
+
+
+def _run_match_rescore_task_runner(
+    cancel_token: Optional[CancellationToken] = None,
+    progress_cb: Optional[Callable] = None,
+    limit: int = 200,
+) -> Dict[str, Any]:
+    """Background re-score of existing jobs with the requirement-coverage engine."""
+    db = next(get_db())
+    rescored = failed = 0
+    started = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        active = (
+            db.query(Resume)
+            .filter(Resume.is_active == True)
+            .order_by(Resume.created_at.desc())
+            .first()
+        )
+        if not active:
+            return {"rescored": 0, "failed": 0, "error": "no_active_resume"}
+
+        resume_text = decrypt_data(active.content_encrypted)
+        parsed_resume = None
+        if active.parsed_json_encrypted:
+            try:
+                parsed_resume = json.loads(decrypt_data(active.parsed_json_encrypted))
+            except Exception:
+                parsed_resume = None
+
+        # Ensure the active resume is chunk-indexed so evidence retrieval has data.
+        from backend.database import ResumeChunk
+
+        if (
+            db.query(ResumeChunk).filter(ResumeChunk.resume_id == active.id).count()
+            == 0
+        ):
+            try:
+                index_resume_chunks(db, active)
+            except Exception as idx_err:
+                logger.debug(f"Resume chunk indexing skipped: {idx_err}")
+
+        config = ScoringConfig.from_mapping(get_scoring_config(db))
+        jobs = (
+            db.query(Job)
+            .filter(Job.status.notin_(["Rejected", "Not Interested"]))
+            .order_by(Job.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+
+        for idx, job in enumerate(jobs):
+            if cancel_token:
+                cancel_token.check()
+            description = (job.description or job.title or "").strip()
+            try:
+                evidence = top_evidence(db, active.id, description, k=4)
+                assessment, match = assess_job_requirements(
+                    resume_text,
+                    description,
+                    parsed_resume=parsed_resume,
+                    scoring_config=config,
+                    evidence=evidence,
+                )
+                if match.score is None:
+                    failed += 1
+                else:
+                    job.match_score = match.score
+                    job.match_analysis = _match_analysis_text(assessment, match)
+                    job.match_scored = True
+                    job.score_method = match.method
+                    job.match_scored_at = datetime.datetime.now(datetime.timezone.utc)
+                    job.match_band = match.band
+                    job.apply_recommendation = match.apply_recommendation
+                    rescored += 1
+            except Exception as job_err:
+                failed += 1
+                logger.debug(f"Re-score skipped for job {job.id}: {job_err}")
+
+            if progress_cb:
+                progress_cb(
+                    step=idx + 1,
+                    label=f"Re-scored {rescored} job(s), {failed} skipped.",
+                    items_found=rescored,
+                    total_steps=len(jobs),
+                )
+            if idx < len(jobs) - 1:
+                time.sleep(0.3)
+
+        db.commit()
+
+        try:
+            db.add(
+                OperationLog(
+                    operation_type="match_rescore",
+                    status="Completed" if not failed else "Partial",
+                    summary=f"Re-scored {rescored} job(s) with {SCORE_METHOD}; {failed} skipped.",
+                    details_json=sanitize_log_details(
+                        {
+                            "rescored": rescored,
+                            "failed": failed,
+                            "limit": limit,
+                            "started_at": started.isoformat(),
+                        }
+                    ),
+                    jobs_count=rescored,
+                )
+            )
+            db.commit()
+        except Exception as op_err:
+            logger.warning(
+                f"Failed to persist OperationLog for match re-score: {op_err}"
+            )
+
+        return {"rescored": rescored, "failed": failed, "jobs_found": rescored}
+    finally:
+        db.close()
+
+
+@app.post(
+    "/api/match/rescore",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=TaskResponse,
+)
+def dispatch_match_rescore_task(payload: Optional[RescoreRequest] = None):
+    """Dispatches a non-blocking re-score of existing jobs with the current engine."""
+    limit = payload.limit if payload else 200
+    task_id = task_engine.submit_task(
+        task_type="match_rescore",
+        task_name=f"Re-score Job Matches (up to {limit})",
+        fn=_run_match_rescore_task_runner,
+        total_steps=1,
+        limit=limit,
+    )
+    return TaskResponse(
+        task_id=task_id,
+        status="QUEUED",
+        message=f"Match re-score queued for up to {limit} job(s).",
+    )
+
+
 @app.post(
     "/api/tasks/discovery/google-jobs",
     status_code=status.HTTP_202_ACCEPTED,
@@ -6731,34 +7094,6 @@ def list_active_background_tasks():
     return task_engine.get_active_tasks()
 
 
-@app.get("/api/tasks/{task_id}", response_model=TaskProgress)
-def get_task_status(task_id: str):
-    """Retrieves status and progress of a specific background task."""
-    progress = task_engine.get_task(task_id)
-    if not progress:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return progress
-
-
-@app.post("/api/tasks/{task_id}/cancel")
-def cancel_background_task(task_id: str):
-    """Cooperatively cancels a running or queued background task."""
-    success = task_engine.cancel_task(task_id)
-    if not success:
-        raise HTTPException(
-            status_code=400,
-            detail="Task could not be cancelled or has already completed.",
-        )
-    return {"status": "ok", "message": f"Cancellation requested for task {task_id}."}
-
-
-@app.delete("/api/tasks/completed")
-def clear_completed_tasks_endpoint():
-    """Clears completed and cancelled background tasks from memory."""
-    cleared = task_engine.clear_completed_tasks()
-    return {"status": "ok", "cleared_count": cleared}
-
-
 @app.get("/api/tasks/events")
 async def task_events_sse(request: Request):
     """
@@ -6796,6 +7131,34 @@ async def task_events_sse(request: Request):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.get("/api/tasks/{task_id}", response_model=TaskProgress)
+def get_task_status(task_id: str):
+    """Retrieves status and progress of a specific background task."""
+    progress = task_engine.get_task(task_id)
+    if not progress:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return progress
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def cancel_background_task(task_id: str):
+    """Cooperatively cancels a running or queued background task."""
+    success = task_engine.cancel_task(task_id)
+    if not success:
+        raise HTTPException(
+            status_code=400,
+            detail="Task could not be cancelled or has already completed.",
+        )
+    return {"status": "ok", "message": f"Cancellation requested for task {task_id}."}
+
+
+@app.delete("/api/tasks/completed")
+def clear_completed_tasks_endpoint():
+    """Clears completed and cancelled background tasks from memory."""
+    cleared = task_engine.clear_completed_tasks()
+    return {"status": "ok", "cleared_count": cleared}
 
 
 @app.get("/api/system/unified-status")

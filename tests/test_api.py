@@ -1991,3 +1991,27 @@ def test_hiring_team_uses_ddg_talent_partners_when_linkedin_disabled(mock_partne
     assert "https://linkedin.com/in/jane-recruiter" in urls
     mock_partners.assert_called_once()
 
+
+# -------------------------------------------------------------
+# Match-scoring configuration (user-tunable thresholds)
+# -------------------------------------------------------------
+def test_scoring_config_defaults_and_roundtrip():
+    data = client.get("/api/preferences").json()
+    assert data["scoring_config"]["must_weight"] == 3.0
+    assert data["scoring_config"]["good"] == 70.0
+
+    res = client.put(
+        "/api/preferences",
+        json={"scoring_config": {"must_floor": 0.2, "good": 60.0, "bogus": 9}},
+    )
+    assert res.status_code == 200
+    cfg = res.json()["scoring_config"]
+    assert cfg["must_floor"] == 0.2
+    assert cfg["good"] == 60.0
+    assert cfg["must_weight"] == 3.0   # untouched default preserved
+    assert "bogus" not in cfg          # unknown keys ignored
+
+    # Persisted across requests.
+    assert client.get("/api/preferences").json()["scoring_config"]["good"] == 60.0
+
+

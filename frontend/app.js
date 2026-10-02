@@ -1942,6 +1942,16 @@ function renderJobFeed(jobs) {
             ? "Not yet analyzed"
             : (job.match_scored ? "AI match score" : "Source baseline — not AI match-scored");
 
+        const recMap = {
+            apply: { label: "✅ Apply", cls: "rec-apply" },
+            apply_with_caution: { label: "⚠️ Caution", cls: "rec-caution" },
+            skip: { label: "⛔ Skip", cls: "rec-skip" },
+        };
+        const rec = recMap[job.apply_recommendation];
+        const recBadge = rec
+            ? `<span class="rec-badge ${rec.cls}" title="Requirement-coverage recommendation${job.match_band ? ` — ${job.match_band} match` : ''}">${rec.label}${job.match_band ? ` · ${job.match_band}` : ''}</span>`
+            : '';
+
         const compName = job.company_name || 'Direct';
         const initial = compName.trim().charAt(0).toUpperCase();
 
@@ -1974,6 +1984,7 @@ function renderJobFeed(jobs) {
                         ${job.status === 'Applied' ? (job.submission_confirmed ? `<span class="badge" style="background:rgba(166,227,161,0.2); color:#a6e3a1; border:1px solid rgba(166,227,161,0.5);">✅ Submitted</span>` : `<span class="badge" style="background:rgba(250,179,135,0.15); color:#fab387; border:1px solid rgba(250,179,135,0.4);">🕓 Awaiting submit</span>`) : ''}
                         ${ghostBadge}
                         ${tailoredBadge}
+                        ${recBadge}
                     </div>
                     <div class="job-meta-row">
                         <span class="job-meta-item">📍 ${escapeHTML(job.location || 'Remote / Various')}</span>

@@ -99,6 +99,23 @@ class Resume(Base):
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
+
+class ResumeChunk(Base):
+    """Embedded resume fragments (skills block, each role, each project) used for
+    RAG-lite evidence retrieval during requirement assessment."""
+
+    __tablename__ = "resume_chunks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    resume_id = Column(
+        Integer, ForeignKey("resumes.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    section = Column(String(50), default="other")   # skills | role | project | education
+    text = Column(Text, nullable=False)
+    embedding = Column(SafeVector(384), nullable=True)
+    created_at = Column(DateTime, default=utc_now)
+
+
 class Job(Base):
     __tablename__ = "jobs"
 
@@ -130,6 +147,12 @@ class Job(Base):
 
     # True only when match_score came from a real AI analysis (vs. a source/baseline/saved default)
     match_scored = Column(Boolean, default=False)
+    # Which scoring engine produced match_score (null for legacy/baseline scores) + when.
+    score_method = Column(String(50), nullable=True)
+    match_scored_at = Column(DateTime, nullable=True)
+    # Deterministic engine's qualitative result (for UI display).
+    match_band = Column(String(20), nullable=True)
+    apply_recommendation = Column(String(30), nullable=True)
 
     # Timeline Dates
     applied_at = Column(DateTime, nullable=True)
@@ -260,6 +283,7 @@ class UserPreference(Base):
     target_country = Column(String(100), default="")
     timezone = Column(String(64), default="")      # IANA tz (e.g. Asia/Kolkata); "" = browser default
     features_json = Column(Text, default="{}")     # opt-in feature flags (JSON)
+    scoring_config_json = Column(Text, default="{}")  # tunable match-scoring weights/cutoffs (JSON)
     consents_json = Column(Text, default="{}")     # explicit per-feature consent records (JSON, versioned)
     excluded_companies = Column(Text, default="amazon")  # comma-separated name/domain blocklist
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
@@ -347,6 +371,38 @@ def get_feature_flags(db) -> dict:
 def is_feature_enabled(db, feature: str) -> bool:
     """True when an opt-in discovery feature is enabled."""
     return bool(get_feature_flags(db).get(feature, False))
+
+
+# Tunable match-scoring parameters (mirrors backend.match_scoring.ScoringConfig defaults).
+DEFAULT_SCORING_CONFIG = {
+    "must_weight": 3.0,
+    "nice_weight": 1.0,
+    "must_floor": 0.5,
+    "cap_when_below_floor": 55.0,
+    "must_blend": 0.7,
+    "nice_blend": 0.3,
+    "strong": 85.0,
+    "good": 70.0,
+    "moderate": 55.0,
+    "weak": 40.0,
+}
+
+
+def get_scoring_config(db) -> dict:
+    """Returns the effective match-scoring config (stored overrides merged over defaults)."""
+    pref = get_user_preferences(db)
+    try:
+        stored = json.loads(pref.scoring_config_json or "{}")
+    except Exception:
+        stored = {}
+    config = dict(DEFAULT_SCORING_CONFIG)
+    for key in DEFAULT_SCORING_CONFIG:
+        if key in stored:
+            try:
+                config[key] = float(stored[key])
+            except (TypeError, ValueError):
+                pass
+    return config
 
 
 def get_consents(db) -> dict:
@@ -489,6 +545,14 @@ def init_db(custom_url: str = None):
                     conn.execute(text("ALTER TABLE jobs ADD COLUMN match_scored BOOLEAN DEFAULT 0;"))
                     # Backfill legacy rows whose score/analysis came from the AI analyzer
                     conn.execute(text("UPDATE jobs SET match_scored = 1 WHERE match_analysis LIKE 'Strengths:%';"))
+                if "score_method" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN score_method VARCHAR(50);"))
+                if "match_scored_at" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN match_scored_at DATETIME;"))
+                if "match_band" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN match_band VARCHAR(20);"))
+                if "apply_recommendation" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN apply_recommendation VARCHAR(30);"))
 
         if "companies" in existing_tables:
             col_names = {c["name"] for c in inspector.get_columns("companies")}
@@ -507,6 +571,8 @@ def init_db(custom_url: str = None):
                     conn.execute(text("ALTER TABLE user_preferences ADD COLUMN excluded_companies TEXT DEFAULT 'amazon';"))
                 if "consents_json" not in col_names:
                     conn.execute(text("ALTER TABLE user_preferences ADD COLUMN consents_json TEXT DEFAULT '{}';"))
+                if "scoring_config_json" not in col_names:
+                    conn.execute(text("ALTER TABLE user_preferences ADD COLUMN scoring_config_json TEXT DEFAULT '{}';"))
 
         if "dismissed_job_patterns" in existing_tables:
             col_names = {c["name"] for c in inspector.get_columns("dismissed_job_patterns")}

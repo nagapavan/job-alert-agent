@@ -1887,6 +1887,129 @@ def analyze_job_match(
         }
 
 
+MIN_JOB_DESCRIPTION_CHARS = 30
+
+_REQUIREMENT_EXTRACTION_PROMPT = (
+    "You are an expert technical recruiter. Extract the target job's requirements and assess "
+    "each one against the candidate resume. Output ONLY a valid JSON object matching the schema.\n"
+    "Schema fields per requirement:\n"
+    "  text: the requirement as stated in the posting.\n"
+    "  kind: one of skill, experience_years, seniority, education, certification, domain, work_mode, location, other.\n"
+    "  category: 'must_have' unless the posting marks it preferred/nice/plus/bonus (then 'nice_to_have').\n"
+    "  status: 'met' | 'partial' | 'missing' | 'unknown'. Use 'unknown' when the resume does not state enough to judge.\n"
+    "  weight: OPTIONAL relative importance (only when the posting emphasizes it); otherwise omit.\n"
+    "  scope: for experience_years only — 'total' for general experience, 'technology' when tied to a "
+    "specific technology (then also set technology).\n"
+    "  min_years / max_years: for experience_years, from the posting (e.g. '3+ years' -> min 3; '3-5 years' -> 3 and 5).\n"
+    "  evidence: a short snippet from the resume or posting supporting the status. Never invent facts.\n"
+    "Rules:\n"
+    "1. Ground every judgement in the provided resume; if a requirement is not mentioned, use 'unknown'.\n"
+    "2. Do not output any numeric score; scoring is done downstream.\n"
+    "3. Keep 'text' concise. At most one requirement per distinct posting requirement.\n"
+    "4. Set the top-level 'summary' to 1-2 neutral sentences (no score).\n"
+)
+
+
+def _normalize_assessment(assessment) -> None:
+    """Clamp model output to the known status/category vocabularies in place."""
+    from backend.match_scoring import MUST_HAVE, UNKNOWN
+
+    valid_status = {"met", "partial", "missing", "unknown"}
+    valid_category = {"must_have", "nice_to_have"}
+    for req in assessment.requirements:
+        req.text = (req.text or "").strip()
+        if req.status not in valid_status:
+            req.status = UNKNOWN
+        if req.category not in valid_category:
+            req.category = MUST_HAVE
+
+
+def _apply_over_qualification(assessment, candidate_years, hints) -> None:
+    """Deterministically flag over-qualification (advisory only; never affects the score)."""
+    from backend.jd_signals import is_over_qualified
+
+    if candidate_years is None:
+        return
+    for req in assessment.requirements:
+        if req.kind == "experience_years":
+            scope = req.scope or ("technology" if req.technology else "total")
+            hint = {
+                "min_years": req.min_years,
+                "max_years": req.max_years,
+                "scope": scope,
+                "technology": req.technology,
+                "snippet": req.text,
+            }
+            if is_over_qualified(candidate_years, hint):
+                req.over_qualified = True
+    if any(r.over_qualified for r in assessment.requirements) or any(
+        is_over_qualified(candidate_years, h) for h in hints
+    ):
+        assessment.over_qualified = True
+
+
+def assess_job_requirements(
+    resume_text: str,
+    job_description: str,
+    provider: Optional[str] = None,
+    parsed_resume: Optional[dict] = None,
+    scoring_config=None,
+    evidence: Optional[List[str]] = None,
+):
+    """Extract requirements, assess them against the resume, and score deterministically.
+
+    Returns ``(RequirementAssessment, MatchResult)``. Raises ValueError on empty inputs.
+    """
+    from backend import jd_signals, resume_signals
+    from backend.match_scoring import RequirementAssessment, compute_match
+
+    if not (resume_text or "").strip() or not (job_description or "").strip():
+        raise ValueError("Both resume_text and job_description are required.")
+    if len(job_description.strip()) < MIN_JOB_DESCRIPTION_CHARS:
+        raise ValueError("Job description is too short to assess reliably.")
+
+    hints = jd_signals.parse_experience(job_description)
+    education = jd_signals.parse_education(job_description)
+    certifications = jd_signals.parse_certifications(job_description)
+    candidate_years = resume_signals.estimate_total_years(parsed_resume)
+    candidate_seniority = resume_signals.latest_seniority(parsed_resume)
+
+    evidence_block = ""
+    if evidence:
+        evidence_block = (
+            "\n--- RESUME EVIDENCE (retrieved) ---\n"
+            + "\n".join(f"- {item}" for item in evidence)
+            + "\n"
+        )
+
+    user_prompt = (
+        "--- PRE-PARSED SIGNALS (authoritative; reuse these values) ---\n"
+        f"Experience hints: {json.dumps(hints)}\n"
+        f"Education mentioned: {education}\n"
+        f"Certifications mentioned: {certifications}\n"
+        f"Candidate total years (estimated): {candidate_years}\n"
+        f"Candidate latest seniority: {candidate_seniority}\n"
+        f"{evidence_block}\n"
+        f"--- CANDIDATE RESUME ---\n{resume_text}\n\n"
+        f"--- TARGET JOB DESCRIPTION ---\n{clean_job_description(job_description, max_chars=4000)}"
+    )
+
+    assessment: RequirementAssessment = generate_structured(
+        schema=RequirementAssessment,
+        system_prompt=_REQUIREMENT_EXTRACTION_PROMPT,
+        user_prompt=user_prompt,
+        provider=provider,
+        temperature=0.0,
+        max_tokens=1800,
+        task_type="job_match_scoring",
+        task_name="Requirement-Extraction",
+    )
+    _normalize_assessment(assessment)
+    _apply_over_qualification(assessment, candidate_years, hints)
+    result = compute_match(assessment, scoring_config)
+    return assessment, result
+
+
 class InterviewQuestion(BaseModel):
     """A single likely interview question with a resume-grounded STAR scaffold."""
 

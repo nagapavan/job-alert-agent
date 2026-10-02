@@ -713,6 +713,18 @@ def test_task_events_sse_asyncio_is_available():
     assert hasattr(main, "asyncio")
 
 
+def test_task_events_sse_route_precedes_dynamic_task_route():
+    """Regression: GET /api/tasks/events must be matched by the SSE handler, not
+    /api/tasks/{task_id} (which would swallow 'events' and return 404)."""
+    from backend.main import app
+
+    paths = [getattr(r, "path", None) for r in app.routes]
+    assert "/api/tasks/events" in paths
+    assert "/api/tasks/{task_id}" in paths
+    assert paths.index("/api/tasks/events") < paths.index("/api/tasks/{task_id}")
+
+
+
 # -------------------------------------------------------------
 # Unit Tests: Shared & Lever Requisition-Active Probes
 # -------------------------------------------------------------

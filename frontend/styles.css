@@ -1125,6 +1125,36 @@ body {
     padding-left: 2px;
 }
 
+.rec-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 9px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+}
+
+.rec-badge.rec-apply {
+    background: rgba(166, 227, 161, 0.16);
+    color: #a6e3a1;
+    border-color: rgba(166, 227, 161, 0.45);
+}
+
+.rec-badge.rec-caution {
+    background: rgba(250, 179, 135, 0.16);
+    color: #fab387;
+    border-color: rgba(250, 179, 135, 0.45);
+}
+
+.rec-badge.rec-skip {
+    background: rgba(243, 139, 168, 0.16);
+    color: #f38ba8;
+    border-color: rgba(243, 139, 168, 0.45);
+}
+
 .status-dropdown {
     padding: 7px 14px;
     border-radius: 20px;
