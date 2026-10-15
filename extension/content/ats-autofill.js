@@ -255,6 +255,38 @@
     }
   }
 
+  // LinkedIn replaced its job-detail DOM: JSON-LD JobPosting is no longer emitted and the
+  // old `.jobs-description__content` class is gone. The stable, job-scoped hook is the
+  // `JobDetails_AboutTheJob_<jobId>` id prefix, handled in the Tier-1 selector list below.
+
+  // Host-agnostic challenge/blocked-page detection. Only an *actual* challenge surface
+  // counts: a challenge URL, a rendered reCAPTCHA challenge iframe, or a page whose
+  // visible text is dominated by bot-check language. Merely loading recaptcha/api.js,
+  // having a `data-sitekey`, or an (often invisible) `.g-recaptcha` badge on a normal
+  // form is NOT a challenge — that would false-positive on ordinary application pages.
+  function isChallengeOrBlockedPage() {
+    const href = (window.location.href || "").toLowerCase();
+    const host = (window.location.hostname || "").toLowerCase();
+    // 1. URL-level: challenge/blocked endpoints.
+    if (/\/sorry\/|\/recaptcha\/|\/checkpoint|\/authwall|\/challenge/.test(href)) return true;
+    if (host.includes("google.com") && /recaptcha|sorry/.test(href)) return true;
+    // 2. DOM-level: a *rendered* reCAPTCHA challenge iframe (the interstitial itself).
+    try {
+      const frames = document.querySelectorAll("iframe[src*='google.com/recaptcha']");
+      for (const f of frames) {
+        // The challenge frame renders with a visible size; the invisible badge is tiny.
+        const r = f.getBoundingClientRect();
+        if (r.width >= 250 && r.height >= 100) return true;
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    // 3. Text-level: the visible page must be *dominated* by verification language.
+    const bodyText = (document.body && (document.body.innerText || "")) || "";
+    const head = bodyText.slice(0, 600).toLowerCase();
+    return /unusual activity|unusual traffic|verify you'?re a human|let'?s do a quick security check|security verification|complete the captcha|i'?m not a robot/i.test(head);
+  }
+
   function extractJsonLdJobPosting() {
     let scripts = [];
     try {
@@ -440,6 +472,21 @@
       }
     }
 
+    // Anti-bot / auth challenge pages (Google reCAPTCHA interstitial, LinkedIn
+    // checkpoint/authwall, etc.) are hard stops for EVERY host — never extract their
+    // content as a job description.
+    const isLinkedIn = ats === "linkedin";
+    if (isChallengeOrBlockedPage()) {
+      return {
+        title: title || document.title || "Target Position",
+        company: company || "Target Company",
+        description: "",
+        url: window.location.href,
+        atsType: ats,
+        challenge: true,
+      };
+    }
+
     // Tier 1: known ATS containers (deep query pierces shadow DOM)
     if (!description || description.length < 200) {
       const descSelectors = [
@@ -449,7 +496,10 @@
         ".posting-description",
         ".section-wrapper",
         "[data-automation-id='jobPostingDescription']",
+        // LinkedIn job-detail container (stable id prefix; per-job numeric suffix)
+        '[id^="JobDetails_AboutTheJob_"]',
         ".jobs-description__content",
+        ".jobs-box__html-content",
         ".show-more-less-html__markup",
         // iCIMS portal (e.g. globalcareers-<company>.icims.com)
         ".iCIMS_JobContent",
@@ -475,16 +525,19 @@
       }
     }
 
-    // Tier 2: largest semantic content block (JS-rendered / custom portals)
-    if (!description || description.length < 200) {
+    // Tier 2: largest semantic content block (JS-rendered / custom portals).
+    // LinkedIn is excluded: on LinkedIn `main`/`section` contain feed, "people you may
+    // know", and company-post noise, so the job-scoped Tier 1 is the only valid source.
+    if (!isLinkedIn && (!description || description.length < 200)) {
       const mainText = extractMainContentText();
       if (mainText.length > (description || "").length) {
         description = mainText;
       }
     }
 
-    // Tier 3: all-roots text fallback (light + shadow; raised cap; backend scopes sections)
-    if (!description || description.length < 200) {
+    // Tier 3: all-roots text fallback (light + shadow; raised cap; backend scopes sections).
+    // Never used for LinkedIn, where whole-page text is unrelated to the job.
+    if (!isLinkedIn && (!description || description.length < 200)) {
       const bodyText = deepRootsText();
       if (bodyText.length > (description || "").length) {
         description = bodyText;
@@ -1641,11 +1694,34 @@
     updateBadgeLifecycle();
   }
 
+  // Async, LinkedIn-aware extraction: on LinkedIn the job container is client-rendered,
+  // so wait (bounded) for it to appear before extracting. This eliminates the race that
+  // previously let the extractor fall through to whole-page feed text.
+  async function extractJobInfoAsync() {
+    try {
+      if (!isChallengeOrBlockedPage()) {
+        const isLinkedIn = (window.location.hostname || "").includes("linkedin.com");
+        // On LinkedIn the job container is client-rendered, so wait (bounded) for it.
+        // Other hosts render server-side; a short settle wait covers late hydration.
+        const deadline = Date.now() + (isLinkedIn ? 4000 : 1200);
+        while (Date.now() < deadline) {
+          if (isLinkedIn && deepQueryAll('[id^="JobDetails_AboutTheJob_"]').length > 0) break;
+          if (isChallengeOrBlockedPage()) break;
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      }
+    } catch (e) {
+      /* fall through to a best-effort synchronous extraction */
+    }
+    return extractJobMetadata();
+  }
+
   // Expose extraction entry points on the isolated-world window so the side panel can
   // collect data from EVERY frame via chrome.scripting.executeScript (hybrid pages embed
   // the JD/form in a cross-origin iframe, which the top frame cannot read directly).
   try {
     window.__jobAgentExtractJobInfo = extractJobMetadata;
+    window.__jobAgentExtractJobInfoAsync = extractJobInfoAsync;
     window.__jobAgentInspectFormTelemetry = inspectFormTelemetry;
   } catch (e) {
     /* isolated world should always allow this */

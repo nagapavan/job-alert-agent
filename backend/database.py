@@ -321,6 +321,7 @@ class UserPreference(Base):
     scoring_config_json = Column(Text, default="{}")  # tunable match-scoring weights/cutoffs (JSON)
     consents_json = Column(Text, default="{}")     # explicit per-feature consent records (JSON, versioned)
     excluded_companies = Column(Text, default="amazon")  # comma-separated name/domain blocklist
+    skip_topics = Column(Text, default="")  # comma-separated skill/keyword blocklist (titles + JDs)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
 
@@ -616,6 +617,8 @@ def init_db(custom_url: str = None):
                     conn.execute(text("ALTER TABLE user_preferences ADD COLUMN consents_json TEXT DEFAULT '{}';"))
                 if "scoring_config_json" not in col_names:
                     conn.execute(text("ALTER TABLE user_preferences ADD COLUMN scoring_config_json TEXT DEFAULT '{}';"))
+                if "skip_topics" not in col_names:
+                    conn.execute(text("ALTER TABLE user_preferences ADD COLUMN skip_topics TEXT DEFAULT '';"))
 
         if "dismissed_job_patterns" in existing_tables:
             col_names = {c["name"] for c in inspector.get_columns("dismissed_job_patterns")}

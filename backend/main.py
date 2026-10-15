@@ -36,6 +36,7 @@ from backend.config import (
 )
 from backend.matchers import detect_foreign_restriction
 from backend.playwright_app import BrowserProfileBusy, search_linkedin_talent_partners
+from backend.prompts import interview_prep_advisor_system
 
 logger = logging.getLogger("api")
 
@@ -2823,6 +2824,7 @@ class UserPreferenceIn(BaseModel):
     consents: Optional[Dict[str, Any]] = None
     scoring_config: Optional[Dict[str, float]] = None
     excluded_companies: Optional[str] = None
+    skip_topics: Optional[str] = None
 
 
 class UserPreferenceOut(BaseModel):
@@ -2839,6 +2841,7 @@ class UserPreferenceOut(BaseModel):
     consent_required_features: List[str] = []
     scoring_config: Dict[str, float] = {}
     excluded_companies: str = ""
+    skip_topics: str = ""
 
 
 def normalize_target_cities(raw: Optional[str]) -> str:
@@ -2875,6 +2878,7 @@ def get_preferences(db: Session = Depends(get_db)):
         excluded_companies=pref.excluded_companies
         if pref.excluded_companies is not None
         else "amazon",
+        skip_topics=pref.skip_topics or "",
     )
 
 
@@ -2941,6 +2945,14 @@ def update_preferences(payload: UserPreferenceIn, db: Session = Depends(get_db))
             if t.strip()
         ]
         pref.excluded_companies = ", ".join(dict.fromkeys(tokens))
+    if payload.skip_topics is not None:
+        # Normalize skip topics similar to excluded companies
+        tokens = [
+            t.strip().lower()
+            for t in payload.skip_topics.split(",")
+            if t.strip()
+        ]
+        pref.skip_topics = ", ".join(dict.fromkeys(tokens))
     db.commit()
     db.refresh(pref)
     return get_preferences(db=db)
@@ -3553,7 +3565,7 @@ def _execute_ats_scrape(
                 break
 
             # Semantic & Synonym Filtering via the shared preference gate
-            if not pref_filter.accepts(j.get("title", ""), j.get("location", "")):
+            if not pref_filter.accepts(j.get("title", ""), j.get("location", ""), j.get("description", "")):
                 continue
 
             existing = (
@@ -4245,18 +4257,14 @@ def interview_prep_chat(job_id: int, req: ChatRequest, db: Session = Depends(get
     cleaned_jd = clean_job_description(
         job.description or "Standard requirements for " + job.title, max_chars=800
     )
-    system_prompt = (
-        f"You are an elite executive career coach and interview preparation advisor. "
-        f"You are coaching the candidate for the role of '{job.title}' at '{comp_name}'.\n\n"
-        f"Context Details:\n"
-        f"- Target Position: {job.title}\n"
-        f"- Company: {comp_name}\n"
-        f"- Company News & Products: {comp.recent_news if comp else 'N/A'}\n"
-        f"- Company Hiring Process: {comp.hiring_process if comp else 'N/A'}\n"
-        f"- Compensation Insights: {comp.salary_insights if comp else 'N/A'}\n"
-        f"- Job Description: {cleaned_jd}\n"
-        f"- Candidate Profile: {resume_text[:1200]}\n\n"
-        "Provide tailored, actionable, high-impact advice. Answer directly and structure clearly with markdown."
+    system_prompt = interview_prep_advisor_system(
+        job_title=job.title,
+        company_name=comp_name,
+        recent_news=(comp.recent_news if comp else "N/A"),
+        hiring_process=(comp.hiring_process if comp else "N/A"),
+        salary_insights=(comp.salary_insights if comp else "N/A"),
+        cleaned_jd=cleaned_jd,
+        resume_text=resume_text,
     )
 
     reply = generate_text(
@@ -4662,7 +4670,7 @@ def analyze_job_match_endpoint(
     strengths, gaps = _derive_strengths_gaps(assessment, match)
 
     eligible, ineligibility_reason = _check_eligibility(
-        db, payload.job_title, payload.location
+        db, payload.job_title, payload.location, description
     )
 
     return MatchAnalyzeResponse(
@@ -6669,7 +6677,7 @@ def _run_google_jobs_task_runner(
 
                     # Preference gate (title / location / work-mode) before ingestion.
                     if pref_filter.rejection_reason(
-                        j_title, rj.get("location") or location
+                        j_title, rj.get("location") or location, rj.get("description", "")
                     ):
                         filtered_count += 1
                         continue
@@ -6911,7 +6919,7 @@ def _run_linkedin_sync_task_runner(
                 for rec in alerts_items or []:
                     # Preference gate: alert/recommendation feeds are discovery, not explicit intent.
                     if pref_filter.rejection_reason(
-                        rec.get("title", ""), rec.get("location") or ""
+                        rec.get("title", ""), rec.get("location") or "", rec.get("description", "")
                     ):
                         alerts_filtered += 1
                         continue
@@ -7694,7 +7702,7 @@ def _deterministic_match(
             score, scoring_config, gated=gated, over_qualified=over_qualified
         )
 
-        eligible, ineligibility_reason = _check_eligibility(db, job_title, location)
+        eligible, ineligibility_reason = _check_eligibility(db, job_title, location, description)
 
         # Surface the requirement breakdown so the score is transparent, not a black box.
         strengths, gaps = _derive_strengths_gaps(assessment)
@@ -7769,7 +7777,7 @@ def _deterministic_match(
         return None
 
 
-def _check_eligibility(db, job_title: str, location: str) -> tuple[bool, Optional[str]]:
+def _check_eligibility(db, job_title: str, location: str, description: str) -> tuple[bool, Optional[str]]:
     """Checks if the job is eligible based on user preferences."""
     try:
         # Check location eligibility if provided
@@ -7777,7 +7785,7 @@ def _check_eligibility(db, job_title: str, location: str) -> tuple[bool, Optiona
             from backend.preference_filter import PreferenceFilter
 
             reason = PreferenceFilter.from_db(db).rejection_reason(
-                job_title, location
+                job_title, location, description
             )
             if reason:
                 return False, reason

@@ -171,6 +171,32 @@ class TestDeterministicAssessment:
         assert by_text[skill] == expected_status
 
     @pytest.mark.parametrize(
+        "jd, parsed, resume_text, skill, expected_status",
+        [
+            # NodeJS in raw resume text is aliased to canonical node.js and matches a
+            # Node.js requirement directly.
+            ("Requires Node.js.", {"skills": ["Python"]},
+             "Built services with NodeJS.", "Node.js", "met"),
+            # A Node.js developer is partially (not fully) aligned with a JavaScript
+            # requirement via the front-end language-family concept group.
+            ("Requires JavaScript.", {"skills": ["Python"]},
+             "Built services with NodeJS.", "JavaScript", "partial"),
+            # TypeScript requirement is likewise partial for a Node developer.
+            ("Requires TypeScript.", {"skills": ["Python"]},
+             "Built services with NodeJS.", "TypeScript", "partial"),
+            # A resume with neither Node nor JS stays missing.
+            ("Requires JavaScript.", {"skills": ["Python"]},
+             "Python and Docker.", "JavaScript", "missing"),
+        ],
+    )
+    def test_nodejs_language_family_detection(self, jd, parsed, resume_text, skill, expected_status):
+        a = build_deterministic_assessment(
+            jd, parsed, resume_text=resume_text, job_title="Engineer"
+        )
+        by_text = {r.text: r.status for r in a.requirements}
+        assert by_text[skill] == expected_status
+
+    @pytest.mark.parametrize(
         "skill, expected_category",
         [("Python", "must_have"), ("Rust", "nice_to_have")],
     )
@@ -202,6 +228,25 @@ class TestDeterministicAssessment:
         a = build_deterministic_assessment(jd_degree, parsed, job_title="Engineer")
         edu = [r for r in a.requirements if r.kind == "education"]
         assert len(edu) == 1
+        assert edu[0].status == expected_status
+
+    @pytest.mark.parametrize(
+        "resume_degree, expected_status",
+        [
+            ("B.Tech in Computer Science", "met"),
+            ("Master's degree in CS", "met"),
+            ("PhD in CS", "met"),
+            ("Associate degree", "missing"),
+        ],
+    )
+    def test_education_alternative_list_uses_lowest_level(self, resume_degree, expected_status):
+        """A "BS/MS/PhD" list is alternatives: the effective requirement is the lowest (bachelor)."""
+        jd = "BS/MS/PhD in Computer Science or a related field."
+        parsed = {"education": [{"degree": resume_degree}]}
+        a = build_deterministic_assessment(jd, parsed, job_title="Engineer")
+        edu = [r for r in a.requirements if r.kind == "education"]
+        assert len(edu) == 1
+        assert edu[0].text == "Education: bachelor"
         assert edu[0].status == expected_status
 
     @pytest.mark.parametrize(

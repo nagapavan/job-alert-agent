@@ -3796,6 +3796,9 @@ async function loadPreferencesFromServer() {
         if (data.excluded_companies !== undefined && data.excluded_companies !== null) {
             state.excludedCompanies = data.excluded_companies;
         }
+        if (data.skip_topics !== undefined && data.skip_topics !== null) {
+            state.skipTopics = data.skip_topics;
+        }
         applyFeatureFlags(data.features || {});
         initTargetPreferences();
     } catch (e) {
@@ -3803,12 +3806,14 @@ async function loadPreferencesFromServer() {
     }
 }
 
-async function persistPreferencesToServer(featuresOverride, excludedOverride) {
+async function persistPreferencesToServer(featuresOverride, excludedOverride, skipTopicsOverride) {
     try {
         const prefs = getTargetPreferences();
         const payload = { ...prefs, features: featuresOverride || featureFlags };
         const excluded = excludedOverride !== undefined ? excludedOverride : state.excludedCompanies;
         if (excluded !== undefined && excluded !== null) payload.excluded_companies = excluded;
+        const skipTopics = skipTopicsOverride !== undefined ? skipTopicsOverride : state.skipTopics;
+        if (skipTopics !== undefined && skipTopics !== null) payload.skip_topics = skipTopics;
         await fetch(`${API_BASE}/api/preferences`, {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
@@ -3847,6 +3852,9 @@ async function populateSettingsPanel() {
     const exclEl = document.getElementById("set-excluded-companies");
     if (exclEl) exclEl.value = (state.excludedCompanies !== undefined && state.excludedCompanies !== null)
         ? state.excludedCompanies : "amazon";
+    const skipTopicsEl = document.getElementById("set-skip-topics");
+    if (skipTopicsEl) skipTopicsEl.value = (state.skipTopics !== undefined && state.skipTopics !== null)
+        ? state.skipTopics : "";
     try {
         const res = await fetch(`${API_BASE}/api/settings/llm`);
         if (res.ok) {
@@ -3942,7 +3950,9 @@ async function saveSettingsModal() {
     }
     const exclEl = document.getElementById("set-excluded-companies");
     const excluded = exclEl ? exclEl.value : undefined;
-    await persistPreferencesToServer(features, excluded);
+    const skipTopicsEl = document.getElementById("set-skip-topics");
+    const skipTopics = skipTopicsEl ? skipTopicsEl.value : undefined;
+    await persistPreferencesToServer(features, excluded, skipTopics);
     applyFeatureFlags(features);
 
     const body = { allow_cloud_fallback: document.getElementById("set-allow-cloud").checked };

@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 from backend.ai_helper import _clean_json_string, generate_text
 from backend.config import AGENT_USER_AGENT, RESPECT_ROBOTS
 from backend.matchers import check_title_match
+from backend.prompts import company_intelligence_synthesis_system
 
 # Optional dependency: open-source JobSpy aggregator (Google/Indeed/LinkedIn/...).
 # Imported defensively so the app runs without it installed.
@@ -1289,23 +1290,7 @@ def gather_company_intelligence(
     )
     market_ctx = "\n".join([f"- {r['title']}: {r['snippet']}" for r in market_results])
 
-    system_prompt = (
-        "You are an executive research analyst. Synthesize the provided raw web snippets into a clean, "
-        "structured JSON object with the following schema:\n"
-        "{\n"
-        '  "description": "1-2 concise sentences summarizing the core products, business model, and mission.",\n'
-        '  "market_position": "Background and positioning: company size (employees/revenue if available), founded date, HQ location, target customers, value proposition, key competitors, and differentiators.",\n'
-        '  "talking_points": "What makes this company interesting; questions a smart candidate would ask; relevant industry trends.",\n'
-        '  "recent_news": "Bulleted summary of recent developments, product launches, leadership changes, funding rounds, or announcements.",\n'
-        '  "salary_insights": "Estimated salary ranges or compensation structure for the role.",\n'
-        '  "hiring_process": "Overview of typical interview stages (e.g. Recruiter screen, Technical, Onsite)."\n'
-        "}\n"
-        "Rules:\n"
-        "- Use ONLY the information present in the provided raw snippets.\n"
-        "- If a field is not supported by the snippets, write exactly: Not found in sources.\n"
-        "- Use sentence case and simple sentences.\n"
-        "- Output ONLY valid JSON without conversational wrapper."
-    )
+    system_prompt = company_intelligence_synthesis_system()
 
     user_prompt = (
         f"Target Company: {company_name}\nTarget Role: {job_title}\n\n"

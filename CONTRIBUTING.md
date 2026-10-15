@@ -13,7 +13,13 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
-uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+
+# Plain (recommended — stable):
+uvicorn backend.main:app --host 127.0.0.1 --port 8000
+
+# Optional hot reload (see AGENTS.md §12.2 for the caveat):
+# pip install "uvicorn[standard]"   # adds the watchfiles watcher
+uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload --reload-dir backend
 ```
 
 No build step is required for the SPA or the Chrome extension.

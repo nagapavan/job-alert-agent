@@ -128,11 +128,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     try {
       results = await chrome.scripting.executeScript({
         target: { tabId: tabId, allFrames: true },
-        func: () => {
+        func: async () => {
           const meta =
-            typeof window.__jobAgentExtractJobInfo === "function"
-              ? window.__jobAgentExtractJobInfo()
-              : null;
+            typeof window.__jobAgentExtractJobInfoAsync === "function"
+              ? await window.__jobAgentExtractJobInfoAsync()
+              : typeof window.__jobAgentExtractJobInfo === "function"
+                ? window.__jobAgentExtractJobInfo()
+                : null;
           const telemetry =
             typeof window.__jobAgentInspectFormTelemetry === "function"
               ? window.__jobAgentInspectFormTelemetry()
@@ -323,12 +325,18 @@ document.addEventListener("DOMContentLoaded", async () => {
         } else {
           // Fallback extraction from tab title and domain
           const tabUrl = new URL(tab.url || "https://example.com");
+          const tabHref = (tab.url || "").toLowerCase();
+          const tabTitle = tab.title || "";
+          const looksLikeChallenge =
+            /recaptcha|\/sorry\/|\/checkpoint|\/authwall|\/challenge/.test(tabHref) ||
+            /recaptcha|just a moment|attention required|unusual traffic|verify you/i.test(tabTitle);
           jobMeta = {
-            title: tab.title || "Custom Job Position",
+            title: tabTitle || "Custom Job Position",
             company: tabUrl.hostname.replace(/www\.|\.com|\.io|\.co|\.org/g, "").toUpperCase(),
-            description: tab.title || "Target Career Opportunity",
+            description: looksLikeChallenge ? "" : (tabTitle || "Target Career Opportunity"),
             url: tab.url,
-            atsType: "custom"
+            atsType: "custom",
+            challenge: looksLikeChallenge
           };
         }
 
@@ -338,6 +346,26 @@ document.addEventListener("DOMContentLoaded", async () => {
         companyEl.innerText = jobMeta.company;
         portalEl.innerText = (jobMeta.atsType || "CUSTOM").toUpperCase();
         snippetEl.innerText = jobMeta.description ? jobMeta.description.slice(0, 180) + "..." : "Posting extracted.";
+
+        // Anti-bot / verification pages (Google reCAPTCHA interstitial, LinkedIn
+        // checkpoint/authwall) must never produce a fabricated score from challenge
+        // text. LinkedIn is also hard-stopped on a too-short/absent description because
+        // its job container is the only valid source; other hosts only stop when empty.
+        const descLen = jobMeta.description ? jobMeta.description.trim().length : 0;
+        const tooShortToScore = jobMeta.atsType === "linkedin" ? descLen < 200 : descLen === 0;
+        if (jobMeta.challenge || tooShortToScore) {
+          scoreCircle.innerText = "--";
+          scoreCircle.style.borderColor = "#f59e0b";
+          scoreCircle.style.color = "#f59e0b";
+          scoreLabel.innerText = jobMeta.challenge ? "Verification required" : "Job not detected";
+          analysisBox.innerHTML = jobMeta.challenge
+            ? "This tab is showing a security/verification page (reCAPTCHA) instead of the job. Complete the check (or open the job in the LinkedIn tab), then click Re-process." +
+              '<button class="sp-btn-secondary" id="sp-reprocess-match" style="margin-top:10px;">🔄 Re-process match analysis</button>'
+            : "No readable job description was found on this page. Open the actual job posting, then click Re-process." +
+              '<button class="sp-btn-secondary" id="sp-reprocess-match" style="margin-top:10px;">🔄 Re-process match analysis</button>';
+          document.getElementById("sp-reprocess-match")?.addEventListener("click", inspectActiveTab);
+          return;
+        }
 
         // Run Match Analysis
         const profData = await chrome.storage.local.get(["candidateProfile"]);

@@ -205,7 +205,16 @@ _SKILL_ALIASES = {
     "microsoft azure": "azure",
     "llms": "llm",
     "apache kafka": "kafka",
+    # Node.js is frequently written "nodejs"/"node.js" in resumes/JDs; both collapse
+    # to the canonical "node.js" so a Node developer gets credit against JS requirements.
+    "nodejs": "node.js",
 }
+
+# Surface spellings (alias keys) for each canonical skill, so a resume/JD that writes
+# "NodeJS" is still detected when we scan for the canonical "node.js".
+_SKILL_ALIAS_SURFACES: "dict[str, set]" = {}
+for _surface, _canon in _SKILL_ALIASES.items():
+    _SKILL_ALIAS_SURFACES.setdefault(_canon, set()).add(_surface)
 
 # Broad JD terms credit a partial match when the resume has related technologies.
 _CONCEPT_GROUPS = {
@@ -216,6 +225,11 @@ _CONCEPT_GROUPS = {
     "microservices": {"grpc", "docker", "kubernetes", "kafka", "rabbitmq", "rest api"},
     "system design": {"microservices", "distributed systems", "grpc", "kafka", "rest api"},
     "machine learning": {"llm", "nlp", "pytorch", "tensorflow", "pandas", "numpy", "scikit-learn"},
+    # Front-end language family: knowing one language transfers partially to the others
+    # (a Node.js developer is partially aligned with a JavaScript/TypeScript requirement).
+    "javascript": {"node.js", "typescript"},
+    "typescript": {"javascript", "node.js"},
+    "node.js": {"javascript", "typescript"},
 }
 
 _CLOUD_PROVIDERS = {"aws", "gcp", "azure"}
@@ -257,6 +271,32 @@ def _skill_token(pattern: str) -> re.Pattern:
     return re.compile(r"(?<![A-Za-z0-9])" + re.escape(pattern) + r"(?![A-Za-z0-9])", re.I)
 
 
+def _skill_patterns(skill: str) -> "List[re.Pattern]":
+    """Word-boundary patterns for a skill, including alias surface spellings.
+
+    e.g. for canonical "node.js" this also matches a raw "NodeJS" in free text,
+    since resumes/JDs frequently write it without the dot.
+    """
+    patterns = [_skill_token(skill)]
+    patterns += [
+        _skill_token(surface)
+        for surface in _SKILL_ALIAS_SURFACES.get(_normalize_skill(skill), set())
+    ]
+    return patterns
+
+
+def _resume_skill_scan(resume_text: str) -> "set[str]":
+    """Skills detected from raw resume text (union of canonical + alias surfaces)."""
+    from backend.parser import COMMON_TECH_SKILLS  # local import avoids a cycle
+
+    lowered = (resume_text or "").lower()
+    found = set()
+    for s in COMMON_TECH_SKILLS:
+        if any(p.search(lowered) for p in _skill_patterns(s)):
+            found.add(_normalize_skill(s))
+    return found
+
+
 def _normalize_skill(name: str) -> str:
     t = (name or "").strip().lower()
     return _SKILL_ALIASES.get(t, t)
@@ -293,14 +333,12 @@ def build_deterministic_assessment(
     resume_skills = {
         _normalize_skill(s) for s in ((parsed_resume or {}).get("skills") or [])
     }
-    # Fall back to scanning the raw resume text when structured skills are absent
-    # (e.g. resumes ingested before parsing, or inline resume text from the extension).
-    if not resume_skills and resume_text:
-        resume_skills = {
-            _normalize_skill(s)
-            for s in COMMON_TECH_SKILLS
-            if _skill_token(s).search(resume_text.lower())
-        }
+    # Always merge skills detected from the raw resume text. Structured skills can be
+    # stale or incomplete (e.g. a language listed in prose rather than the skills list),
+    # so the free-text scan keeps the profile current without dropping structured data.
+    # The alias-aware scan also catches variant spellings like "NodeJS".
+    if resume_text:
+        resume_skills |= _resume_skill_scan(resume_text)
     resume_blob = " ".join(
         [resume_text or ""] + [str(s) for s in ((parsed_resume or {}).get("skills") or [])]
     ).lower()
@@ -456,9 +494,11 @@ def build_deterministic_assessment(
     # Education — a higher degree satisfies a lower requirement, never the reverse.
     education = jd_signals.parse_education(jd)
     if education:
-        # "Bachelor's or Master's" lists alternatives -> the lowest listed level is the
-        # requirement; a higher degree still satisfies it.
-        req_rank = min(_EDU_RANK.get(level, 0) for level in education)
+        # "Bachelor's or Master's" / "BS/MS/PhD" lists alternatives -> the lowest listed
+        # level is the requirement; a higher degree still satisfies it.
+        edu_ranked = sorted(education, key=lambda lvl: _EDU_RANK.get(lvl, 0))
+        req_level = edu_ranked[0]
+        req_rank = _EDU_RANK.get(req_level, 0)
         edu_entries = (parsed_resume or {}).get("education") or []
         edu_text = " ".join(str(e.get("degree") or "") for e in edu_entries)
         cand_levels = jd_signals.parse_education(edu_text)
@@ -472,7 +512,7 @@ def build_deterministic_assessment(
             status = MET if cand_rank >= req_rank else MISSING
         reqs.append(
             RequirementItem(
-                text=f"Education: {', '.join(education)}",
+                text=f"Education: {req_level}",
                 kind="education",
                 category=MUST_HAVE,
                 status=status,
@@ -484,12 +524,14 @@ def build_deterministic_assessment(
     for cert in jd_signals.parse_certifications(jd):
         if _normalize_skill(cert) in seen:
             continue
+        # Word-boundary match so a resume's "CKAD" does not credit the "CKA" cert.
+        cert_present = jd_signals.cert_in_text(cert, resume_blob)
         reqs.append(
             RequirementItem(
                 text=cert,
                 kind="certification",
                 category=NICE_TO_HAVE,
-                status=MET if cert.lower() in resume_blob else MISSING,
+                status=MET if cert_present else MISSING,
             )
         )
 

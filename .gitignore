@@ -25,7 +25,12 @@ data/resumes/
 logs/
 *.log
 
+# ChromaDB vector memory (derived, rebuildable via scripts/setup_chromadb.py)
+.chroma/
+
 # Internal development docs (team knowledge base, not for OSS)
 AGENTS.md
 PROJECT_INDEX.md
 DEVELOPMENT_NOTES.md
+
+.opencode/

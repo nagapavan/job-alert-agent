@@ -151,9 +151,16 @@ OPERATION_LOG_PRUNE_INTERVAL_SECONDS=3600
 ### 3. Run the Server
 
 ```bash
-uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+# Plain (recommended — stable across long sessions):
+uvicorn backend.main:app --host 127.0.0.1 --port 8000
 # Binds to loopback only (single-user local tool). To expose it on your LAN, use
 # --host 0.0.0.0 and set ALLOWED_ORIGINS / ALLOWED_EXTENSION_IDS for your clients.
+
+# Optional hot reload (development only). The bare `--reload` flag falls back to a
+# slow StatReload watcher when `watchfiles` is missing and can hang on startup for
+# this repo. Install the extras first, then scope the watcher to app code:
+#   pip install "uvicorn[standard]"
+uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload --reload-dir backend
 ```
 
 Open your browser and navigate to: **`http://localhost:8000`**

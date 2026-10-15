@@ -73,6 +73,32 @@ def test_parse_education():
     assert parse_education("No formal degree required.") == []
 
 
+def test_parse_education_no_false_positive_on_ordinary_words():
+    # "master" / "bachelor" as adjectives must not be read as a degree.
+    assert parse_education("Master debugger with deep systems knowledge.") == []
+    assert parse_education("We hire master engineers who ship.") == []
+    assert parse_education("hacker bachelor pad") == []
+    # Standalone abbreviations still detected.
+    assert parse_education("Ph.D. preferred") == ["phd"]
+    # "X or Y" chaining: both levels detected when a degree word follows.
+    assert parse_education("Bachelor's or Master's degree required.") == ["master", "bachelor"]
+    assert parse_education("No formal degree required.") == []
+
+
+def test_parse_education_slash_joined_degree_cluster():
+    # The common "BS/MS/PhD in <field>" alternative list must yield all three levels so the
+    # comparison can pick the lowest (bachelor) as the effective requirement.
+    levels = parse_education(
+        "BS/MS/PhD in Computer Engineering, Electrical Engineering, or a related field"
+    )
+    assert set(levels) == {"bachelor", "master", "phd"}
+    assert parse_education("B.S./M.S. in Computer Science") == ["master", "bachelor"]
+    # Dotless acronyms alone still need a degree context (avoid "MS Teams"/"BS detector").
+    assert parse_education("MS Teams integration experience") == []
+    assert parse_education("BS detector") == []
+    assert parse_education("MS in Computer Science") == ["master"]
+
+
 def test_parse_certifications():
     assert "AWS Certified" in parse_certifications("Must hold AWS Certified Solutions Architect.")
     assert parse_certifications("No certifications required.") == []
@@ -84,6 +110,17 @@ def test_parse_certifications_kubernetes_togaf_cncf():
     assert "CKA" in certs
     assert "Certified Kubernetes Security Specialist" in certs
     assert "CNCF" in certs
+
+
+def test_parse_certifications_no_substring_acronym_matches():
+    # Short acronyms like CKA/CKS must not match inside ordinary longer words.
+    assert "CKA" not in parse_certifications("I hold a CKAD certification.")
+    assert "CKS" not in parse_certifications("We fixed production bottlenecks and shipped.")
+    assert "CKS" not in parse_certifications("Three specialization tracks in the platform.")
+    # Standalone occurrences still match.
+    certs = parse_certifications("Certified Kubernetes Administrator (CKA); CKS certified.")
+    assert "CKA" in certs
+    assert "CKS" in certs
 
 
 def test_over_qualified_total_minimum():

@@ -252,8 +252,9 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
 
         # Step 1: Navigate directly to the global all-mail search view (Gmail search
         # URLs are mailbox-wide, not scoped to the current folder) and wait for load.
-        search_url = "https://mail.google.com/mail/u/0/#search/" + urllib.parse.quote_plus(search_query)
+        search_url = "https://mail.google.com/mail/u/0/#search/" + urllib.parse.quote(search_query, safe="")
         page.goto(search_url, timeout=45000, wait_until="domcontentloaded")
+        logger.info(f"Gmail scan: navigated, final URL = {page.url[:160]}")
 
         if "accounts.google.com" in page.url or "signin" in page.url.lower():
             logger.warning("Gmail scan: User is not logged in to Google in persistent Chrome profile. Launch interactive browser session to sign in.")
@@ -335,9 +336,17 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
         except Exception:
             has_rows = False
         if not has_rows:
+            logger.info("Gmail scan: no rows after direct #search/ navigation; retrying via search box.")
             try:
-                search_input = page.query_selector("input[aria-label='Search mail'], input[name='q']")
-                if search_input:
+                search_input = page.query_selector(
+                    "input[aria-label='Search mail'], input[name='q'], input[aria-label*='Search' i]"
+                )
+                if not search_input:
+                    logger.warning(
+                        f"Gmail scan: search input not found (final URL = {page.url[:160]}); "
+                        "Gmail UI may have changed — 0 emails parsed."
+                    )
+                else:
                     search_input.click()
                     search_input.fill(search_query)
                     search_input.press("Enter")
@@ -347,12 +356,13 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
                     except Exception:
                         pass
             except Exception as search_err:
-                logger.debug(f"Gmail targeted search notice: {search_err}")
+                logger.warning(f"Gmail targeted search notice: {search_err}")
         # Scan search results (2 pages ≈ up to 80 emails).
         try:
             scan_view_with_pagination(max_pages=2)
         except Exception as scan_err:
-            logger.debug(f"Gmail scan pagination notice: {scan_err}")
+            logger.warning(f"Gmail scan pagination notice: {scan_err}")
+        logger.info(f"Gmail scan: parsed {len(emails)} email(s) from all-mail targeted search.")
 
         context.close()
     except Exception as e:

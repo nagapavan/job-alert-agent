@@ -52,8 +52,8 @@ _SENIORITY = [
 
 _EDUCATION = [
     ("phd", ("phd", "ph.d", "doctorate", "doctoral")),
-    ("master", ("master", "m.s.", "m.s", "m.sc", "m.sc.", "mba", "msc", "m.tech", "mtech", "m.e.", "m.eng")),
-    ("bachelor", ("bachelor", "b.s.", "b.s", "b.sc", "b.sc.", "bsc", "undergraduate", "b.tech", "btech", "b.e.", "b.eng")),
+    ("master", ("master", "m.s.", "m.s", "m.sc", "m.sc.", "mba", "msc", "ms", "ma", "m.tech", "mtech", "m.e.", "m.eng")),
+    ("bachelor", ("bachelor", "b.s.", "b.s", "b.sc", "b.sc.", "bsc", "bs", "ba", "undergraduate", "b.tech", "btech", "b.e.", "b.eng")),
     ("associate", ("associate degree", "associate's")),
     ("high_school", ("high school", "diploma")),
 ]
@@ -69,6 +69,12 @@ CERT_CATALOG = (
     "TOGAF", "Terraform", "PMP", "Scrum Master", "CISSP", "CCNA",
     "ITIL", "SnowPro", "Databricks", "Kafka", "Salesforce Certified",
 )
+
+# Precompiled word-boundary patterns per cert (order preserved for stable output).
+_CERT_RES = {
+    cert: re.compile(r"(?<![A-Za-z0-9])" + re.escape(cert.lower()) + r"(?![A-Za-z0-9])")
+    for cert in CERT_CATALOG
+}
 
 
 class ExperienceHint(TypedDict):
@@ -132,16 +138,90 @@ def seniority_level(title: str) -> str:
     return "unknown"
 
 
+# Words that disambiguate a bare degree term from its ordinary use (e.g. "master
+# debugger", "MS Teams"). A context-gated token only counts when one of these appears
+# within a few following tokens, or when it sits in a slash/comma-joined degree cluster
+# (e.g. "BS/MS/PhD in Computer Science").
+_EDU_CONTEXT_WORDS = (
+    "degree", "of", "in", "science", "engineering", "technology",
+    "administration", "arts", "business", "computer", "sciences", "management",
+    "undergraduate", "graduate", "bachelor", "master", "bs", "ba", "ms", "ma",
+    "bsc", "msc", "phd",
+)
+
+# Tokens that are also ordinary words/acronyms and therefore require a nearby degree
+# context word (or another degree token) before counting. Maps token -> education level.
+_EDU_CONTEXT_GATED = {
+    "master": "master", "bachelor": "bachelor",
+    "bs": "bachelor",  # BS = Bachelor of Science
+    "ba": "bachelor",
+    "ms": "master",    # MS = Master of Science
+    "ma": "master",
+}
+
+
+def _edu_word(tok: str) -> "re.Pattern":
+    return re.compile(
+        r"(?<![A-Za-z0-9])" + re.escape(tok.lower()) + r"(?![A-Za-z0-9])", re.I
+    )
+
+
+# A context-gated token followed (within ~5 tokens, crossing "/", ",", "&") by a degree
+# context word. This matches "master's degree", "bachelor's or master's degree", and
+# "BS/MS/PhD in Computer Science", while rejecting "master debugger" / "MS Teams".
+_EDU_CONTEXT_ALT = "|".join(re.escape(w) for w in _EDU_CONTEXT_WORDS)
+_EDU_SEP = r"[\s/,&]+"
+_EDU_CONTEXT_RE = {
+    term: re.compile(
+        rf"(?<![A-Za-z0-9])(?:{term})(?:'s|s)?(?![A-Za-z0-9])"
+        rf"(?=(?:{_EDU_SEP}(?:\w+(?:'s)?|\d{{4}})){{0,5}}{_EDU_SEP}(?:{_EDU_CONTEXT_ALT})\b)",
+        re.I,
+    )
+    for term in _EDU_CONTEXT_GATED
+}
+
+
+def _edu_token_re(level: str, tok: str) -> "re.Pattern":
+    """Pattern for one (level, token): context-window for ambiguous tokens, else boundary."""
+    if _EDU_CONTEXT_GATED.get(tok) == level:
+        return _EDU_CONTEXT_RE[tok]
+    return _edu_word(tok)
+
+
 def parse_education(text: str) -> List[str]:
-    """Return the education levels referenced in the text (e.g. ["bachelor"])."""
+    """Return the education levels referenced in the text (e.g. ["bachelor"]).
+
+    Uses word-boundary matching so ordinary words like "master debugger" do not get
+    misread as a degree. Bare degree terms/acronyms ("master", "bachelor", "BS", "MS")
+    only count when a degree-context word (or another degree token) appears within a few
+    following tokens — e.g. "master's degree", "bachelor's or master's degree", or
+    "BS/MS/PhD in Computer Science".
+    """
     lowered = (text or "").lower()
-    return [level for level, tokens in _EDUCATION if any(t in lowered for t in tokens)]
+    levels = []
+    for level, tokens in _EDUCATION:
+        if any(_edu_token_re(level, tok).search(lowered) for tok in tokens):
+            levels.append(level)
+    return levels
 
 
 def parse_certifications(text: str) -> List[str]:
-    """Return catalog certifications named in the text."""
+    """Return catalog certifications named in the text.
+
+    Uses word-boundary matching so a short acronym like ``CKA`` is not matched inside
+    a longer word (e.g. ``CKAD``), while standalone ``CKA``/``CKS`` and multi-word
+    names like ``AWS Certified Solutions Architect`` still match.
+    """
     lowered = (text or "").lower()
-    return [cert for cert in CERT_CATALOG if cert.lower() in lowered]
+    return [cert for cert, pat in _CERT_RES.items() if pat.search(lowered)]
+
+
+def cert_in_text(cert: str, text: str) -> bool:
+    """True if ``cert`` appears as a standalone token in ``text`` (word-boundary)."""
+    pat = _CERT_RES.get(cert)
+    if pat is None:
+        pat = re.compile(r"(?<![A-Za-z0-9])" + re.escape((cert or "").lower()) + r"(?![A-Za-z0-9])")
+    return bool(pat.search((text or "").lower()))
 
 
 def is_over_qualified(candidate_years: Optional[float], hint: ExperienceHint) -> bool:

@@ -291,4 +291,66 @@ def test_sidepanel_uses_gesture_based_injection():
     assert "chrome.scripting.executeScript" in src
 
 
+def test_linkedin_extraction_uses_job_scoped_container():
+    """LinkedIn's JD must come from the stable job-scoped container, not whole-page text.
+
+    LinkedIn stopped emitting JobPosting JSON-LD and renamed the legacy job-description
+    classes; the only stable hook is the ``JobDetails_AboutTheJob_<jobId>`` id prefix.
+    """
+    src = _read("content/ats-autofill.js")
+    assert 'JobDetails_AboutTheJob_' in src
+    # The LinkedIn render race is handled by a bounded wait for the container.
+    assert "__jobAgentExtractJobInfoAsync" in src
+    assert "extractJobInfoAsync" in src
+
+
+def test_linkedin_never_falls_back_to_whole_page_text():
+    """LinkedIn must not use the feed-polluting Tier 2/3 whole-page fallbacks."""
+    src = _read("content/ats-autofill.js")
+    assert "isChallengeOrBlockedPage" in src
+    # Tier 2/3 are gated on non-LinkedIn.
+    assert "!isLinkedIn && (!description || description.length < 200)" in src
+
+
+def test_challenge_detection_is_host_agnostic():
+    """reCAPTCHA / anti-bot interstitials are hard-stopped for every host, not just LinkedIn."""
+    src = _read("content/ats-autofill.js")
+    assert "isChallengeOrBlockedPage" in src
+    assert "google.com/recaptcha" in src
+    # extractJobMetadata hard-stops on the generic guard (no atsType restriction).
+    assert "if (isChallengeOrBlockedPage()) {" in src
+
+
+def test_challenge_detection_ignores_invisible_recaptcha_on_normal_forms():
+    """A normal application page that merely loads reCAPTCHA must NOT be flagged.
+
+    Only a challenge URL, a *rendered* challenge iframe, or verification-dominated page
+    text counts — not a bare data-sitekey/.g-recaptcha badge or the api.js loader.
+    """
+    src = _read("content/ats-autofill.js")
+    guard = src[src.index("function isChallengeOrBlockedPage"):]
+    guard = guard[: guard.index("\n  }\n") + 4]
+    # The over-broad signals that caused the kake.co false positive must be gone.
+    assert "[data-sitekey]" not in guard
+    assert ".g-recaptcha" not in guard
+    assert "recaptcha/api.js" not in guard
+    # The precise signals are present.
+    assert "google.com/recaptcha" in guard
+    assert "getBoundingClientRect" in guard
+
+
+def test_sidepanel_handles_challenge_and_unrendered_job():
+    """The side panel shows an actionable state instead of a fabricated score."""
+    src = _read("sidepanel/sidepanel.js")
+    assert "Verification required" in src
+    assert "Job not detected" in src
+    assert "jobMeta.challenge" in src
+
+
+def test_sidepanel_prefers_async_extractor():
+    """The side panel must await the async (LinkedIn-aware) extraction entry point."""
+    src = _read("sidepanel/sidepanel.js")
+    assert "__jobAgentExtractJobInfoAsync" in src
+
+
 

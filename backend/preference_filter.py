@@ -11,6 +11,7 @@ applications) intentionally bypass this gate.
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional  # noqa: UP035
 
@@ -383,6 +384,7 @@ class PreferenceCriteria:
     cities: List[str] = field(default_factory=list)
     work_mode: str = ""
     country: str = ""
+    skip_topics: List[str] = field(default_factory=list)
 
     @property
     def has_filters(self) -> bool:
@@ -391,6 +393,7 @@ class PreferenceCriteria:
             or self.locations
             or self.cities
             or (self.work_mode and self.work_mode.lower() != "all")
+            or self.skip_topics
         )
 
     @classmethod
@@ -414,6 +417,11 @@ class PreferenceCriteria:
             ],
             work_mode=(getattr(pref, "work_mode", "") or "").strip().lower(),
             country=(getattr(pref, "target_country", "") or "").strip(),
+            skip_topics=[
+                t.strip().lower()
+                for t in (getattr(pref, "skip_topics", "") or "").split(",")
+                if t.strip()
+            ],
         )
 
 
@@ -457,10 +465,45 @@ class PreferenceFilter:
             title or "", location or "", self.criteria.work_mode
         )
 
-    def rejection_reason(self, title: str, location: str) -> Optional[str]:
-        """Returns the first failing rule ('title' | 'location' | 'work_mode') or None."""
+    def rejection_reason(self, title: str, location: str, description: str = "") -> Optional[str]:
+        """Returns the first failing rule ('title' | 'location' | 'work_mode' | 'skip_topic') or None."""
         if not self.has_filters:
             return None
+        # Check skip topics first (user's explicit avoid list)
+        if self.criteria.skip_topics:
+            # Check if any skip topic appears in title
+            title_lower = (title or "").lower()
+            for topic in self.criteria.skip_topics:
+                # Word boundary matching for topics
+                pattern = rf'\b{re.escape(topic)}\b'
+                if re.search(pattern, title_lower):
+                    return "skip_topic"
+            
+            # Check description for must-have requirements with skip topics
+            if description:
+                # Look for must-have requirement patterns in description
+                desc_lower = description.lower()
+                # Common must-have requirement markers
+                must_have_markers = [
+                    "must have", "must-have", "must:", "required:", "requirement:", 
+                    "you must", "candidate must", "we require", "requires"
+                ]
+                
+                # Find must-have requirement sections
+                for marker in must_have_markers:
+                    if marker in desc_lower:
+                        # Look for skip topics near must-have sections
+                        marker_index = desc_lower.find(marker)
+                        # Check a reasonable window after the marker
+                        window_start = marker_index
+                        window_end = min(len(desc_lower), marker_index + 500)
+                        window_text = desc_lower[window_start:window_end]
+                        
+                        for topic in self.criteria.skip_topics:
+                            pattern = rf'\b{re.escape(topic)}\b'
+                            if re.search(pattern, window_text):
+                                return "skip_topic"
+        
         if not self.title_ok(title):
             return "title"
         if not self.location_ok(location):
@@ -470,4 +513,4 @@ class PreferenceFilter:
         return None
 
     def accepts(self, title: str, location: str, description: str = "") -> bool:
-        return self.rejection_reason(title, location) is None
+        return self.rejection_reason(title, location, description) is None

@@ -155,10 +155,6 @@ Quick-lookup reference for locating where changes should be made.
 
 ## Root
 
-### `run.py`
-**Responsibility:** CLI entry point.
-- `print_help` / `check_dependencies` / `start_server`.
-
 ### `conftest.py`
 **Responsibility:** Pytest fixtures.
 - `setup_test_db` / `isolate_token_tracker_stats` / `prevent_real_browser_spawns` — autouse isolation.
