@@ -452,6 +452,9 @@
                         </div>
                     </div>
 
+                    <!-- Sync Review Banner: surfaces "N new from sync" jobs still needing review -->
+                    <div id="sync-review-banner" class="sync-review-banner hidden"></div>
+
                     <div class="panel-header">
                         <div class="search-box">
                             <input type="text" id="job-search-input"
@@ -473,6 +476,15 @@
                                 <option value="0">All Match Scores</option>
                                 <option value="80">High Match (80%+)</option>
                                 <option value="60">Good Match (60%+)</option>
+                            </select>
+                            <select id="source-filter" class="filter-select" onchange="setSourceFilter(this.value)"
+                                title="Filter feed by where the opportunity came from">
+                                <option value="all">All Sources</option>
+                                <option value="linkedin">🔗 LinkedIn</option>
+                                <option value="direct">🏢 ATS / Direct</option>
+                                <option value="google">🔎 Google Jobs</option>
+                                <option value="email">✉️ Email</option>
+                                <option value="hirist">📋 Hirist</option>
                             </select>
                         </div>
                     </div>
@@ -1291,6 +1303,14 @@
                                 application status sync <span class="settings-hint">(candidate portal)</span></label>
                         </div>
 
+                        <!-- UI insights -->
+                        <div class="settings-group">
+                            <div class="settings-group-title">🎯 UI insights</div>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-resume_gap_insights">
+                                Resume Gap Insights <span class="settings-hint">(per-job gap / strength panel in the
+                                    job modal)</span></label>
+                        </div>
+
                         <!-- Official ATS portals (public APIs) -->
                         <div class="settings-group">
                             <div class="settings-group-title">🏢 Official ATS portals <span
@@ -1369,10 +1389,12 @@
                                 snippet only, narrow query)</span></h4>
                         <div id="gmail-status" class="settings-hint" style="margin:4px 0 10px;">Checking…</div>
                         <label>Google OAuth Client ID</label>
-                        <input id="gmail-client-id" class="settings-input"
+                        <input id="gmail-client-id" class="settings-input" autocomplete="off"
+                            spellcheck="false" autocapitalize="off"
                             placeholder="xxxxxxx.apps.googleusercontent.com" />
                         <label>Google OAuth Client Secret</label>
                         <input id="gmail-client-secret" type="password" class="settings-input"
+                            autocomplete="new-password" spellcheck="false" autocapitalize="off"
                             placeholder="Leave blank to keep current" />
                         <div style="display:flex;gap:8px;flex-wrap:wrap;">
                             <button class="btn btn-outline btn-sm" onclick="saveGmailCredentials()">Save Client</button>
@@ -1494,6 +1516,23 @@
                                 <!-- Populated dynamically -->
                             </div>
                         </div>
+                    </div>
+
+                    <!-- Resume Gap Insights (requirement-level strengths & gaps) -->
+                    <div class="stack-compatibility-card" id="modal-gap-insights-card" style="display:none;">
+                        <div class="stack-header">
+                            <div class="stack-title-group">
+                                <span class="stack-icon">🎯</span>
+                                <div>
+                                    <h5 style="margin:0; font-size:13.5px; font-weight:700; color:var(--text-main);">
+                                        Resume Gap Insights</h5>
+                                    <p style="margin:0; font-size:12px; color:var(--text-dim);">
+                                        Requirement-level fit from the last match analysis. Update your resume to
+                                        close the gaps before applying.</p>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="modal-gap-insights-body"></div>
                     </div>
 
                     <div class="tailor-control-card">

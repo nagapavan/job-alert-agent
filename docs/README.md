@@ -21,7 +21,9 @@ Where to look for the deep-dive topics:
 | Topic | Document / section |
 | :--- | :--- |
 | **AI/ML Portfolio Journey & Decision Making** | [`PORTFOLIO_JOURNEY.md`](PORTFOLIO_JOURNEY.md) (narrative arc from monolithic LLM → performance crisis → hybrid classifier breakthrough; why each decision was made, trade-offs analyzed, lessons learned; **for LinkedIn/interviews**) |
+| **LLM Model Behavior & Agentic Platform Lessons** | [`LESSONS_LEARNED.md`](LESSONS_LEARNED.md) (Gemini hallucination patterns, Claude over-documentation, DeepSeek reliability, working with verbose models, context management) |
 | **Fast classifier + on-demand LLM analysis** | [`HYBRID_MATCHER_GUIDE.md`](HYBRID_MATCHER_GUIDE.md) (complete walkthrough: how it works, API reference, architecture, feature extraction, benchmarks, training) |
+| **Bulk match scoring (deterministic-first)** | [`BULK_MATCH_SCORING.md`](BULK_MATCH_SCORING.md) (implementation: two-tier routing, artifact guard, counters, testing, performance expectations) |
 | Architecture diagrams (Mermaid + text/ASCII) | [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §1–20 (text topology in §19) |
 | Code examples for every major component | [`PROJECT_INDEX.md`](../PROJECT_INDEX.md) → "Code Examples — Major Components" |
 | Database schema + explanations | [`AGENTS.md`](../AGENTS.md) §5 & §9 |
@@ -29,14 +31,15 @@ Where to look for the deep-dive topics:
 | AI prompt engineering details | [`AGENTIC_ARCHITECTURE.md`](../AGENTIC_ARCHITECTURE.md) §6 |
 | Packages / dependencies used | [`AGENTS.md`](../AGENTS.md) §8; [`requirements.txt`](../requirements.txt) |
 | Performance optimization strategies | [`AGENTS.md`](../AGENTS.md) §10 |
-| Security implementation details | [`AGENTS.md`](../AGENTS.md) §11; [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §14 & DFD 5 |
-| Developer onboarding guide | [`AGENTS.md`](../AGENTS.md) §12; [`README.md`](../README.md) Quick Start |
+| Security implementation details | [`AGENTS.md`](../AGENTS.md) §11; [`SECURITY_IMPLEMENTATION.md`](SECURITY_IMPLEMENTATION.md); [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §14 & DFD 5 |
+| Developer onboarding & code editing rules | [`README.md`](../README.md) Quick Start; [`CONTRIBUTING.md`](../CONTRIBUTING.md); [`EngineeringAgentRules.md`](../EngineeringAgentRules.md) |
 | Agentic reasoning / autonomy / harness | [`AGENTIC_ARCHITECTURE.md`](../AGENTIC_ARCHITECTURE.md) §1–5 |
 | ATS portals, filters & requisition probing | [`ATS_PORTALS.md`](ATS_PORTALS.md) |
-| Structured match analysis & interview prep | [`AGENTS.md`](../AGENTS.md) §1; [`PROJECT_INDEX.md`](../PROJECT_INDEX.md); [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §20 |
+| Structured match analysis & interview prep | [`PROJECT_INDEX.md`](../PROJECT_INDEX.md); [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §20 |
 | One-shot "Sync All" orchestration | [`SYNC_ALL_PLAN.md`](SYNC_ALL_PLAN.md) |
-| Log rotation & operation-log retention | [`AGENTS.md`](../AGENTS.md) §1 & §12.3 |
-| No-fabrication guarantees / "not AI-scored" | [`AGENTIC_ARCHITECTURE.md`](../AGENTIC_ARCHITECTURE.md) §5.5; [`AGENTS.md`](../AGENTS.md) §1 |
+| Log rotation & operation-log retention | [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §1; [`README.md`](../README.md) §Observability |
+| No-fabrication guarantees / "not AI-scored" | [`AGENTIC_ARCHITECTURE.md`](../AGENTIC_ARCHITECTURE.md) §5.5 |
+| Security implementation & encryption | [`SECURITY_IMPLEMENTATION.md`](SECURITY_IMPLEMENTATION.md) (CORS, auth, secrets, encryption, browser isolation, prompt injection, opt-in guardrails, Gmail privacy) |
 
 ## Feature / design plans (`docs/`)
 

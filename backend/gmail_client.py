@@ -18,12 +18,16 @@ PAGE_SIZE = 50
 MAX_PAGES = 2
 
 # Code-owned narrow query: job-board senders + decision/interview subjects only.
+# Label scope: no labelIds are passed to messages().list, so Gmail searches ALL
+# labels (Inbox, Updates, Promotions, Social, plus any user labels) except
+# Spam/Trash. The narrow q keeps this privacy-scoped (no mailbox enumeration).
 GMAIL_QUERY = (
-    'newer_than:60d (from:greenhouse.io OR from:lever.co OR from:ashbyhq.com '
-    'OR from:myworkdayjobs.com OR from:smartrecruiters.com OR from:linkedin.com '
+    'newer_than:90d (from:greenhouse.io OR from:lever.co OR from:ashbyhq.com '
+    'OR from:myworkdayjobs.com OR from:workday.com OR from:smartrecruiters.com '
+    'OR from:workable.com OR from:icims.com OR from:taleo.net OR from:linkedin.com '
     'OR subject:interview OR subject:offer OR subject:"next steps" '
     'OR subject:regret OR subject:"not moving forward" '
-    'OR subject:"job alert" OR subject:opportunity)'
+    'OR subject:"job alert" OR subject:opportunity OR subject:application)'
 )
 
 # Emails that map to an application-pipeline status change.
@@ -116,10 +120,36 @@ def _service_from_credentials(creds):
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
+def _is_invalid_grant(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "invalid_grant" in msg or "token has been expired or revoked" in msg
+
+
 def build_service(client_id: str, client_secret: str, refresh_token: str):
-    """Builds an authenticated Gmail service (refreshing the access token as needed)."""
+    """Builds an authenticated Gmail service (refreshing the access token as needed).
+
+    On ``invalid_grant`` (expired/revoked refresh token) the dead token is cleared so the app
+    stops retrying and the UI can prompt a reconnect; the client id/secret are kept.
+    """
     _require_google_libs()
-    return _service_from_credentials(_credentials(client_id, client_secret, refresh_token))
+    try:
+        return _service_from_credentials(_credentials(client_id, client_secret, refresh_token))
+    except Exception as e:
+        if _is_invalid_grant(e):
+            try:
+                from backend.config import save_gmail_settings
+
+                save_gmail_settings(refresh_token="")
+            except Exception:
+                pass
+            logger.warning("Gmail refresh token is expired/revoked; cleared it (reconnect required).")
+            raise RuntimeError(
+                "Gmail authorization expired or was revoked (invalid_grant). "
+                "Reconnect Gmail in Settings. If this recurs roughly every 7 days, publish the "
+                "Google OAuth consent screen to 'In production' — Testing-mode refresh tokens "
+                "expire after 7 days."
+            ) from e
+        raise
 
 
 def get_profile_email(service) -> str:
@@ -251,9 +281,17 @@ def get_status() -> Dict[str, Any]:
     from backend.config import get_gmail_settings, is_gmail_configured
 
     s = get_gmail_settings()
+    secret = s["client_secret"] or ""
+    # Common paste mistake: the client ID (or a *.apps.googleusercontent.com URL) stored as the
+    # secret. Surfacing it turns a later opaque `invalid_client` into an actionable message.
+    secret_looks_invalid = bool(secret) and (
+        secret == s["client_id"] or secret.endswith(".apps.googleusercontent.com")
+    )
     return {
+        "client_id": s["client_id"] or "",
         "client_id_set": bool(s["client_id"]),
-        "client_secret_set": bool(s["client_secret"]),
+        "client_secret_set": bool(secret),
+        "secret_looks_invalid": secret_looks_invalid,
         "connected": bool(s["client_id"] and s["client_secret"] and s["refresh_token"]),
         "configured": is_gmail_configured(),
         "email": s["token_email"] or "",

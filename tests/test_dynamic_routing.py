@@ -3,6 +3,7 @@ from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
 
 from backend.main import app
+from backend.config import OLLAMA_MODEL
 from backend.ai_helper import (
     TaskComplexity,
     TASK_PROFILES,
@@ -63,10 +64,12 @@ def test_user_override_hyperparameters():
 # -------------------------------------------------------------
 
 def test_dynamic_tier_model_selection():
-    # Ollama
-    assert get_model_for_tier("ollama", TaskComplexity.FAST) == "qwen2.5:3b"
-    assert get_model_for_tier("ollama", TaskComplexity.STANDARD) == "llama3:8b"
-    assert get_model_for_tier("ollama", TaskComplexity.DEEP_REASONING) == "llama3.3:70b"
+    from backend.config import OLLAMA_MODEL
+
+    # Ollama uses a single configured model across all tiers (no 3-tier mapping).
+    assert get_model_for_tier("ollama", TaskComplexity.FAST) == OLLAMA_MODEL
+    assert get_model_for_tier("ollama", TaskComplexity.STANDARD) == OLLAMA_MODEL
+    assert get_model_for_tier("ollama", TaskComplexity.DEEP_REASONING) == OLLAMA_MODEL
 
     # OpenAI
     assert get_model_for_tier("openai", TaskComplexity.FAST) == "gpt-4o-mini"
@@ -125,7 +128,7 @@ def test_generate_text_dynamic_routing():
             temperature=0.0,
             max_tokens=400,
             top_p=0.85,
-            model="qwen2.5:3b"
+            model=OLLAMA_MODEL
         )
 
         # Call with deep task
@@ -143,7 +146,7 @@ def test_generate_text_dynamic_routing():
             temperature=0.8,
             max_tokens=2500,
             top_p=0.95,
-            model="llama3.3:70b"
+            model=OLLAMA_MODEL
         )
 
 # -------------------------------------------------------------
@@ -155,8 +158,7 @@ def test_api_llm_routing_status_endpoint():
     assert res.status_code == 200
     data = res.json()
     assert data["dynamic_routing_enabled"] is True
-    assert "tier_models" in data
-    assert data["tier_models"]["fast_tier"] == "qwen2.5:3b"
+    assert "tier_models" not in data  # removed with the single-model Ollama simplification
     assert "resolved_provider_tiers" in data
     assert "task_profiles" in data
     assert "cover_letter" in data["task_profiles"]

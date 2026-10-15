@@ -38,23 +38,19 @@ Every permission declared in `manifest.json` requires a clear plain-English just
 | `sidePanel` | Required to provide a persistent, multi-tab AI Career Copilot and Match Analyzer alongside active job posting tabs. |
 | `storage` | Required to save the candidate's local autofill profile, runtime connection preferences, and offline Q&A memory bank. |
 | `tabs` | Required to detect the URL and title of the active job posting tab to provide relevant match analysis and autofill actions. |
-| `scripting` | Required to inject the ATS form field detector and floating autofill action overlay onto supported job portals. LinkedIn is injected **on demand only**, under `activeTab`, after an explicit user action — there is no persistent LinkedIn host permission and no script runs on LinkedIn at page load. |
-| `activeTab` | Required to inspect the current job posting's DOM content when the user clicks "Inspect Current Tab", and to inject the on-demand content script on gesture-only hosts such as LinkedIn. |
+| `scripting` | Required to inject the job-description extractor and the 1-click autofill overlay into the active job posting page (including any embedded ATS iframe) when the user clicks "Inspect Current Tab" or the autofill button. |
+| `activeTab` | Retained as a secondary gesture grant; primary access is provided by the host permissions below. |
 
 ### Host Permissions Justification
 
 | Host Pattern | Justification |
 | :--- | :--- |
 | `http://localhost:8000/*`, `http://127.0.0.1:8000/*` | Connects to the user's private local FastAPI backend server for AI model inference and SQLite/PostgreSQL synchronization. |
-| `https://*.greenhouse.io/*` | Enables 1-click application autofill and job description extraction on Greenhouse career portals. |
-| `https://*.lever.co/*` | Enables 1-click application autofill and job description extraction on Lever career portals. |
-| `https://*.ashbyhq.com/*` | Enables 1-click application autofill and job description extraction on Ashby career portals. |
-| `https://*.myworkdayjobs.com/*` | Enables 1-click application autofill and job description extraction on Workday career portals. |
-| `https://*.google.com/*` | Enables match analysis on Google for Jobs search result cards. |
+| `https://*/*`, `http://*/*` | The extension analyzes job postings and autofills applications on employer career portals, which cannot be enumerated in advance. Scripts are injected **on demand only**, when the user explicitly clicks Inspect/Autofill; no page content is read passively or at page load (the only declarative content scripts run on the four ATS domains above). No page data leaves the machine except to the user's own local backend. |
 
-> **LinkedIn is intentionally not a host permission.** The extension does not request access to
-> `linkedin.com`; the side panel injects the content script on demand under `activeTab` only after
-> an explicit user action.
+> **Broad host access is intentional.** Rather than prompting for permission on every new job site,
+> the extension is granted host access once at install so analysis/autofill works seamlessly on any
+> employer portal. Injection remains user-initiated; there is no background page scraping.
 
 ---
 

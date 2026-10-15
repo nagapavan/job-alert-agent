@@ -332,12 +332,20 @@ def test_gmail_sync_is_opt_in(mock_sync_email, mock_sync_pw):
 
 def test_gmail_query_is_narrow():
     from backend.gmail_client import GMAIL_QUERY
-    assert "newer_than:" in GMAIL_QUERY
+    assert "newer_than:90d" in GMAIL_QUERY
     assert "from:greenhouse.io" in GMAIL_QUERY
     assert "subject:interview" in GMAIL_QUERY
     # Opportunity signals (LinkedIn / job alerts) are included for opportunity tracking.
     assert "from:linkedin.com" in GMAIL_QUERY
     assert "job alert" in GMAIL_QUERY
+    # All-mail widening: the window covers the full application lifecycle and the
+    # major ATS sender domains are included alongside the subject keywords.
+    assert "from:workday.com" in GMAIL_QUERY
+    assert "from:icims.com" in GMAIL_QUERY
+    assert "from:taleo.net" in GMAIL_QUERY
+    assert "from:workable.com" in GMAIL_QUERY
+    # The query must stay narrow (sender/subject terms only) — no label-less sweep.
+    assert "label:" not in GMAIL_QUERY
 
 
 def test_gmail_list_message_ids_uses_narrow_query_and_caps_pages():
@@ -366,6 +374,35 @@ def test_gmail_fetch_metadata_is_metadata_format():
     assert meta["subject"] == "Your application"
     assert "stripe.com" in meta["sender"]
     assert svc.users().messages().get.call_args.kwargs["format"] == "metadata"
+
+
+def test_build_service_clears_token_on_invalid_grant():
+    from backend import gmail_client
+
+    class _RefreshError(Exception):
+        pass
+
+    with patch.object(gmail_client, "_require_google_libs"), \
+         patch.object(
+             gmail_client,
+             "_credentials",
+             side_effect=_RefreshError("invalid_grant: Token has been expired or revoked."),
+         ), \
+         patch("backend.config.save_gmail_settings") as mock_save:
+        with pytest.raises(RuntimeError, match="invalid_grant"):
+            gmail_client.build_service("cid", "secret", "dead-token")
+    mock_save.assert_called_once_with(refresh_token="")
+
+
+def test_build_service_reraises_non_invalid_grant():
+    from backend import gmail_client
+
+    with patch.object(gmail_client, "_require_google_libs"), \
+         patch.object(gmail_client, "_credentials", side_effect=RuntimeError("network down")), \
+         patch("backend.config.save_gmail_settings") as mock_save:
+        with pytest.raises(RuntimeError, match="network down"):
+            gmail_client.build_service("cid", "secret", "tok")
+    mock_save.assert_not_called()
 
 
 @patch("backend.scraper.extract_company_and_role_from_email_header")

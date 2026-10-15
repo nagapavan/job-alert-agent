@@ -10,15 +10,17 @@ from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 
 from backend.database import Job, Resume, ApplicationEvent
-from backend.config import decrypt_data
+from backend.config import decrypt_data, COPILOT_JUDGE_ENABLED, COPILOT_JUDGE_MAX_REGEN
 from backend.ai_helper import (
     generate_text, 
     generate_consolidated_application_package,
     clean_job_description,
     generate_embeddings,
-    resolve_semantic_essay_cache
+    resolve_semantic_essay_cache,
+    judge_output,
 )
 from backend.company_catalog import compute_cosine_similarity
+from backend.prompts import career_copilot_system
 
 logger = logging.getLogger("chat_agent")
 
@@ -573,23 +575,17 @@ class CareerChatAgent:
         top_matches_summary = ", ".join([f"{j['title']} @ {j['company']} ({j['match_score']}%)" for j in pipeline['top_jobs'][:3]]) if pipeline['top_jobs'] else "None currently in queue"
         skills_summary = ", ".join(candidate['skills'][:15]) if candidate['skills'] else "Engineering / Tech"
 
-        system_prompt = (
-            "You are the candidate's personal AI Career Copilot and Senior Executive Job Search Strategist.\n"
-            "You have direct access to their active resume, job discovery pipeline, application tracker, and target company intelligence.\n\n"
-            f"Candidate Profile:\n"
-            f"- Name: {candidate['name']}\n"
-            f"- Experience: {candidate['experience']}\n"
-            f"- Key Skills: {skills_summary}\n\n"
-            f"Pipeline Snapshot:\n"
-            f"- Total Tracked: {pipeline['total_jobs']} roles\n"
-            f"- To Apply: {pipeline['to_apply_count']}, Shortlisted: {pipeline['shortlisted_count']}, Applied: {pipeline['applied_count']}, Interviewing: {pipeline['interview_count']}\n"
-            f"- Top Matches: {top_matches_summary}\n"
-            f"{focused_job_snippet}\n"
-            "Instructions:\n"
-            "1. Be direct, empowering, proactive, and concise. Use clean GitHub markdown formatting.\n"
-            "2. When discussing interview prep, use the STAR method (Situation, Task, Action, Result) referencing the candidate's real skills.\n"
-            "3. If any database actions were taken (status changes, material generation), clearly confirm what was updated.\n"
-            "4. Keep responses high-signal and structured with bold highlights and bullet points."
+        system_prompt = career_copilot_system(
+            candidate_name=candidate.get("name", "Candidate"),
+            candidate_experience=candidate.get("experience", ""),
+            skills_summary=skills_summary,
+            total_jobs=pipeline.get("total_jobs", 0),
+            to_apply_count=pipeline.get("to_apply_count", 0),
+            shortlisted_count=pipeline.get("shortlisted_count", 0),
+            applied_count=pipeline.get("applied_count", 0),
+            interview_count=pipeline.get("interview_count", 0),
+            top_matches_summary=top_matches_summary,
+            focused_job_snippet=focused_job_snippet,
         )
 
         user_prompt = f"Conversation History:\n{history_snippet}\nCandidate Message: {message}"
@@ -622,8 +618,39 @@ class CareerChatAgent:
             if not ai_reply.startswith("⚠️ **Local AI offline**"):
                 ai_reply = offline_banner + ai_reply
 
+        # Quality Judge gate (bounded, non-fatal): score the open-ended copilot reply
+        # and regenerate up to COPILOT_JUDGE_MAX_REGEN times if it fails. Only applied to
+        # real AI replies (never the offline fallback banner), and skippable via env to
+        # preserve token budgets.
+        final_reply = ai_reply
+        if (
+            COPILOT_JUDGE_ENABLED
+            and ai_reply
+            and not ai_reply.startswith("⚠️ **Local AI offline**")
+            and len(ai_reply) > 40  # skip trivial/empty replies to avoid pointless LLM spend
+        ):
+
+            def _regenerate(critique: str) -> str:
+                return generate_text(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt
+                    + f"\n\nQuality feedback to address in a revised answer:\n{critique}",
+                    json_mode=False,
+                    task_type=copilot_task_type,
+                    task_name=f"Copilot-{copilot_task_type}-Regen",
+                )
+
+            judged = judge_output(
+                ai_reply,
+                context=user_prompt,
+                regenerator=_regenerate,
+                max_regenerations=COPILOT_JUDGE_MAX_REGEN,
+                task_name="Copilot-Judge",
+            )
+            final_reply = judged.get("text") or ai_reply
+
         return {
-            "reply": ai_reply,
+            "reply": final_reply,
             "actions_taken": actions_taken,
             "embedded_jobs": embedded_jobs
         }

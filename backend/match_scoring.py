@@ -128,6 +128,28 @@ def _band(score: Optional[float], config: ScoringConfig) -> str:
     return "Poor"
 
 
+def band_and_recommendation(
+    score: Optional[float],
+    config: Optional[ScoringConfig] = None,
+    gated: bool = False,
+    over_qualified: bool = False,
+) -> tuple[str, str]:
+    """Map a 0-100 score to its (band, apply_recommendation) using the shared config.
+
+    Single source of truth for the score→band thresholds, reused by both the
+    LLM-backed ``compute_match`` and the fast classifier path.
+    """
+    config = config or ScoringConfig()
+    band = _band(score, config)
+    if score is None:
+        return band, UNKNOWN_RECOMMENDATION
+    if gated or band in ("Weak", "Poor"):
+        return band, SKIP
+    if over_qualified or band == "Moderate":
+        return band, APPLY_WITH_CAUTION
+    return band, APPLY
+
+
 def compute_match(
     assessment: RequirementAssessment, config: Optional[ScoringConfig] = None
 ) -> MatchResult:
@@ -158,16 +180,9 @@ def compute_match(
         score = min(score, config.cap_when_below_floor)
 
     over_qualified = assessment.over_qualified or any(r.over_qualified for r in reqs)
-    band = _band(score, config)
-
-    if score is None:
-        recommendation = UNKNOWN_RECOMMENDATION
-    elif gated or band in ("Weak", "Poor"):
-        recommendation = SKIP
-    elif over_qualified or band == "Moderate":
-        recommendation = APPLY_WITH_CAUTION
-    else:
-        recommendation = APPLY
+    band, recommendation = band_and_recommendation(
+        score, config, gated=gated, over_qualified=over_qualified
+    )
 
     missing_must = sorted(
         (r for r in must if r.status == MISSING),

@@ -223,9 +223,11 @@ def parse_email_classification(subject: str, snippet: str, sender: str = "") -> 
 
 def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> List[Dict[str, Any]]:
     """
-    Navigates to Gmail using the persistent Chrome session and runs a single TARGETED search
-    (job-board senders + interview/offer/rejection subjects) to catch job alerts, interview
-    calls, and status updates. Deliberately does NOT scan the full inbox or category tabs.
+    Navigates to Gmail using the persistent Chrome session and runs a single TARGETED
+    search across ALL MAIL (not just the active inbox — Updates/Promotions/Social
+    categories and user labels are included) over job-board senders + interview/
+    offer/rejection subjects to catch job alerts, interview calls, and status updates.
+    Deliberately does NOT enumerate the full mailbox or browse category tabs.
     """
     emails = []
     seen_keys = set()
@@ -234,8 +236,24 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
         context = get_persistent_browser_context(playwright_instance, headless=headless)
         page = context.new_page()
 
-        # Step 1: Navigate to Gmail Inbox and wait for SPA to load
-        page.goto("https://mail.google.com/mail/u/0/#inbox", timeout=45000, wait_until="domcontentloaded")
+        # Privacy: run ONLY a tight, targeted search. We deliberately do NOT scan the
+        # whole inbox or the Category "Updates" tabs, which would read unrelated
+        # personal mail. No label restriction in the query = all-mail scope (Gmail
+        # itself excludes Spam/Trash).
+        search_query = (
+            "newer_than:90d "
+            "(from:greenhouse.io OR from:lever.co OR from:ashbyhq.com OR from:myworkdayjobs.com "
+            "OR from:workday.com OR from:smartrecruiters.com OR from:workable.com "
+            "OR from:icims.com OR from:taleo.net OR from:linkedin.com "
+            "OR subject:interview OR subject:offer OR subject:\"next steps\" "
+            "OR subject:regret OR subject:\"not moving forward\" OR subject:\"application\" "
+            "OR subject:\"job alert\" OR subject:opportunity)"
+        )
+
+        # Step 1: Navigate directly to the global all-mail search view (Gmail search
+        # URLs are mailbox-wide, not scoped to the current folder) and wait for load.
+        search_url = "https://mail.google.com/mail/u/0/#search/" + urllib.parse.quote_plus(search_query)
+        page.goto(search_url, timeout=45000, wait_until="domcontentloaded")
 
         if "accounts.google.com" in page.url or "signin" in page.url.lower():
             logger.warning("Gmail scan: User is not logged in to Google in persistent Chrome profile. Launch interactive browser session to sign in.")
@@ -309,28 +327,32 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
                     else:
                         break
 
-        # Privacy: run ONLY a tight, targeted search. We deliberately do NOT scan the whole
-        # inbox or the Category "Updates" tabs, which would read unrelated personal mail.
-        search_query = (
-            "newer_than:60d "
-            "(from:greenhouse.io OR from:lever.co OR from:ashbyhq.com OR from:myworkdayjobs.com "
-            "OR from:smartrecruiters.com OR subject:interview OR subject:offer OR subject:\"next steps\" "
-            "OR subject:regret OR subject:\"not moving forward\" OR subject:\"application\" OR subject:\"job alert\")"
-        )
+        # Fallback: if the direct #search/ navigation did not render rows (Gmail SPA
+        # quirk), re-run the same query through the search box — still all-mail scope.
+        has_rows = False
         try:
-            search_input = page.query_selector("input[aria-label='Search mail'], input[name='q']")
-            if search_input:
-                search_input.click()
-                search_input.fill(search_query)
-                search_input.press("Enter")
-                page.wait_for_timeout(2500)
-                try:
-                    page.wait_for_selector("tr.zA", timeout=8000)
-                except Exception:
-                    pass
-                scan_view_with_pagination(max_pages=1)
-        except Exception as search_err:
-            logger.debug(f"Gmail targeted search notice: {search_err}")
+            has_rows = page.query_selector("tr.zA") is not None
+        except Exception:
+            has_rows = False
+        if not has_rows:
+            try:
+                search_input = page.query_selector("input[aria-label='Search mail'], input[name='q']")
+                if search_input:
+                    search_input.click()
+                    search_input.fill(search_query)
+                    search_input.press("Enter")
+                    page.wait_for_timeout(2500)
+                    try:
+                        page.wait_for_selector("tr.zA", timeout=8000)
+                    except Exception:
+                        pass
+            except Exception as search_err:
+                logger.debug(f"Gmail targeted search notice: {search_err}")
+        # Scan search results (2 pages ≈ up to 80 emails).
+        try:
+            scan_view_with_pagination(max_pages=2)
+        except Exception as scan_err:
+            logger.debug(f"Gmail scan pagination notice: {scan_err}")
 
         context.close()
     except Exception as e:

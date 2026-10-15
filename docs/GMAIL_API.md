@@ -49,13 +49,19 @@ Replace/augment the browser-session Gmail scan with the official **Gmail API**, 
 
 ## 4. Query & fetch strategy (anti-"read-all-mail" core)
 
-- Single, code-owned query (not user free-form):
+- Single, code-owned query (not user free-form). Label scope is **all mail** (no `labelIds`
+  ⇒ Inbox, Updates, Promotions, Social, and user labels; Gmail itself excludes Spam/Trash),
+  kept narrow by the sender/subject terms:
   ```
-  newer_than:60d (from:greenhouse.io OR from:lever.co OR from:ashbyhq.com
-   OR from:myworkdayjobs.com OR from:smartrecruiters.com
+  newer_than:90d (from:greenhouse.io OR from:lever.co OR from:ashbyhq.com
+   OR from:myworkdayjobs.com OR from:workday.com OR from:smartrecruiters.com
+   OR from:workable.com OR from:icims.com OR from:taleo.net OR from:linkedin.com
    OR subject:interview OR subject:offer OR subject:"next steps"
-   OR subject:regret OR subject:"not moving forward")
+   OR subject:regret OR subject:"not moving forward"
+   OR subject:"job alert" OR subject:opportunity OR subject:application)
   ```
+- The browser fallback (`scan_gmail_for_job_alerts`) mirrors this: it navigates straight to the
+  global `#search/` view (mailbox-wide, not the inbox) and reads 2 result pages (≈80 emails).
 - `users().messages().list(userId="me", q=QUERY, maxResults=50, fields="messages/id,nextPageToken")`,
   page-capped (e.g., max 2 pages).
 - Per message: `messages().get(userId="me", id=..., format="metadata",

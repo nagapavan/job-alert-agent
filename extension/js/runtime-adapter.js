@@ -130,6 +130,7 @@ class JobAgentRuntimeAdapter {
   // 1. Job Match Analysis
   // -------------------------------------------------------------
   async analyzeJobMatch(jobTitle, company, jobDescription, resumeText) {
+    let backendError = null;
     // Mode A: Connected FastAPI — structured JSON match analysis (single source of truth)
     if (this.mode === "connected" && this.isConnected) {
       try {
@@ -150,7 +151,8 @@ class JobAgentRuntimeAdapter {
         if (resp.ok) {
           const res = await resp.json();
           if (res.match_score == null || res.analysis_source === "error") {
-            console.warn("Backend could not produce a match score:", res.error || res.analysis_source);
+            backendError = res.error || "The backend could not produce a score for this posting.";
+            console.warn("Backend could not produce a match score:", backendError);
           } else {
             const score = this._normalizeScore(res.match_score);
             return {
@@ -162,9 +164,11 @@ class JobAgentRuntimeAdapter {
             };
           }
         } else {
+          backendError = `Backend returned HTTP ${resp.status}.`;
           console.warn(`Backend match analysis returned ${resp.status}; trying on-device.`);
         }
       } catch (e) {
+        backendError = e && e.message ? e.message : "Could not reach the backend.";
         console.warn("Backend match analysis failed, trying on-device:", e);
       }
     }
@@ -197,7 +201,8 @@ class JobAgentRuntimeAdapter {
 
     // Never fabricate a score. Surface an explicit, retryable failure instead.
     return this._matchUnavailableResult(
-      "No AI model was available to evaluate this role. Connect the backend or enable on-device AI, then re-process."
+      backendError ||
+        "No AI model was available to evaluate this role. Connect the backend or enable on-device AI, then re-process."
     );
   }
 

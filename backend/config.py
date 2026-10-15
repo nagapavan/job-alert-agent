@@ -104,11 +104,10 @@ POSTGRES_HOST = os.environ.get("DB_HOST", "localhost")
 POSTGRES_PORT = os.environ.get("DB_PORT", "5432")
 POSTGRES_DB = os.environ.get("DB_NAME", "job_alert_agent")
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", 
-    f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
-)
 SQLITE_URL = f"sqlite:///{BASE_DIR}/job_alert_agent.db"
+# SQLite is the default database. Set DATABASE_URL to a postgresql:// URL to opt into
+# PostgreSQL (with pgvector) for larger job sets.
+DATABASE_URL = os.environ.get("DATABASE_URL", SQLITE_URL)
 
 # -------------------------------------------------------------
 # AI / LLM Configurations (Local LM Studio / Unsloth / Ollama & Cloud Fallbacks)
@@ -116,6 +115,32 @@ SQLITE_URL = f"sqlite:///{BASE_DIR}/job_alert_agent.db"
 # Default provider priority: "auto", "lmstudio", "unsloth", "ollama", "openai", "gemini", "anthropic"
 DEFAULT_LLM_PROVIDER = os.environ.get("DEFAULT_LLM_PROVIDER", "auto")
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "120"))
+# Transient-failure retry policy for provider calls (429/5xx/conn/timeout).
+# Values may be overridden per task-type via TASK_PROFILES in ai_helper.
+LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
+LLM_BACKOFF_BASE = float(os.environ.get("LLM_BACKOFF_BASE", "0.5"))
+LLM_BACKOFF_MAX = float(os.environ.get("LLM_BACKOFF_MAX", "5.0"))
+LLM_RETRY_JITTER = os.environ.get("LLM_RETRY_JITTER", "true").lower() in ("true", "1", "yes")
+
+# LLM audit-trail content capture (transitional observability, LangSmith-analogue).
+# OFF by default for privacy — prompts may contain PII such as resume text. When enabled,
+# only short, length-capped transcript snippets are recorded to logs/llm_audit.log.
+LLM_AUDIT_CAPTURE_CONTENT = os.environ.get(
+    "LLM_AUDIT_CAPTURE_CONTENT", "false"
+).lower() in ("true", "1", "yes")
+LLM_AUDIT_MAX_CONTENT_CHARS = int(os.environ.get("LLM_AUDIT_MAX_CONTENT_CHARS", "500"))
+
+# Career Copilot quality Judge gate (open-ended reply scoring + bounded regeneration).
+# Adds one extra LLM call per copilot turn, so it can be disabled via env for
+# strict token-economy. max_regenerations bounds how many retries the judge may trigger.
+COPILOT_JUDGE_ENABLED = os.environ.get("COPILOT_JUDGE_ENABLED", "true").lower() in ("true", "1", "yes")
+COPILOT_JUDGE_MAX_REGEN = int(os.environ.get("COPILOT_JUDGE_MAX_REGEN", "1"))
+# Interactive endpoints must not block on the LLM for the full timeout; the match-analysis
+# LLM fallback aborts after this many seconds and returns a fast unverified state.
+LLM_INTERACTIVE_TIMEOUT = int(os.environ.get("LLM_INTERACTIVE_TIMEOUT", "30"))
+# Bulk discovery/re-score scoring: run the deterministic requirement engine first (no LLM),
+# with a bounded LLM fallback. Set to false to fall back to the legacy LLM-only bulk path.
+DETERMINISTIC_BULK_SCORING = os.environ.get("DETERMINISTIC_BULK_SCORING", "true").lower() in ("true", "1", "yes")
 
 # LM Studio Local Server (OpenAI-compatible inference server)
 LM_STUDIO_BASE_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
@@ -297,9 +322,6 @@ def save_llm_settings(openai_api_key=None, gemini_api_key=None, anthropic_api_ke
 
 # Dynamic Model Routing
 ENABLE_DYNAMIC_MODEL_ROUTING = os.environ.get("ENABLE_DYNAMIC_MODEL_ROUTING", "true").lower() in ("true", "1", "yes")
-FAST_TIER_MODEL = os.environ.get("FAST_TIER_MODEL", "qwen2.5:3b")
-STANDARD_TIER_MODEL = os.environ.get("STANDARD_TIER_MODEL", "llama3:8b")
-DEEP_TIER_MODEL = os.environ.get("DEEP_TIER_MODEL", "llama3.3:70b")
 
 # LinkedIn automation is opt-in and rate-limited. Conservative inter-action pause (seconds)
 # to reduce load/risk on the user's LinkedIn session.

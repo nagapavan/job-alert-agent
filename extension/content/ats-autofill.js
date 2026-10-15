@@ -126,10 +126,206 @@
     if (host.includes("myworkdayjobs.com") || document.querySelector("[data-automation-id='applicationPage']")) {
       return "workday";
     }
+    if (host.includes("icims.com") || document.querySelector(".iCIMS_MainWrapper, .iCIMS_JobContent")) {
+      return "icims";
+    }
     if (host.includes("linkedin.com")) {
       return "linkedin";
     }
     return "custom";
+  }
+
+  // -------------------------------------------------------------
+  // Structured JD extraction helpers
+  //   Tier 0: schema.org/JobPosting JSON-LD (most reliable; full description)
+  //   Tier 1: known ATS containers (below)
+  //   Tier 2: largest semantic content block (JS-rendered / custom portals)
+  // -------------------------------------------------------------
+  // Walk the light DOM AND every open shadow root, so component-rendered pages
+  // (Atlassian's design system, etc.) are still readable.
+  function getAllRoots() {
+    const roots = [document];
+    const seen = new Set();
+    const queue = [document];
+    while (queue.length) {
+      const root = queue.shift();
+      let elements = [];
+      try {
+        elements = root.querySelectorAll("*");
+      } catch (e) {
+        elements = [];
+      }
+      for (const el of elements) {
+        if (el.shadowRoot && !seen.has(el.shadowRoot)) {
+          seen.add(el.shadowRoot);
+          roots.push(el.shadowRoot);
+          queue.push(el.shadowRoot);
+        }
+      }
+    }
+    return roots;
+  }
+
+  function deepQueryAll(selector) {
+    const out = [];
+    for (const root of getAllRoots()) {
+      try {
+        root.querySelectorAll(selector).forEach((el) => out.push(el));
+      } catch (e) {
+        /* ignore invalid selector in a given root */
+      }
+    }
+    return out;
+  }
+
+  // Text of a shadow root, walking text nodes and skipping <script>/<style>/etc. Using
+  // textContent here would leak bundled JavaScript into the "description".
+  function _shadowRootText(root) {
+    const parts = [];
+    try {
+      root.querySelectorAll("*").forEach((el) => {
+        const tag = (el.tagName || "").toLowerCase();
+        if (tag === "script" || tag === "style" || tag === "noscript" || tag === "template" || tag === "svg") {
+          return;
+        }
+        for (const n of el.childNodes) {
+          if (n.nodeType === 3) {
+            const t = (n.textContent || "").trim();
+            if (t) parts.push(t);
+          }
+        }
+      });
+    } catch (e) {
+      /* ignore */
+    }
+    return parts.join("\n");
+  }
+
+  // Text from all roots (light + shadow), used as the last-resort description source.
+  function deepRootsText() {
+    const parts = [];
+    for (const root of getAllRoots()) {
+      try {
+        if (root === document) {
+          parts.push(document.body ? document.body.innerText || "" : "");
+        } else {
+          parts.push(_shadowRootText(root));
+        }
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    return parts.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  // Heuristic: reject captured text that is actually JS/CSS source rather than prose.
+  function looksLikeCode(text) {
+    const s = (text || "").slice(0, 2000);
+    if (!s) return false;
+    const signals = (s.match(/=>|function\s*\(|var\s+[A-Za-z_$]+\s*=|const\s+[A-Za-z_$]+\s*=|let\s+[A-Za-z_$]+\s*=|this\.[A-Za-z_$]+\s*=|;\s*}|return\s+[A-Za-z_$]+\./g) || []).length;
+    return signals >= 5;
+  }
+
+  function _htmlToText(html) {
+    if (!html) return "";
+    const withBreaks = String(html)
+      .replace(/<\s*(script|style)[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, " ")
+      .replace(/<\s*br\s*\/?>/gi, "\n")
+      .replace(/<\/(p|div|li|h[1-6]|tr|section|article|ul|ol)>/gi, "\n");
+    const tmp = document.createElement("div");
+    tmp.innerHTML = withBreaks;
+    return (tmp.textContent || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/[ \t]+/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  function _jsonLdLocation(loc) {
+    try {
+      const l = Array.isArray(loc) ? loc[0] : loc;
+      const addr = l && (l.address || l);
+      if (!addr) return "";
+      if (typeof addr === "string") return addr;
+      return [addr.addressLocality, addr.addressRegion, addr.addressCountry]
+        .filter(Boolean)
+        .join(", ");
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function extractJsonLdJobPosting() {
+    let scripts = [];
+    try {
+      scripts = deepQueryAll('script[type="application/ld+json"]');
+    } catch (e) {
+      return null;
+    }
+    for (const s of scripts) {
+      let data;
+      try {
+        data = JSON.parse(s.textContent || "null");
+      } catch (e) {
+        continue;
+      }
+      if (!data) continue;
+      const nodes = Array.isArray(data)
+        ? data
+        : Array.isArray(data["@graph"])
+          ? data["@graph"]
+          : [data];
+      for (const node of nodes) {
+        if (!node || typeof node !== "object") continue;
+        const t = node["@type"];
+        const types = Array.isArray(t) ? t : [t];
+        const isJob = types.some(
+          (x) => typeof x === "string" && x.toLowerCase().includes("jobposting")
+        );
+        if (!isJob) continue;
+        const org = node.hiringOrganization;
+        const companyName = typeof org === "string" ? org : (org && org.name) || "";
+        const desc = _htmlToText(node.description || "");
+        if (!desc) continue;
+        return {
+          title: (node.title || "").trim(),
+          company: companyName.trim(),
+          description: desc,
+          location: _jsonLdLocation(node.jobLocation),
+        };
+      }
+    }
+    return null;
+  }
+
+  function extractMainContentText() {
+    const selectors = [
+      "main",
+      "article",
+      "[role='main']",
+      "#content",
+      ".iCIMS_JobContent",
+      ".job-posting-detail",
+      ".job-details",
+      ".basic-layout__main",
+      ".body-copy.rich-text",
+      ".job-description",
+      ".jobDescription",
+      "[class*='job-description']",
+      "[class*='jobDescription']",
+      "[class*='job-posting']",
+      "[class*='jobPosting']",
+      "section",
+    ];
+    let best = "";
+    for (const sel of selectors) {
+      for (const el of deepQueryAll(sel)) {
+        const text = (el.innerText || el.textContent || "").trim();
+        if (text.length > best.length) best = text;
+      }
+    }
+    if (!best) best = deepRootsText();
+    return best;
   }
 
   function extractJobMetadata() {
@@ -147,12 +343,15 @@
       "[data-automation-id='jobTitle']",
       "h1.top-card-layout__title",
       ".job-details-jobs-unified-top-card__job-title",
+      "h1.iCIMS_Header",
+      "h1.default.heading",
+      "section.job-posting-detail h1",
       "h1"
     ];
     for (const sel of titleSelectors) {
-      const el = document.querySelector(sel);
-      if (el && el.innerText.trim()) {
-        title = el.innerText.trim();
+      const el = deepQueryAll(sel).find((n) => (n.innerText || n.textContent || "").trim());
+      if (el) {
+        title = (el.innerText || el.textContent || "").trim();
         break;
       }
     }
@@ -177,13 +376,16 @@
       "meta[property='og:site_name']"
     ];
     for (const sel of companySelectors) {
-      const el = document.querySelector(sel);
+      const el = deepQueryAll(sel).find((n) => {
+        if (n.tagName === "META") return (n.getAttribute("content") || "").trim();
+        return (n.innerText || n.textContent || "").trim();
+      });
       if (el) {
         let extracted = "";
         if (el.tagName === "META") {
           extracted = el.getAttribute("content") || "";
-        } else if (el.innerText.trim()) {
-          extracted = el.innerText.trim();
+        } else {
+          extracted = (el.innerText || el.textContent || "").trim();
         }
         if (extracted && !isGenericCompanyName(extracted)) {
           company = extracted;
@@ -222,27 +424,78 @@
       }
     }
 
-    // 3. Description Extraction
-    const descSelectors = [
-      "#content",
-      "#job-description",
-      ".job-description",
-      ".posting-description",
-      ".section-wrapper",
-      "[data-automation-id='jobPostingDescription']",
-      ".jobs-description__content",
-      ".show-more-less-html__markup"
-    ];
-    for (const sel of descSelectors) {
-      const el = document.querySelector(sel);
-      if (el && el.innerText.trim().length > 100) {
-        description = el.innerText.trim();
-        break;
+    // 3. Description Extraction (tiered)
+
+    // Tier 0: schema.org/JobPosting structured data — full, clean description.
+    const ld = extractJsonLdJobPosting();
+    if (ld) {
+      if (ld.title && (!title || title.length < 8 || /job details|careers|opportunit/i.test(title))) {
+        title = ld.title;
+      }
+      if (ld.company && (!company || isGenericCompanyName(company))) {
+        company = ld.company;
+      }
+      if (ld.description) {
+        description = ld.description;
       }
     }
 
-    if (!description) {
-      description = document.body ? document.body.innerText.slice(0, 4000) : "";
+    // Tier 1: known ATS containers (deep query pierces shadow DOM)
+    if (!description || description.length < 200) {
+      const descSelectors = [
+        "#content",
+        "#job-description",
+        ".job-description",
+        ".posting-description",
+        ".section-wrapper",
+        "[data-automation-id='jobPostingDescription']",
+        ".jobs-description__content",
+        ".show-more-less-html__markup",
+        // iCIMS portal (e.g. globalcareers-<company>.icims.com)
+        ".iCIMS_JobContent",
+        ".iCIMS_MainWrapper",
+        // Atlassian careers (React) job-detail section
+        "section.job-posting-detail",
+        ".job-posting-detail",
+        // Randstad (Drupal "bluex") job detail
+        ".job-details",
+        ".basic-layout__main",
+        ".body-copy.rich-text",
+        ".collapsible__content.rich-text"
+      ];
+      let best = "";
+      for (const sel of descSelectors) {
+        for (const el of deepQueryAll(sel)) {
+          const text = (el.innerText || el.textContent || "").trim();
+          if (text.length > best.length) best = text;
+        }
+      }
+      if (best.length > (description || "").length) {
+        description = best;
+      }
+    }
+
+    // Tier 2: largest semantic content block (JS-rendered / custom portals)
+    if (!description || description.length < 200) {
+      const mainText = extractMainContentText();
+      if (mainText.length > (description || "").length) {
+        description = mainText;
+      }
+    }
+
+    // Tier 3: all-roots text fallback (light + shadow; raised cap; backend scopes sections)
+    if (!description || description.length < 200) {
+      const bodyText = deepRootsText();
+      if (bodyText.length > (description || "").length) {
+        description = bodyText;
+      }
+    }
+
+    description = (description || "").slice(0, 15000);
+
+    // Never treat bundled JS/CSS as a job description.
+    if (looksLikeCode(description)) {
+      description = "";
     }
 
     return {
@@ -1386,6 +1639,16 @@
     document.addEventListener("DOMContentLoaded", updateBadgeLifecycle);
   } else {
     updateBadgeLifecycle();
+  }
+
+  // Expose extraction entry points on the isolated-world window so the side panel can
+  // collect data from EVERY frame via chrome.scripting.executeScript (hybrid pages embed
+  // the JD/form in a cross-origin iframe, which the top frame cannot read directly).
+  try {
+    window.__jobAgentExtractJobInfo = extractJobMetadata;
+    window.__jobAgentInspectFormTelemetry = inspectFormTelemetry;
+  } catch (e) {
+    /* isolated world should always allow this */
   }
 })();
 

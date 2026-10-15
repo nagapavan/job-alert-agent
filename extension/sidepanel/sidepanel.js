@@ -57,38 +57,111 @@ document.addEventListener("DOMContentLoaded", async () => {
     setTimeout(() => toast.classList.remove("show"), 2500);
   }
 
+  // Returns true when we can read the tab (content script present/injectable), false when the
+  // extension lacks host access (activeTab not granted and the origin is not in host_permissions).
+  // activeTab is granted per toolbar-icon click, so opening the panel via the icon needs no prompt.
   async function ensureContentScriptInjected(tabId) {
+    let isAlive = false;
     try {
-      const isAlive = await new Promise((resolve) => {
+      isAlive = await new Promise((resolve) => {
         chrome.tabs.sendMessage(tabId, { type: "PING" }, (resp) => {
-          if (chrome.runtime.lastError || !resp) {
-            resolve(false);
-          } else {
-            resolve(true);
-          }
+          resolve(!chrome.runtime.lastError && !!resp);
         });
       });
+    } catch (e) {
+      isAlive = false;
+    }
 
-      if (!isAlive) {
-        if (chrome.scripting) {
-          await chrome.scripting.insertCSS({
-            target: { tabId: tabId },
-            files: ["content/ats-autofill.css"]
-          }).catch(() => {});
+    if (!chrome.scripting) return isAlive;
 
-          await chrome.scripting.executeScript({
-            target: { tabId: tabId },
-            files: ["content/ats-autofill.js"]
-          }).catch((err) => console.warn("Execute script error:", err));
-
-          await new Promise(r => setTimeout(r, 120));
-        }
-      }
+    try {
+      await chrome.scripting
+        .insertCSS({ target: { tabId: tabId, allFrames: true }, files: ["content/ats-autofill.css"] })
+        .catch(() => {});
+      // Rejects when the extension has no host access to the tab -> our "needs permission" signal.
+      await chrome.scripting.executeScript({
+        target: { tabId: tabId, allFrames: true },
+        files: ["content/ats-autofill.js"]
+      });
+      if (!isAlive) await new Promise((r) => setTimeout(r, 120));
       return true;
     } catch (err) {
-      console.warn("Could not inject content script into tab:", err);
-      return false;
+      console.warn("Content script injection blocked (missing host access):", err && err.message);
+      return isAlive;
     }
+  }
+
+  // Shown in the rare case the page can't be read (e.g. the user restricted the extension's
+  // site access). Host access is granted at install, so no runtime permission prompt is needed.
+  function renderAccessPrompt() {
+    const titleEl = document.getElementById("sp-job-title");
+    const companyEl = document.getElementById("sp-job-company");
+    const portalEl = document.getElementById("sp-job-portal");
+    const snippetEl = document.getElementById("sp-job-snippet");
+    const scoreCircle = document.getElementById("sp-score-circle");
+    const scoreLabel = document.getElementById("sp-score-tier-label");
+    const analysisBox = document.getElementById("sp-match-analysis-text");
+
+    if (titleEl) titleEl.innerText = "Couldn't read this page";
+    if (companyEl) companyEl.innerText = "—";
+    if (portalEl) portalEl.innerText = "";
+    if (snippetEl) snippetEl.innerText = "Job Agent couldn't read this page.";
+    if (scoreCircle) {
+      scoreCircle.innerText = "--";
+      scoreCircle.style.borderColor = "#f59e0b";
+      scoreCircle.style.color = "#f59e0b";
+    }
+    if (scoreLabel) scoreLabel.innerText = "Unavailable";
+    if (analysisBox) {
+      analysisBox.innerHTML =
+        "<p>Job Agent couldn't read this page. Check its site access " +
+        "(chrome://extensions → Job Agent → Site access → On all sites), then retry.</p>";
+    }
+  }
+
+  // Collect job metadata + form telemetry from EVERY frame of the tab and keep the best
+  // of each. Hybrid pages (e.g. iCIMS embedded in a React shell) render the JD and the
+  // application form inside a cross-origin iframe that the top frame cannot read.
+  async function collectFrameData(tabId) {
+    if (!chrome.scripting) return null;
+    let results = [];
+    try {
+      results = await chrome.scripting.executeScript({
+        target: { tabId: tabId, allFrames: true },
+        func: () => {
+          const meta =
+            typeof window.__jobAgentExtractJobInfo === "function"
+              ? window.__jobAgentExtractJobInfo()
+              : null;
+          const telemetry =
+            typeof window.__jobAgentInspectFormTelemetry === "function"
+              ? window.__jobAgentInspectFormTelemetry()
+              : null;
+          return { meta, telemetry };
+        }
+      });
+    } catch (e) {
+      console.warn("Frame collection failed:", e);
+      return null;
+    }
+
+    const frames = (results || [])
+      .map((r) => r && r.result)
+      .filter((r) => r && r.meta);
+    if (!frames.length) return null;
+
+    const bestMeta = frames.reduce((a, b) =>
+      (b.meta.description || "").length > (a.meta.description || "").length ? b : a
+    ).meta;
+
+    const telemetryFrames = frames
+      .filter((f) => f.telemetry)
+      .sort((a, b) => (b.telemetry.total_fields || 0) - (a.telemetry.total_fields || 0));
+
+    return {
+      data: bestMeta,
+      telemetry: telemetryFrames.length ? telemetryFrames[0].telemetry : null
+    };
   }
 
   // -------------------------------------------------------------
@@ -233,11 +306,17 @@ document.addEventListener("DOMContentLoaded", async () => {
         return;
       }
 
-      // Ensure content script is running on custom site or ATS
-      await ensureContentScriptInjected(tab.id);
+      // Inject (all frames) and collect. hasAccess=false means we lack host permission for this
+      // origin (activeTab not granted) -> offer an explicit "enable access" action instead.
+      const hasAccess = await ensureContentScriptInjected(tab.id);
+      const frameData = await collectFrameData(tab.id);
 
-      // Query content script for job metadata
-      chrome.tabs.sendMessage(tab.id, { type: "GET_PAGE_JOB_INFO" }, async (response) => {
+      if ((!frameData || !frameData.data) && !hasAccess) {
+        renderAccessPrompt();
+        return;
+      }
+
+      const handleInspection = async (response) => {
         let jobMeta = null;
         if (response && response.data) {
           jobMeta = response.data;
@@ -357,7 +436,9 @@ document.addEventListener("DOMContentLoaded", async () => {
             });
           }
         }
-      });
+      };
+
+      await handleInspection(frameData);
     } catch (e) {
       titleEl.innerText = "Failed to inspect tab";
       console.error("Tab inspection error:", e);

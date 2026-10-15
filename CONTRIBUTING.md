@@ -39,6 +39,16 @@ No build step is required for the SPA or the Chrome extension.
 4. If you changed a SQLAlchemy model, add a lightweight `ALTER TABLE` step in
    `init_db()` (`backend/database.py`) so existing databases migrate without data loss.
 
+## Code Editing & File Integrity Rules
+
+- **Never Push Without Explicit Approval**: Do NOT run `git push` or otherwise publish to any remote unless the user explicitly asks. Local commits and branches are fine.
+- **Active File Targeting**: If changes belong to the active file, modify only that file. Otherwise, update the existing relevant file. Do not scatter related changes across multiple files unnecessarily.
+- **No Unnecessary Files**: Do not create new files or folders unless explicitly requested or approved.
+- **No Over-Engineering Documentation**: Do NOT auto-generate explanatory docs, checklists, alternative analyses, or reference files unless explicitly requested. Make the code changes only. If asked "should we do X?", wait for the decision—do not create docs exploring options you're unsure about.
+- **Concise Communication**: Provide only what was requested. Avoid verbose summaries, unnecessary walkthroughs, or "for future reference" guides.
+- **Pydantic V2 Syntax**: Always use Pydantic V2 conventions (e.g., `model_config = ConfigDict(from_attributes=True)` instead of v1 `class Config`).
+- **Preserve Comments & Docstrings**: Maintain existing docstrings, type annotations, and code styling patterns. Avoid slop-comments; use design docs instead.
+
 ## Ground rules
 
 - **No fabricated AI output.** If an LLM/analysis step fails, surface an explicit

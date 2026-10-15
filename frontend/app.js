@@ -14,6 +14,9 @@ let state = {
     activeJobModal: null,
     activeLLM: null,
     feedTab: "all",
+    sourceFilter: "all", // 'all', 'linkedin', 'direct', 'email'
+    reviewBatchId: null, // when set, feed is scoped to that sync batch ("view N new")
+    lastSync: null, // latest LinkedIn sync summary from /api/linkedin/last-sync
     trackerFilter: "in_progress", // 'in_progress', 'shortlisted', 'all', 'rejected', 'not_interested'
     companyFilter: "all", // 'all', 'direct', 'network'
     companySearchQuery: "",
@@ -1544,6 +1547,81 @@ async function fetchJobs() {
     } catch (e) {
         console.error("Failed to fetch jobs", e);
     }
+    fetchLastLinkedInSync();
+}
+
+async function fetchLastLinkedInSync() {
+    try {
+        const res = await fetch(`${API_BASE}/api/linkedin/last-sync`);
+        if (res.ok) {
+            state.lastSync = await res.json();
+            renderSyncBanner();
+        }
+    } catch (e) {
+        console.error("Failed to fetch last LinkedIn sync", e);
+    }
+}
+
+// Show/hide the "N new from sync" review banner and wire its View/Dismiss actions.
+function renderSyncBanner() {
+    const banner = document.getElementById("sync-review-banner");
+    if (!banner) return;
+    const info = state.lastSync;
+    if (!info || !info.has_sync || !info.sync_batch_id || info.pending_review <= 0) {
+        banner.classList.add("hidden");
+        banner.innerHTML = "";
+        return;
+    }
+    banner.classList.remove("hidden");
+    banner.innerHTML = `
+        <span class="sync-banner-icon">📥</span>
+        <span class="sync-banner-text">
+            <strong>${info.pending_review}</strong> job(s) from your last LinkedIn sync still need review
+            <span class="sync-banner-meta">(${info.total_added} added: ${info.saved_jobs_added} saved, ${info.recommendations_added} recommended)</span>
+        </span>
+        <span class="sync-banner-actions">
+            <button class="btn btn-sm btn-primary" onclick="viewSyncBatch()">View them</button>
+            <button class="btn btn-sm btn-outline" onclick="dismissSyncBanner()" title="Hide this banner">✕</button>
+        </span>
+    `;
+}
+
+function viewSyncBatch() {
+    if (state.lastSync && state.lastSync.sync_batch_id) {
+        state.reviewBatchId = state.lastSync.sync_batch_id;
+        applyJobFilters();
+        const feed = document.getElementById("job-feed");
+        if (feed && feed.scrollIntoView) feed.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+}
+
+function dismissSyncBanner() {
+    const banner = document.getElementById("sync-review-banner");
+    if (banner) banner.classList.add("hidden");
+}
+
+// Toggle the "showing batch N new" chip that appears while a sync batch filter is active.
+function renderReviewBatchChip() {
+    let chip = document.getElementById("review-batch-chip");
+    const active = !!state.reviewBatchId;
+    if (!active && !chip) return;
+    if (!active && chip) { chip.remove(); return; }
+    if (active && !chip) {
+        const container = document.getElementById("feed-tabs-container");
+        if (!container) return;
+        chip = document.createElement("span");
+        chip.id = "review-batch-chip";
+        chip.className = "review-batch-chip";
+        container.prepend(chip);
+    }
+    const pending = (state.jobs || []).filter(j => j.sync_batch_id === state.reviewBatchId).length;
+    chip.innerHTML = `📥 Reviewing last sync (${pending}) <button onclick="clearReviewBatch()" title="Clear filter">✕</button>`;
+}
+
+function clearReviewBatch() {
+    state.reviewBatchId = null;
+    renderReviewBatchChip();
+    applyJobFilters();
 }
 
 async function fetchResume() {
@@ -1766,6 +1844,14 @@ function setFeedTab(tabName) {
     applyJobFilters();
 }
 
+function setSourceFilter(value) {
+    state.sourceFilter = value || "all";
+    // Scoping to a batch is more specific, so it takes precedence; drop it when re-filtering by source.
+    state.reviewBatchId = null;
+    renderReviewBatchChip();
+    applyJobFilters();
+}
+
 function isJobLocationMatch(jLoc, jTitle, targetCountry, targetCities, targetWorkMode) {
     const loc = (jLoc || "").toLowerCase().trim();
     const title = (jTitle || "").toLowerCase().trim();
@@ -1858,10 +1944,12 @@ function isJobLocationMatch(jLoc, jTitle, targetCountry, targetCities, targetWor
 
 function applyJobFilters() {
     updateFeedTabCounts();
+    renderReviewBatchChip();
 
     const query = (document.getElementById("job-search-input")?.value || "").toLowerCase();
     const statusVal = document.getElementById("status-filter")?.value || "all";
     const minScore = parseFloat(document.getElementById("score-filter")?.value || "0");
+    const sourceVal = (state.sourceFilter || "all").toLowerCase();
 
     const targetRoles = state.targetRoles.map(t => t.toLowerCase().trim()).filter(Boolean);
     const targetCountry = (state.targetCountry || "all").toLowerCase().trim();
@@ -1869,6 +1957,21 @@ function applyJobFilters() {
 
     const filtered = state.jobs.filter(j => {
         const jStatus = j.status || "To Apply";
+
+        // Sync batch review scope (narrowest, wins over tabs)
+        if (state.reviewBatchId) {
+            return j.sync_batch_id === state.reviewBatchId;
+        }
+
+        // Source filter (LinkedIn / Direct / Email)
+        let matchesSource = true;
+        if (sourceVal !== "all") {
+            const st = (j.source_type || "Direct").toLowerCase();
+            if (sourceVal === "linkedin") matchesSource = st === "linkedin";
+            else if (sourceVal === "email") matchesSource = st === "email";
+            else if (sourceVal === "direct") matchesSource = st === "direct";
+        }
+        if (!matchesSource) return false;
 
         // Tab & Status condition
         let matchesTab = true;
@@ -1963,6 +2066,10 @@ function renderJobFeed(jobs) {
             ? `<span class="tailored-badge" title="AI Tailored cover letter and resume points ready">⚡ Tailored</span>`
             : '';
 
+        const syncBadge = job.sync_batch_id
+            ? `<span class="sync-new-badge" title="New from your last LinkedIn sync — not yet reviewed">📥 New from sync</span>`
+            : '';
+
         const isChecked = state.selectedJobIds.has(job.id);
         const postedDate = job.created_at ? formatDate(job.created_at) : 'Recently';
         const statusSlug = (job.status || 'To Apply').toLowerCase().replace(/\s+/g, '-');
@@ -1984,6 +2091,7 @@ function renderJobFeed(jobs) {
                         ${job.status === 'Applied' ? (job.submission_confirmed ? `<span class="badge" style="background:rgba(166,227,161,0.2); color:#a6e3a1; border:1px solid rgba(166,227,161,0.5);">✅ Submitted</span>` : `<span class="badge" style="background:rgba(250,179,135,0.15); color:#fab387; border:1px solid rgba(250,179,135,0.4);">🕓 Awaiting submit</span>`) : ''}
                         ${ghostBadge}
                         ${tailoredBadge}
+                        ${syncBadge}
                         ${recBadge}
                     </div>
                     <div class="job-meta-row">
@@ -3122,6 +3230,58 @@ function openJobDetails(jobId) {
     return openJobDetailsModal(jobId);
 }
 
+function renderGapInsights(job) {
+    const card = document.getElementById("modal-gap-insights-card");
+    const body = document.getElementById("modal-gap-insights-body");
+    if (!card || !body) return;
+    // Feature flag (default on; only an explicit false disables the panel).
+    if (featureFlags && featureFlags.resume_gap_insights === false) {
+        card.style.display = "none";
+        return;
+    }
+    // Structured lists (persisted at scoring time) take precedence; legacy rows
+    // fall back to the flattened "Strengths: ... Gaps: ..." narrative.
+    let strengths = Array.isArray(job.match_strengths) ? job.match_strengths : null;
+    let gaps = Array.isArray(job.match_gaps) ? job.match_gaps : null;
+    let legacy = false;
+    if (!strengths && !gaps) {
+        const ma = job.match_analysis || "";
+        const gapIdx = ma.indexOf("Gaps:");
+        if (gapIdx >= 0) {
+            legacy = true;
+            const gapText = ma.slice(gapIdx + 5).replace(/\.$/, "").trim();
+            const strIdx = ma.indexOf("Strengths:");
+            const strText = strIdx >= 0
+                ? ma.slice(strIdx + 10, gapIdx).replace(/\.$/, "").trim()
+                : "";
+            gaps = gapText ? [gapText] : [];
+            strengths = strText ? [strText] : [];
+        }
+    }
+    if ((!gaps || !gaps.length) && (!strengths || !strengths.length)) {
+        card.style.display = "none";
+        return;
+    }
+    card.style.display = "";
+    const bullets = items => items.map(t =>
+        `<li style="margin:3px 0; font-size:12.5px; color:var(--text-main);">${escapeHTML(t)}</li>`
+    ).join("");
+    body.innerHTML = [
+        gaps && gaps.length ? `
+            <div style="margin-top:8px;">
+                <span style="font-size:11px; text-transform:uppercase; color:#fab387; font-weight:700; letter-spacing:0.5px;">
+                    ⚠️ Gaps to address${legacy ? " (from last analysis)" : ""}</span>
+                <ul style="margin:4px 0 0 18px; padding:0;">${bullets(gaps)}</ul>
+            </div>` : "",
+        strengths && strengths.length ? `
+            <div style="margin-top:10px;">
+                <span style="font-size:11px; text-transform:uppercase; color:#a6e3a1; font-weight:700; letter-spacing:0.5px;">
+                    ✓ Already matched</span>
+                <ul style="margin:4px 0 0 18px; padding:0;">${bullets(strengths)}</ul>
+            </div>` : ""
+    ].join("");
+}
+
 function openJobModal(job) {
     if (typeof job === "object" && job && job.id) {
         return openJobDetailsModal(job.id);
@@ -3167,6 +3327,8 @@ function openJobDetailsModal(jobId) {
         ? "\n\nℹ️ This role has not been AI match-scored. Run '⚡ Tailor AI' to generate a real ATS score."
         : "";
     document.getElementById("modal-analysis-details").innerText = (job.match_analysis || "Comparison summary available.") + unscoredCue;
+
+    renderGapInsights(job);
 
     // Cover Letter
     document.getElementById("modal-cover-letter-text").value = job.cover_letter_draft || "Click '⚡ Tailor AI' to generate a tailored cover letter for this role.";
@@ -3466,7 +3628,8 @@ let availableFeatures = {};
 const ALL_FEATURE_KEYS = [
     "ats_portals", "google_jobs", "jobspy_google", "linkedin_sync", "gmail_sync",
     "ats_greenhouse", "ats_lever", "ats_ashby", "ats_hirist",
-    "ats_smartrecruiters", "ats_workable", "ats_workday", "ats_uber", "ats_custom_html"
+    "ats_smartrecruiters", "ats_workable", "ats_workday", "ats_uber", "ats_custom_html",
+    "resume_gap_insights"
 ];
 
 function applyFeatureFlags(flags) {
@@ -3705,9 +3868,18 @@ async function loadGmailSection() {
         const res = await fetch(`${API_BASE}/api/gmail/status`);
         if (!res.ok) { statusEl.innerText = "Gmail status unavailable."; return; }
         const s = await res.json();
-        statusEl.innerText = s.connected
-            ? `✅ Connected${s.email ? " as " + s.email : ""}.`
-            : (s.client_id_set && s.client_secret_set ? "Client saved — not connected." : "Not configured.");
+        // Pre-fill the client ID so the ID/secret pair can't silently drift apart.
+        const idInput = document.getElementById("gmail-client-id");
+        if (idInput && !idInput.value && s.client_id) {
+            idInput.value = s.client_id;
+        }
+        if (s.secret_looks_invalid) {
+            statusEl.innerText = "⚠️ The saved Client Secret looks like the Client ID. Re-paste the real secret (starts with 'GOCSPX-').";
+        } else {
+            statusEl.innerText = s.connected
+                ? `✅ Connected${s.email ? " as " + s.email : ""}.`
+                : (s.client_id_set && s.client_secret_set ? "Client saved — not connected." : "Not configured.");
+        }
     } catch (e) {
         statusEl.innerText = "Gmail status unavailable.";
     }

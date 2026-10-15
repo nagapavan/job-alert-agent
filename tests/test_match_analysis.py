@@ -2,8 +2,9 @@
 Tests for the structured, stateless resume↔job match endpoint used by the
 browser-extension side panel (`POST /api/match/analyze`).
 
-The endpoint extracts requirements and computes the score deterministically via
-``assess_job_requirements``; the returned score and the derived analysis can never diverge.
+The endpoint scores deterministically first (no LLM) via a lightweight
+requirement extractor + classifier; the LLM extractor is only a fallback when
+the deterministic path cannot produce any requirements.
 """
 
 from unittest.mock import patch
@@ -31,44 +32,55 @@ def _result(items, summary="Neutral summary."):
     return assessment, compute_match(assessment)
 
 
-@patch("backend.main.assess_job_requirements")
-def test_match_analyze_returns_structured_score_and_analysis(mock_assess, db_session):
-    _add_active_resume(db_session)
-    mock_assess.side_effect = lambda *a, **k: _result([
-        RequirementItem(text="Python", status="met"),
-        RequirementItem(text="AWS", status="met"),
-        RequirementItem(text="Kubernetes", status="missing"),
-        RequirementItem(text="TOGAF", status="missing"),
-    ])
+# A JD/title pair with no recognizable deterministic signals, forcing the LLM fallback.
+_NO_SIGNAL_TITLE = "Engineer"
+_NO_SIGNAL_JD = "We are a small team that values curiosity and craft."
 
-    res = client.post("/api/match/analyze", json={
-        "job_title": "Enterprise Architect",
-        "company": "Financial Times",
-        "job_description": "Enterprise architecture role requiring TOGAF.",
-    })
+
+def test_match_analyze_deterministic_classifier_path_no_llm(db_session):
+    """Signal-rich JD is scored deterministically without calling the LLM extractor."""
+    _add_active_resume(db_session)
+    with patch("backend.main.assess_job_requirements") as mock_assess:
+        res = client.post("/api/match/analyze", json={
+            "job_title": "Backend Engineer",
+            "company": "Acme",
+            "job_description": "We need Python, Kubernetes, Terraform and AWS.",
+        })
 
     assert res.status_code == 200
     data = res.json()
-    # 2 of 4 must-haves met -> 50%, Weak band.
-    assert data["match_score"] == 50.0
-    assert data["band"] == "Weak"
-    assert data["must_coverage"] == 0.5
-    assert data["strengths"] == ["Python", "AWS"]
-    assert "Kubernetes" in data["gaps"]
-    assert data["feedback"] == "Neutral summary."
-    assert data["resume_available"] is True
-    assert data["analysis_source"] == "llm"
-    assert data["score_method"] == "requirement_coverage_v1"
+    assert data["analysis_source"] == "classifier"
+    assert data["match_method"] == "classifier_v1"
+    assert data["match_score"] is not None
+    assert data["must_coverage"] == 0.75
+    assert 55 <= data["match_score"] <= 70
+    assert data["band"] in ("Moderate", "Good")
+    # Transparent breakdown so the score is explainable.
     assert len(data["requirements"]) == 4
+    assert "Python" in data["strengths"]
+    assert "Terraform" in data["gaps"]
+    assert "must-have coverage 75%" in data["feedback"]
+    mock_assess.assert_not_called()
 
-    called_resume, called_desc = mock_assess.call_args.args[:2]
-    assert "Alice" in called_resume
-    assert "TOGAF" in called_desc
+
+def test_match_analyze_unconfirmable_tenure_asks_user_to_decide(db_session):
+    """Tech presented without dated tenure -> partial + explicit 'please decide' note."""
+    _add_active_resume(db_session, "Alice. Skills: Golang, Python.")
+    res = client.post("/api/match/analyze", json={
+        "job_title": "Backend Engineer",
+        "job_description": "What You Bring: At least 3-years experience in Golang.",
+    })
+    assert res.status_code == 200
+    data = res.json()
+    assert data["analysis_source"] == "classifier"
+    assert "please decide" in data["feedback"]
+    golang = [r for r in data["requirements"] if r.get("technology") == "Golang"]
+    assert golang and golang[0]["status"] == "partial"
 
 
-@patch("backend.main.assess_job_requirements")
-def test_match_analyze_without_resume_returns_error_state(mock_assess, db_session):
-    res = client.post("/api/match/analyze", json={"job_title": "Backend Engineer"})
+def test_match_analyze_without_resume_returns_error_state(db_session):
+    with patch("backend.main.assess_job_requirements") as mock_assess:
+        res = client.post("/api/match/analyze", json={"job_title": "Backend Engineer"})
 
     assert res.status_code == 200
     data = res.json()
@@ -79,6 +91,45 @@ def test_match_analyze_without_resume_returns_error_state(mock_assess, db_sessio
     mock_assess.assert_not_called()
 
 
+def test_match_analyze_requires_job_title():
+    res = client.post("/api/match/analyze", json={"company": "Acme"})
+    assert res.status_code == 422
+
+
+@patch("backend.main.assess_job_requirements")
+def test_match_analyze_llm_fallback_returns_structured_score(mock_assess, db_session):
+    """When deterministic extraction yields nothing, the LLM fallback is used."""
+    _add_active_resume(db_session)
+    mock_assess.side_effect = lambda *a, **k: _result([
+        RequirementItem(text="Python", status="met"),
+        RequirementItem(text="AWS", status="met"),
+        RequirementItem(text="Kubernetes", status="missing"),
+        RequirementItem(text="TOGAF", status="missing"),
+    ])
+
+    res = client.post("/api/match/analyze", json={
+        "job_title": _NO_SIGNAL_TITLE,
+        "job_description": _NO_SIGNAL_JD,
+    })
+
+    assert res.status_code == 200
+    data = res.json()
+    # 2 of 4 must-haves met -> 50%, Weak band.
+    assert data["match_score"] == 50.0
+    assert data["band"] == "Weak"
+    assert data["must_coverage"] == 0.5
+    assert "Kubernetes" in data["gaps"]
+    assert data["feedback"] == "Neutral summary."
+    assert data["resume_available"] is True
+    assert data["analysis_source"] == "llm"
+    assert data["score_method"] == "requirement_coverage_v1"
+    assert len(data["requirements"]) == 4
+
+    called_resume, called_desc = mock_assess.call_args.args[:2]
+    assert "Alice" in called_resume
+    assert _NO_SIGNAL_JD in called_desc
+
+
 @patch("backend.main.assess_job_requirements")
 def test_match_analyze_inline_resume_overrides_active_resume(mock_assess, db_session):
     _add_active_resume(db_session, "ACTIVE_RESUME_MARKER")
@@ -87,8 +138,8 @@ def test_match_analyze_inline_resume_overrides_active_resume(mock_assess, db_ses
     ])
 
     res = client.post("/api/match/analyze", json={
-        "job_title": "Staff Engineer",
-        "job_description": "Staff engineer to lead the platform team building distributed services.",
+        "job_title": _NO_SIGNAL_TITLE,
+        "job_description": _NO_SIGNAL_JD,
         "resume_text": "INLINE_RESUME_MARKER " * 20,
     })
 
@@ -98,11 +149,6 @@ def test_match_analyze_inline_resume_overrides_active_resume(mock_assess, db_ses
     assert "ACTIVE_RESUME_MARKER" not in called_resume
 
 
-def test_match_analyze_requires_job_title():
-    res = client.post("/api/match/analyze", json={"company": "Acme"})
-    assert res.status_code == 422
-
-
 @patch("backend.main.assess_job_requirements")
 def test_match_analyze_empty_assessment_returns_error_no_fake_score(mock_assess, db_session):
     """No extracted requirements -> explicit error, never a fabricated score."""
@@ -110,8 +156,8 @@ def test_match_analyze_empty_assessment_returns_error_no_fake_score(mock_assess,
     mock_assess.side_effect = lambda *a, **k: _result([])
 
     res = client.post("/api/match/analyze", json={
-        "job_title": "Principal Engineer",
-        "job_description": "We need Python, Kubernetes, Terraform and AWS.",
+        "job_title": _NO_SIGNAL_TITLE,
+        "job_description": _NO_SIGNAL_JD,
     })
 
     assert res.status_code == 200
@@ -125,8 +171,8 @@ def test_match_analyze_empty_assessment_returns_error_no_fake_score(mock_assess,
 def test_match_analyze_exception_returns_error_no_fake_score(mock_assess, db_session):
     _add_active_resume(db_session)
     res = client.post("/api/match/analyze", json={
-        "job_title": "Backend Engineer",
-        "job_description": "Python backend role with AWS and Kubernetes.",
+        "job_title": _NO_SIGNAL_TITLE,
+        "job_description": _NO_SIGNAL_JD,
     })
     assert res.status_code == 200
     data = res.json()
@@ -143,8 +189,8 @@ def test_match_analyze_unverified_requirements_yield_no_score(mock_assess, db_se
         RequirementItem(text="Clearance", status="unknown"),
     ])
     res = client.post("/api/match/analyze", json={
-        "job_title": "Backend Engineer",
-        "job_description": "Requires active security clearance.",
+        "job_title": _NO_SIGNAL_TITLE,
+        "job_description": _NO_SIGNAL_JD,
     })
     assert res.status_code == 200
     data = res.json()

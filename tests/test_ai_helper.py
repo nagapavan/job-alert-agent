@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import backend.ai_helper as ai_helper
 from backend.ai_helper import (
     analyze_job_match,
     call_lmstudio,
@@ -140,7 +141,8 @@ def test_generate_text_lmstudio_primary(mock_lmstudio):
 
 @patch("backend.ai_helper.call_unsloth")
 @patch("backend.ai_helper.call_lmstudio")
-def test_generate_text_fallback_to_unsloth(mock_lmstudio, mock_unsloth):
+def test_generate_text_fallback_to_unsloth(mock_lmstudio, mock_unsloth, monkeypatch):
+    monkeypatch.setattr("backend.llm_resilience.LLM_MAX_RETRIES", 0)
     mock_lmstudio.side_effect = ConnectionError("LM Studio offline")
     mock_unsloth.return_value = "Unsloth fallback result"
 
@@ -155,7 +157,8 @@ def test_generate_text_fallback_to_unsloth(mock_lmstudio, mock_unsloth):
 @patch("backend.ai_helper.call_ollama")
 @patch("backend.ai_helper.call_unsloth")
 @patch("backend.ai_helper.call_lmstudio")
-def test_generate_text_fallback_to_ollama(mock_lmstudio, mock_unsloth, mock_ollama):
+def test_generate_text_fallback_to_ollama(mock_lmstudio, mock_unsloth, mock_ollama, monkeypatch):
+    monkeypatch.setattr("backend.llm_resilience.LLM_MAX_RETRIES", 0)
     mock_lmstudio.side_effect = ConnectionError("LM Studio offline")
     mock_unsloth.side_effect = ConnectionError("Unsloth server offline")
     mock_ollama.return_value = "Ollama fallback result"
@@ -183,7 +186,8 @@ def test_generate_text_explicit_provider(mock_ollama, mock_lmstudio):
 @patch("backend.ai_helper.call_ollama")
 @patch("backend.ai_helper.call_unsloth")
 @patch("backend.ai_helper.call_lmstudio")
-def test_generate_text_all_failed(mock_lmstudio, mock_unsloth, mock_ollama):
+def test_generate_text_all_failed(mock_lmstudio, mock_unsloth, mock_ollama, monkeypatch):
+    monkeypatch.setattr("backend.llm_resilience.LLM_MAX_RETRIES", 0)
     mock_lmstudio.side_effect = ConnectionError("LM Studio down")
     mock_unsloth.side_effect = ConnectionError("Unsloth down")
     mock_ollama.side_effect = ConnectionError("Ollama down")
@@ -206,8 +210,9 @@ def test_generate_text_forwards_profile_top_p(mock_ollama):
 
 @patch("backend.ai_helper.call_unsloth")
 @patch("backend.ai_helper.call_lmstudio")
-def test_generate_text_fallback_forwards_top_p(mock_lmstudio, mock_unsloth):
+def test_generate_text_fallback_forwards_top_p(mock_lmstudio, mock_unsloth, monkeypatch):
     """The fallback cascade must forward top_p too (not just the direct route)."""
+    monkeypatch.setattr("backend.llm_resilience.LLM_MAX_RETRIES", 0)
     mock_lmstudio.side_effect = ConnectionError("LM Studio offline")
     mock_unsloth.return_value = "Unsloth fallback"
 
@@ -1022,4 +1027,20 @@ def test_token_overlap_similarity_root_substring_matching():
     assert _token_overlap_similarity("a an", "a an the") == 0.0
     # Partial overlap is a fraction of the first text's tokens.
     assert _token_overlap_similarity("senior sales specialist", "sales specialist") == 2 / 3
+
+
+# -------------------------------------------------------------
+# Interactive timeout plumbing (bounded LLM fallback)
+# -------------------------------------------------------------
+def test_generate_text_forwards_bounded_timeout():
+    with patch.object(ai_helper.llm_queue, "submit", return_value="ok") as mock_submit:
+        out = ai_helper.generate_text("sys", "user", timeout=7.5)
+    assert out == "ok"
+    assert mock_submit.call_args.kwargs["timeout"] == 7.5
+
+
+def test_generate_text_omits_timeout_by_default():
+    with patch.object(ai_helper.llm_queue, "submit", return_value="ok") as mock_submit:
+        ai_helper.generate_text("sys", "user")
+    assert "timeout" not in mock_submit.call_args.kwargs
 

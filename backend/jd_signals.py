@@ -23,12 +23,20 @@ _NON_TECHNOLOGY = {
 
 _EXPERIENCE_PATTERNS = [
     (re.compile(rf"{_YEARS_NUM}\s*(?:\+|plus)\s*{_YEARS_UNIT}", re.I), "min"),
-    (re.compile(rf"{_YEARS_NUM}\s*(?:-|–|—|to)\s*{_YEARS_NUM}\s*{_YEARS_UNIT}", re.I), "range"),
-    (re.compile(rf"(?:at least|minimum(?: of)?|min\.?)\s*{_YEARS_NUM}\s*{_YEARS_UNIT}", re.I), "min"),
-    (re.compile(rf"{_YEARS_NUM}\s*{_YEARS_UNIT}\s+(?:of\s+)?(?:relevant\s+|professional\s+|industry\s+)?experience", re.I), "min"),
+    (re.compile(rf"{_YEARS_NUM}\s*(?:-|–|—|to)\s*{_YEARS_NUM}\s*(?:or\s+more\s+)?{_YEARS_UNIT}", re.I), "range"),
+    (re.compile(rf"(?:at least|minimum(?: of)?|min\.?)\s*{_YEARS_NUM}\s*-?\s*{_YEARS_UNIT}", re.I), "min"),
+    (re.compile(rf"(?:more than|over)\s*{_YEARS_NUM}\s*-?\s*{_YEARS_UNIT}", re.I), "min"),
+    (re.compile(rf"{_YEARS_NUM}\s*-?\s*{_YEARS_UNIT}\s+(?:of\s+)?(?:relevant\s+|professional\s+|industry\s+)?experience", re.I), "min"),
 ]
 
 _SCOPE_FOLLOW = re.compile(r"\s*(?:(?:of|in|with)\s+)?([A-Za-z][\w+#/-]{1,29})")
+
+# "N years experience in/with <Tech>" — skip the connector and capture the technology.
+_EXPERIENCE_CONNECTOR = re.compile(
+    r"\s*(?:of\s+)?(?:relevant\s+|professional\s+|industry\s+|hands-on\s+)?"
+    r"experience\s+(?:in|with|of)?\s*([A-Za-z][\w+#/.-]{1,29})",
+    re.I,
+)
 
 _SENIORITY = [
     ("director", ("director", "head of", "vp", "vice president", "chief")),
@@ -44,8 +52,8 @@ _SENIORITY = [
 
 _EDUCATION = [
     ("phd", ("phd", "ph.d", "doctorate", "doctoral")),
-    ("master", ("master", "m.s.", "m.sc", "mba", "msc")),
-    ("bachelor", ("bachelor", "b.s.", "b.sc", "bsc", "undergraduate")),
+    ("master", ("master", "m.s.", "m.s", "m.sc", "m.sc.", "mba", "msc", "m.tech", "mtech", "m.e.", "m.eng")),
+    ("bachelor", ("bachelor", "b.s.", "b.s", "b.sc", "b.sc.", "bsc", "undergraduate", "b.tech", "btech", "b.e.", "b.eng")),
     ("associate", ("associate degree", "associate's")),
     ("high_school", ("high school", "diploma")),
 ]
@@ -95,9 +103,10 @@ def parse_experience(text: str) -> List[ExperienceHint]:
             if lo is None:
                 continue
             scope, technology = "total", None
-            follow = _SCOPE_FOLLOW.match(text[m.end():])
+            tail = text[m.end():]
+            follow = _EXPERIENCE_CONNECTOR.match(tail) or _SCOPE_FOLLOW.match(tail)
             if follow:
-                token = follow.group(1)
+                token = follow.group(1).rstrip(".-")
                 if token.lower() not in _NON_TECHNOLOGY and token[:1].isupper():
                     scope, technology = "technology", token
             key = (lo, hi, scope, technology)

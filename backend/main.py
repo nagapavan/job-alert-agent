@@ -31,11 +31,8 @@ from sqlalchemy.orm import Session
 
 from backend.ai_helper import TASK_PROFILES, TaskComplexity, get_model_for_tier
 from backend.config import (
-    DEEP_TIER_MODEL,
     DEFAULT_LLM_PROVIDER,
     ENABLE_DYNAMIC_MODEL_ROUTING,
-    FAST_TIER_MODEL,
-    STANDARD_TIER_MODEL,
 )
 from backend.matchers import detect_foreign_restriction
 from backend.playwright_app import BrowserProfileBusy, search_linkedin_talent_partners
@@ -71,7 +68,9 @@ from backend.company_catalog import (
 from backend.config import (
     API_KEY,
     BASE_DIR,
+    DETERMINISTIC_BULK_SCORING,
     LINKEDIN_AUTOMATION_PACING_SECONDS,
+    LLM_INTERACTIVE_TIMEOUT,
     clear_gmail_settings,
     decrypt_data,
     encrypt_data,
@@ -108,7 +107,7 @@ from backend.database import (
 )
 from backend.llm_queue import LLMPriority, llm_queue
 from backend.matchers import check_title_match
-from backend.match_scoring import SCORE_METHOD, ScoringConfig
+from backend.match_scoring import ScoringConfig
 from backend.observability import setup_observability, tail_log_file
 from backend.parser import (
     clean_job_description,
@@ -217,7 +216,8 @@ _extension_origin_regex = (
 
 ScoringResult = namedtuple(
     "ScoringResult",
-    ["score", "analysis", "scored", "method", "timestamp", "band", "recommendation"],
+    ["score", "analysis", "scored", "method", "timestamp", "band", "recommendation",
+     "strengths", "gaps"],
 )
 
 
@@ -567,12 +567,15 @@ class JobOut(BaseModel):
     status: str
     match_score: Optional[float] = None
     match_analysis: Optional[str] = None
+    match_strengths: Optional[List[str]] = None
+    match_gaps: Optional[List[str]] = None
     cover_letter_draft: Optional[str] = None
     tailored_resume_points: Optional[str] = None
     cold_message_draft: Optional[str] = None
     is_ghost_job: bool
     repost_count: int
     submission_confirmed: bool = False
+    sync_batch_id: Optional[str] = None
     match_scored: bool = False
     score_method: Optional[str] = None
     match_scored_at: Optional[datetime.datetime] = None
@@ -842,6 +845,21 @@ class LinkedInSyncResponse(BaseModel):
     dismissed_filtered: int = 0
     closed_jobs_pruned: int
     message: str
+
+
+class LinkedInLastSyncOut(BaseModel):
+    """Summary of the most recent LinkedIn sync, powering the "N new from sync" review banner."""
+
+    sync_batch_id: Optional[str] = None
+    total_added: int = 0
+    saved_jobs_added: int = 0
+    recommendations_added: int = 0
+    already_existing: int = 0
+    closed_jobs_pruned: int = 0
+    # Jobs from this batch still unreviewed (sync_batch_id set, not yet acted on).
+    pending_review: int = 0
+    created_at: Optional[datetime.datetime] = None
+    has_sync: bool = False
 
 
 class SkillItem(BaseModel):
@@ -1345,11 +1363,6 @@ def get_llm_routing_status():
     return {
         "dynamic_routing_enabled": ENABLE_DYNAMIC_MODEL_ROUTING,
         "active_provider": active_provider,
-        "tier_models": {
-            "fast_tier": FAST_TIER_MODEL,
-            "standard_tier": STANDARD_TIER_MODEL,
-            "deep_tier": DEEP_TIER_MODEL,
-        },
         "resolved_provider_tiers": {
             "fast": get_model_for_tier(provider_id, TaskComplexity.FAST),
             "standard": get_model_for_tier(provider_id, TaskComplexity.STANDARD),
@@ -1493,9 +1506,24 @@ def gmail_status():
 @app.post("/api/gmail/credentials")
 def gmail_save_credentials(payload: GmailCredentialsIn):
     """Stores the user's BYOK Google OAuth client id/secret (encrypted at rest)."""
+    client_id = (payload.client_id or "").strip()
+    client_secret = (payload.client_secret or "").strip()
+    # Guard against pasting the client ID into the secret field (a common, silent mistake
+    # that later surfaces as OAuth `invalid_client`).
+    if client_secret and (
+        client_secret == client_id
+        or client_secret.endswith(".apps.googleusercontent.com")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "That looks like the Client ID, not the Client Secret. Copy the secret from "
+                "Google Cloud → Credentials (it starts with 'GOCSPX-')."
+            ),
+        )
     save_gmail_settings(
-        client_id=(payload.client_id or "").strip() or None,
-        client_secret=(payload.client_secret or "").strip() or None,
+        client_id=client_id or None,
+        client_secret=client_secret or None,
     )
     return gmail_client.get_status()
 
@@ -1923,10 +1951,14 @@ def list_jobs(
     title_query: Optional[str] = None,
     location_query: Optional[str] = None,
     work_mode: Optional[str] = None,
+    source_type: Optional[str] = None,
+    sync_batch: Optional[str] = None,
+    new_from_sync: bool = Query(False),
     db: Session = Depends(get_db),
 ):
     """
-    Lists tracked jobs with optional filters for status, in-progress state, company, score, title, location, or work mode.
+    Lists tracked jobs with optional filters for status, in-progress state, company, score, title, location, work mode,
+    source type (LinkedIn / Direct / Email), a specific sync batch, or "new from sync" review items.
     """
     query = db.query(Job)
 
@@ -1951,6 +1983,25 @@ def list_jobs(
 
     if min_score is not None:
         query = query.filter(Job.match_score >= min_score)
+
+    if source_type and source_type.lower() != "all":
+        st = source_type.strip()
+        if st.lower() == "linkedin":
+            query = query.filter(Job.source_type == "LinkedIn")
+        elif st.lower() == "google":
+            query = query.filter(Job.source_type == "Google")
+        elif st.lower() == "email":
+            query = query.filter(Job.source_type == "Email")
+        elif st.lower() == "hirist":
+            query = query.filter(Job.source_type == "Hirist")
+        elif st.lower() == "direct":
+            query = query.filter(Job.source_type == "Direct")
+
+    if sync_batch and sync_batch.strip():
+        query = query.filter(Job.sync_batch_id == sync_batch.strip())
+
+    if new_from_sync:
+        query = query.filter(Job.sync_batch_id.isnot(None))
 
     if title_query and title_query.strip():
         terms = [t.strip() for t in title_query.split(",") if t.strip()]
@@ -2341,6 +2392,8 @@ def update_job_status(
 
     old_status = job.status
     job.status = payload.status
+    # The user acted on this job, so it's no longer a "new from sync" review item.
+    job.sync_batch_id = None
     now = datetime.datetime.now(datetime.timezone.utc)
 
     # Update date tracking
@@ -3543,11 +3596,14 @@ def _execute_ats_scrape(
                     match_scored_at,
                     match_band,
                     apply_recommendation,
+                    strengths,
+                    gaps,
                 ) = _score_job_with_engine(
                     db,
                     resume_text,
                     j.get("description") or "",
                     parsed_resume=parsed_resume,
+                    job_title=j.get("title") or "",
                 )
                 if engine_analysis:
                     match_analysis = engine_analysis
@@ -3574,6 +3630,8 @@ def _execute_ats_scrape(
                 match_scored_at=match_scored_at,
                 match_band=match_band,
                 apply_recommendation=apply_recommendation,
+                match_strengths_json=json.dumps(strengths) if match_scored else None,
+                match_gaps_json=json.dumps(gaps) if match_scored else None,
                 cover_letter_draft=None,
                 tailored_resume_points=None,
                 cold_message_draft=None,
@@ -3737,6 +3795,11 @@ def _apply_generated_package(
         f"Strengths: {', '.join(pkg.get('strengths', []))}. "
         f"Gaps: {', '.join(pkg.get('gaps', []))}"
     )
+    # Persist the structured lists alongside the narrative so the UI can render clean bullets.
+    if pkg.get("strengths"):
+        job.match_strengths_json = json.dumps([str(s) for s in pkg["strengths"]])
+    if pkg.get("gaps"):
+        job.match_gaps_json = json.dumps([str(g) for g in pkg["gaps"]])
     for attr, key in (
         ("cover_letter_draft", "cover_letter"),
         ("tailored_resume_points", "tailored_resume_points"),
@@ -3857,6 +3920,8 @@ def bulk_update_job_status(payload: BulkStatusRequest, db: Session = Depends(get
         if not job:
             continue
         job.status = payload.status
+        # User acted on the job -> no longer a pending "new from sync" review item.
+        job.sync_batch_id = None
         if payload.status == "Applied" and not job.applied_at:
             job.applied_at = datetime.datetime.now(datetime.timezone.utc)
         elif payload.status == "Rejected" and not job.rejected_at:
@@ -4309,8 +4374,12 @@ def career_copilot_chat(req: ChatAssistantRequest, db: Session = Depends(get_db)
         )
 
 
-def _derive_strengths_gaps(assessment, match) -> tuple:
-    """Derive the strengths/gaps bullet lists from the requirement breakdown."""
+def _derive_strengths_gaps(assessment, match=None) -> tuple:
+    """Derive the strengths/gaps bullet lists from the requirement breakdown.
+
+    ``match`` is optional; missing must-haves are derived from the assessment when
+    it is omitted (used by the deterministic classifier path).
+    """
     reqs = assessment.requirements
     strengths = [r.text for r in reqs if r.status == "met" and r.text]
     if len(strengths) < 4:
@@ -4319,9 +4388,16 @@ def _derive_strengths_gaps(assessment, match) -> tuple:
             for r in reqs
             if r.status == "partial" and r.text and r.text not in strengths
         ]
-    gaps = list(match.missing_must_haves)
+    if match is not None:
+        gaps = list(match.missing_must_haves)
+    else:
+        gaps = [
+            r.text
+            for r in reqs
+            if r.category == "must_have" and r.status == "missing" and r.text
+        ]
     for req in reqs:
-        if req.status in ("missing", "partial") and req.text and req.text not in gaps:
+        if req.status == "missing" and req.text and req.text not in gaps:
             gaps.append(req.text)
     return strengths[:4], gaps[:3]
 
@@ -4336,27 +4412,88 @@ def _parsed_resume_of(resume):
         return None
 
 
+_JD_CUE_RE = re.compile(
+    r"\b(experience|responsibilit\w*|qualification\w*|requirements?|skills?|"
+    r"proficien\w*|knowledge|you(?:'ll| will)|we(?:'re| are) looking for|"
+    r"years? of|degree|what you(?:'ll| will)|about (?:the|this) role)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_job_description(text: str) -> bool:
+    """Substantive JDs carry role/qualification cues; discovery artifacts (LinkedIn
+    alert/saved snippets, Gmail recruiter lines, truncated link previews) do not, so
+    they should not consume a bounded LLM fallback call."""
+    return bool(_JD_CUE_RE.search(text or ""))
+
+
+def _deterministic_analysis_text(det) -> str:
+    """Compact strengths/gaps narrative for the deterministic classifier path."""
+    strengths, gaps = det["strengths"], det["gaps"]
+    if strengths or gaps:
+        return f"Strengths: {', '.join(strengths)}. Gaps: {', '.join(gaps)}"
+    return det["feedback"]
+
+
 def _score_job_with_engine(
-    db, resume_text, description, parsed_resume=None
+    db, resume_text, description, parsed_resume=None, job_title=""
 ) -> ScoringResult:
-    """Score a discovered job with the requirement-coverage engine.
+    """Score a discovered job: deterministic engine first, bounded LLM fallback.
 
     Returns ``(match_score, match_analysis, match_scored, score_method, match_scored_at,
     match_band, apply_recommendation)``. Failures degrade to an unscored baseline rather
     than fabricating a score.
     """
-    unscored = (0, "", False, None, None, None, None)
+    unscored = ScoringResult(0, "", False, None, None, None, None, [], [])
     if not (resume_text or "").strip() or not (description or "").strip():
         return unscored
     if len(description.strip()) < MIN_JOB_DESCRIPTION_CHARS:
         # No substantive job description -> do not fabricate a score.
         return unscored
+
+    det_errored = False
+    det_match_details = None
+    if DETERMINISTIC_BULK_SCORING:
+        try:
+            det_match_details = _deterministic_match(
+                db, resume_text, description, parsed_resume=parsed_resume, job_title=job_title
+            )
+        except Exception as det_err:
+            logger.warning(
+                f"Deterministic scoring errored ({det_err}); falling back to the LLM engine."
+            )
+            det_errored = True
+            det_match_details = None
+    if det_match_details:
+        return ScoringResult(
+            score=det_match_details["score"],
+            analysis=_deterministic_analysis_text(det_match_details),
+            scored=True,
+            method=det_match_details["method"],
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+            band=det_match_details["band"],
+            recommendation=det_match_details["recommendation"],
+            strengths=list(det_match_details.get("strengths") or []),
+            gaps=list(det_match_details.get("gaps") or []),
+        )
+
+    # A deterministic *error* always falls back (per requirement); a clean "no requirements"
+    # result on a non-JD discovery artifact does not, so it does not burn an LLM call.
+    if (
+        DETERMINISTIC_BULK_SCORING
+        and not det_errored
+        and not _looks_like_job_description(description)
+    ):
+        return unscored
+
+    # Bounded LLM fallback for signal-less JDs the deterministic extractor cannot use.
     try:
         assessment, match = assess_job_requirements(
             resume_text,
             description,
             parsed_resume=parsed_resume,
             scoring_config=ScoringConfig.from_mapping(get_scoring_config(db)),
+            timeout=LLM_INTERACTIVE_TIMEOUT,
         )
     except Exception as e:
         logger.warning(f"Match scoring skipped: {e}")
@@ -4371,7 +4508,10 @@ def _score_job_with_engine(
             timestamp=None,
             band=None,
             recommendation=None,
+            strengths=[],
+            gaps=[],
         )
+    l_strengths, l_gaps = _derive_strengths_gaps(assessment, match)
     return ScoringResult(
         score=match.score,
         analysis=_match_analysis_text(assessment, match),
@@ -4380,6 +4520,8 @@ def _score_job_with_engine(
         timestamp=datetime.datetime.now(datetime.timezone.utc),
         band=match.band,
         recommendation=match.apply_recommendation,
+        strengths=list(l_strengths),
+        gaps=list(l_gaps),
     )
 
 
@@ -4447,78 +4589,46 @@ def analyze_job_match_endpoint(
     evidence = []
     if active_resume:
         try:
-            evidence = top_evidence(db, active_resume.id, description, k=4)
+            evidence = top_evidence(db, active_resume.id, description, k=4)  # pyright: ignore[reportArgumentType]
         except Exception as ev_err:
             logger.debug(f"Resume evidence retrieval skipped: {ev_err}")
 
-    # FAST PATH: Use deterministic ML classifier instead of full LLM extraction
-    # This returns score + recommendation in <100ms for instant feedback.
-    from backend import jd_signals
-    from backend.match_classifier import (
-        get_classifier,
-        extract_match_features,
+    det_match_details = _deterministic_match(
+        db,
+        resume_text,
+        description,
+        parsed_resume,
+        job_title=payload.job_title or "",
+        location=payload.location or "",
     )
-
-    try:
-        jd_hints = jd_signals.parse_experience(description)
-        # We don't have the full assessment yet, so use basic feature extraction
-        features = extract_match_features(parsed_resume, jd_hints, assessment=None)
-        classifier = get_classifier()
-        score = classifier.predict(features)
-
-        # Determine band and recommendation from score (using same logic as compute_match)
-        if score >= 85:
-            band = "Strong"
-            recommendation = "apply"
-        elif score >= 70:
-            band = "Good"
-            recommendation = "apply"
-        elif score >= 55:
-            band = "Moderate"
-            recommendation = "apply_with_caution"
-        elif score >= 40:
-            band = "Weak"
-            recommendation = "apply_with_caution"
-        else:
-            band = "Poor"
-            recommendation = "skip"
-
-        # Check location eligibility if provided
-        eligible, ineligibility_reason = True, None
-        if (payload.location or "").strip():
-            try:
-                from backend.preference_filter import PreferenceFilter
-
-                pref_filter = PreferenceFilter(db)
-                if not pref_filter.passes_location_filter(payload.location):
-                    eligible = False
-                    ineligibility_reason = f"Location '{payload.location}' does not match preferences"
-            except Exception as loc_err:
-                logger.debug(f"Location filtering skipped: {loc_err}")
-
-        # Return fast response (no narrative for now; user can request detailed analysis later if needed)
+    if det_match_details:
         return MatchAnalyzeResponse(
-            match_score=score,
-            band=band,
-            apply_recommendation=recommendation,
-            eligible=eligible,
-            ineligibility_reason=ineligibility_reason,
-            strengths=evidence[:2] if evidence else [],  # Show first 2 matched evidence snippets
-            gaps=[],
-            feedback=f"Score: {score:.0f}% ({band} match). Based on requirement coverage and job signals.",
-            requirements=[],
-            must_coverage=features.must_coverage if hasattr(features, "must_coverage") else None,
-            nice_coverage=features.nice_coverage if hasattr(features, "nice_coverage") else None,
-            over_qualified=features.over_qualified_flag > 0.5 if hasattr(features, "over_qualified_flag") else False,
+            match_score=det_match_details["score"],
+            band=det_match_details["band"],
+            apply_recommendation=det_match_details["recommendation"],
+            eligible=det_match_details["eligible"],
+            ineligibility_reason=det_match_details["ineligibility_reason"],
+            strengths=det_match_details["strengths"],
+            gaps=det_match_details["gaps"],
+            feedback=det_match_details["feedback"],
+            requirements=[
+                r.model_dump() for r in det_match_details["assessment"].requirements
+            ],
+            unverified=det_match_details["unverified"],
+            must_coverage=det_match_details["must_coverage"],
+            nice_coverage=det_match_details["nice_coverage"],
+            over_qualified=det_match_details["over_qualified"],
             analysis_source="classifier",
             resume_available=True,
-            match_method="classifier_v1",
+            match_method=det_match_details["method"],
+            score_method=det_match_details["score_method"],
         )
+    logger.debug(
+        "Deterministic classifier did not produce a match; falling back to LLM analysis."
+    )
 
-    except Exception as classifier_err:
-        logger.warning(f"Classifier-based scoring failed: {classifier_err}; falling back to LLM")
-
-    # FALLBACK PATH: Full LLM extraction (only if classifier fails)
+    # FALLBACK PATH: Full LLM extraction (only if classifier fails). Bounded so an
+    # offline/slow local model cannot block the interactive request for the full timeout.
     try:
         assessment, match = assess_job_requirements(
             resume_text,
@@ -4526,6 +4636,7 @@ def analyze_job_match_endpoint(
             parsed_resume=parsed_resume,
             scoring_config=ScoringConfig.from_mapping(get_scoring_config(db)),
             evidence=evidence,
+            timeout=LLM_INTERACTIVE_TIMEOUT,
         )
     except Exception as e:
         logger.warning(f"Requirement-based match analysis failed: {e}")
@@ -4550,18 +4661,9 @@ def analyze_job_match_endpoint(
 
     strengths, gaps = _derive_strengths_gaps(assessment, match)
 
-    eligible, ineligibility_reason = True, None
-    if (payload.location or "").strip():
-        try:
-            from backend.preference_filter import PreferenceFilter
-
-            reason = PreferenceFilter.from_db(db).rejection_reason(
-                payload.job_title, payload.location
-            )
-            if reason:
-                eligible, ineligibility_reason = False, reason
-        except Exception as e:
-            logger.debug(f"Eligibility check skipped: {e}")
+    eligible, ineligibility_reason = _check_eligibility(
+        db, payload.job_title, payload.location
+    )
 
     return MatchAnalyzeResponse(
         match_score=match.score,
@@ -4583,25 +4685,22 @@ def analyze_job_match_endpoint(
 
 
 @app.post("/api/match/{job_id}/detailed-analysis")
-def generate_detailed_match_analysis(
-    job_id: int, 
-    db: Session = Depends(get_db)
-):
+def generate_detailed_match_analysis(job_id: int, db: Session = Depends(get_db)):
     """
     On-demand detailed match analysis for a job.
-    
+
     Called when user clicks "Explain" or "View Details" in the extension.
     Returns full LLM-generated narrative (strengths/gaps/feedback) and caches it in Job.match_analysis.
-    
+
     Fast-path classifier returns score instantly; this endpoint provides narrative context.
     """
     from backend.database import Job, Resume
     from backend.config import decrypt_data
-    
+
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         return {"error": f"Job {job_id} not found", "analysis": None}
-    
+
     if job.match_analysis:
         # Already cached; return immediately
         return {
@@ -4609,7 +4708,7 @@ def generate_detailed_match_analysis(
             "cached": True,
             "job_id": job_id,
         }
-    
+
     # Fetch active resume
     active_resume = (
         db.query(Resume)
@@ -4617,17 +4716,17 @@ def generate_detailed_match_analysis(
         .order_by(Resume.created_at.desc())
         .first()
     )
-    
+
     if not active_resume:
         return {
             "error": "No active resume found",
             "analysis": None,
             "job_id": job_id,
         }
-    
+
     resume_text = decrypt_data(active_resume.content_encrypted)
-    parsed_resume = parse_resume_json(resume_text)
-    
+    parsed_resume = parse_resume_to_json(resume_text)
+
     try:
         # Run full LLM extraction
         assessment, match = assess_job_requirements(
@@ -4644,24 +4743,26 @@ def generate_detailed_match_analysis(
             "analysis": None,
             "job_id": job_id,
         }
-    
+
     if not assessment:
         return {
             "error": "No assessment produced",
             "analysis": None,
             "job_id": job_id,
         }
-    
+
     # Format narrative
     strengths, gaps = _derive_strengths_gaps(assessment, match)
     narrative = _match_analysis_text(assessment, match)
-    
-    # Cache in database
+
+    # Cache in database (narrative + structured lists for the gap-insights UI)
     job.match_analysis = narrative
+    job.match_strengths_json = json.dumps(list(strengths))
+    job.match_gaps_json = json.dumps(list(gaps))
     db.commit()
-    
+
     logger.info(f"Cached detailed analysis for job {job_id}")
-    
+
     return {
         "analysis": narrative,
         "strengths": strengths,
@@ -4804,6 +4905,50 @@ def _log_linkedin_automation_warning() -> None:
     )
 
 
+@app.get("/api/linkedin/last-sync", response_model=LinkedInLastSyncOut)
+def linkedin_last_sync(db: Session = Depends(get_db)):
+    """
+    Returns the most recent LinkedIn sync batch so the SPA can show a "N new from sync"
+    review banner and deep-link to the jobs that still need review.
+    """
+    log = (
+        db.query(OperationLog)
+        .filter(OperationLog.operation_type == "linkedin_sync")
+        .order_by(OperationLog.id.desc())
+        .first()
+    )
+    if not log:
+        return LinkedInLastSyncOut(has_sync=False)
+
+    details: Dict[str, Any] = {}
+    try:
+        details = json.loads(log.details_json or "{}") or {}
+    except Exception:
+        details = {}
+
+    batch_id = details.get("sync_batch_id")
+    if batch_id:
+        pending = (
+            db.query(Job)
+            .filter(Job.sync_batch_id == batch_id)
+            .count()
+        )
+    else:
+        pending = 0
+
+    return LinkedInLastSyncOut(
+        sync_batch_id=batch_id,
+        total_added=int(details.get("total_added", 0) or 0),
+        saved_jobs_added=int(details.get("saved_jobs_added", 0) or 0),
+        recommendations_added=int(details.get("recommendations_added", 0) or 0),
+        already_existing=int(details.get("already_existing", 0) or 0),
+        closed_jobs_pruned=int(details.get("closed_jobs_pruned", 0) or 0),
+        pending_review=pending,
+        created_at=log.created_at,
+        has_sync=True,
+    )
+
+
 @app.post("/api/linkedin/sync", response_model=LinkedInSyncResponse)
 def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
     """
@@ -4886,6 +5031,9 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
     closed_pruned = 0
     already_existing = 0
     dismissed_filtered = 0
+    # Review batch id: every job newly ingested by this run is tagged with it so the UI can
+    # show a "new from sync" review queue until the user acts on each job.
+    sync_batch_id = f"li-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S')}"
 
     try:
         with sync_playwright() as p:
@@ -4970,6 +5118,8 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                         match_scored_at = None
                         match_band = None
                         apply_recommendation = None
+                        strengths = []
+                        gaps = []
                         if dismissal_match:
                             dismissed_filtered += 1
                             match_score, match_scored = 0, False
@@ -4983,11 +5133,14 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                                 match_scored_at,
                                 match_band,
                                 apply_recommendation,
+                                strengths,
+                                gaps,
                             ) = _score_job_with_engine(
                                 db,
                                 resume_text,
                                 rec.get("description") or "",
                                 parsed_resume=parsed_resume,
+                                job_title=rec.get("title") or "",
                             )
                             if not match_analysis:
                                 match_analysis = "Direct LinkedIn Job Alert match."
@@ -5004,6 +5157,7 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                             source=rec.get("source", "LinkedIn Job Alert"),
                             source_type=rec.get("source_type", "LinkedIn"),
                             status=job_status,
+                            sync_batch_id=sync_batch_id,
                             match_score=match_score,
                             match_analysis=match_analysis,
                             match_scored=match_scored,
@@ -5011,6 +5165,8 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                             match_scored_at=match_scored_at,
                             match_band=match_band,
                             apply_recommendation=apply_recommendation,
+                            match_strengths_json=json.dumps(strengths) if match_scored else None,
+                            match_gaps_json=json.dumps(gaps) if match_scored else None,
                             cover_letter_draft=None,
                             tailored_resume_points=None,
                             cold_message_draft=None,
@@ -5093,11 +5249,14 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                                 match_scored_at,
                                 match_band,
                                 apply_recommendation,
+                                strengths,
+                                gaps,
                             ) = _score_job_with_engine(
                                 db,
                                 resume_text,
                                 item.get("description") or "",
                                 parsed_resume=parsed_resume,
+                                job_title=item.get("title") or "",
                             )
                             if not match_analysis:
                                 match_analysis = "Saved directly on LinkedIn."
@@ -5114,6 +5273,7 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                                 source="LinkedIn Saved Jobs",
                                 source_type="LinkedIn",
                                 status="Shortlisted",
+                                sync_batch_id=sync_batch_id,
                                 match_score=match_score,
                                 match_analysis=match_analysis,
                                 match_scored=match_scored,
@@ -5121,6 +5281,8 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                                 match_scored_at=match_scored_at,
                                 match_band=match_band,
                                 apply_recommendation=apply_recommendation,
+                                match_strengths_json=json.dumps(strengths) if match_scored else None,
+                                match_gaps_json=json.dumps(gaps) if match_scored else None,
                                 cover_letter_draft=None,
                                 tailored_resume_points=None,
                                 cold_message_draft=None,
@@ -5163,6 +5325,8 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                         "already_existing": already_existing,
                         "dismissed_filtered": dismissed_filtered,
                         "closed_jobs_pruned": closed_pruned,
+                        "sync_batch_id": sync_batch_id,
+                        "total_added": total_added,
                     }
                 ),
                 jobs_count=total_added + closed_pruned,
@@ -5428,6 +5592,8 @@ def scrape_google_jobs_endpoint(
                 score_method = match_scored_at = match_band = apply_recommendation = (
                     None
                 )
+                strengths = []
+                gaps = []
                 if dismissal_match:
                     q_dismissed += 1
                     dismissed_filtered += 1
@@ -5441,11 +5607,14 @@ def scrape_google_jobs_endpoint(
                         match_scored_at,
                         match_band,
                         apply_recommendation,
+                        strengths,
+                        gaps,
                     ) = _score_job_with_engine(
                         db,
                         resume_text,
                         j.get("description") or "",
                         parsed_resume=parsed_resume,
+                        job_title=j.get("title") or "",
                     )
                     if not match_analysis:
                         match_analysis = (
@@ -5477,6 +5646,8 @@ def scrape_google_jobs_endpoint(
                     match_scored_at=match_scored_at,
                     match_band=match_band,
                     apply_recommendation=apply_recommendation,
+                    match_strengths_json=json.dumps(strengths) if match_scored else None,
+                    match_gaps_json=json.dumps(gaps) if match_scored else None,
                     cover_letter_draft=None,
                     tailored_resume_points=None,
                     cold_message_draft=None,
@@ -6117,11 +6288,14 @@ def _execute_external_sync(
                             match_scored_at,
                             match_band,
                             apply_recommendation,
+                            strengths,
+                            gaps,
                         ) = _score_job_with_engine(
                             db,
                             resume_text,
                             item.get("description") or "",
                             parsed_resume=parsed_resume,
+                            job_title=item.get("title") or "",
                         )
                         if not match_analysis:
                             match_analysis = f"Imported from Hirist candidate applications dashboard. Current Status: {raw_status}."
@@ -6146,6 +6320,8 @@ def _execute_external_sync(
                             match_scored_at=match_scored_at,
                             match_band=match_band,
                             apply_recommendation=apply_recommendation,
+                            match_strengths_json=json.dumps(strengths) if match_scored else None,
+                            match_gaps_json=json.dumps(gaps) if match_scored else None,
                             applied_at=now_utc
                             if target_status in ["Applied", "Interview", "Rejected"]
                             else None,
@@ -6635,6 +6811,9 @@ def _run_linkedin_sync_task_runner(
             return {"jobs_found": 0, "skipped": "browser_profile_busy"}
 
         saved_count = 0
+        # Review batch id for this background sync run: every job newly ingested is tagged so the
+        # UI can show a "new from sync" review queue until the user acts on each job.
+        sync_batch_id = f"li-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S')}"
         try:
             with sync_playwright() as p:
                 saved_jobs = scan_and_sync_linkedin_saved_jobs(
@@ -6698,6 +6877,7 @@ def _run_linkedin_sync_task_runner(
                                 source="LinkedIn Saved Job",
                                 source_type="LinkedIn",
                                 status="Shortlisted",
+                                sync_batch_id=sync_batch_id,
                                 match_score=0,
                                 match_scored=False,
                                 match_analysis="Saved on LinkedIn (High user interest).",
@@ -6782,6 +6962,7 @@ def _run_linkedin_sync_task_runner(
                             source=rec.get("source", "LinkedIn Job Alert"),
                             source_type=rec.get("source_type", "LinkedIn"),
                             status=job_status,
+                            sync_batch_id=sync_batch_id,
                             match_score=match_score,
                             match_analysis=match_analysis,
                             is_ghost_job=dd.get("is_ghost_job", False),
@@ -6801,6 +6982,37 @@ def _run_linkedin_sync_task_runner(
                 items_found=total_found,
                 total_steps=3,
             )
+
+        # Record a linkedin_sync OperationLog so the "N new from sync" review banner (which reads
+        # the latest linkedin_sync log) reflects background/Sync-All runs, not just manual syncs.
+        try:
+            db.add(OperationLog(
+                operation_type="linkedin_sync",
+                status="Completed",
+                summary=(
+                    f"LinkedIn sync complete (background): {total_found} new added "
+                    f"({saved_count} saved, {alerts_count} alerts/recommendations, "
+                    f"{alerts_filtered} filtered)."
+                ),
+                details_json=sanitize_log_details(
+                    {
+                        "total_processed": total_found,
+                        "recommendations_found": alerts_count,
+                        "recommendations_added": alerts_count,
+                        "saved_jobs_checked": saved_count,
+                        "saved_jobs_added": saved_count,
+                        "already_existing": 0,
+                        "dismissed_filtered": alerts_filtered,
+                        "closed_jobs_pruned": 0,
+                        "sync_batch_id": sync_batch_id,
+                        "total_added": total_found,
+                    }
+                ),
+                jobs_count=total_found,
+            ))
+            db.commit()
+        except Exception as log_err:
+            logger.warning(f"Failed to persist background LinkedIn sync log: {log_err}")
 
         return {
             "saved_jobs_ingested": saved_count,
@@ -7021,9 +7233,10 @@ def _run_match_rescore_task_runner(
     progress_cb: Optional[Callable] = None,
     limit: int = 200,
 ) -> Dict[str, Any]:
-    """Background re-score of existing jobs with the requirement-coverage engine."""
+    """Background re-score of existing jobs (deterministic engine first, bounded LLM fallback)."""
     db = next(get_db())
     rescored = failed = 0
+    deterministic = llm_fallback = 0
     started = datetime.datetime.now(datetime.timezone.utc)
     try:
         active = (
@@ -7055,7 +7268,6 @@ def _run_match_rescore_task_runner(
             except Exception as idx_err:
                 logger.debug(f"Resume chunk indexing skipped: {idx_err}")
 
-        config = ScoringConfig.from_mapping(get_scoring_config(db))
         jobs = (
             db.query(Job)
             .filter(Job.status.notin_(["Rejected", "Not Interested"]))
@@ -7069,25 +7281,30 @@ def _run_match_rescore_task_runner(
                 cancel_token.check()
             description = (job.description or job.title or "").strip()
             try:
-                evidence = top_evidence(db, active.id, description, k=4)
-                assessment, match = assess_job_requirements(
+                result = _score_job_with_engine(
+                    db,
                     resume_text,
                     description,
                     parsed_resume=parsed_resume,
-                    scoring_config=config,
-                    evidence=evidence,
+                    job_title=job.title or "",
                 )
-                if match.score is None:
+                if not result.scored:
                     failed += 1
                 else:
-                    job.match_score = match.score
-                    job.match_analysis = _match_analysis_text(assessment, match)
+                    job.match_score = result.score
+                    job.match_analysis = result.analysis
                     job.match_scored = True
-                    job.score_method = match.method
-                    job.match_scored_at = datetime.datetime.now(datetime.timezone.utc)
-                    job.match_band = match.band
-                    job.apply_recommendation = match.apply_recommendation
+                    job.score_method = result.method
+                    job.match_scored_at = result.timestamp
+                    job.match_band = result.band
+                    job.apply_recommendation = result.recommendation
+                    job.match_strengths_json = json.dumps(result.strengths)
+                    job.match_gaps_json = json.dumps(result.gaps)
                     rescored += 1
+                    if result.method == "classifier_v1":
+                        deterministic += 1
+                    else:
+                        llm_fallback += 1
             except Exception as job_err:
                 failed += 1
                 logger.debug(f"Re-score skipped for job {job.id}: {job_err}")
@@ -7104,15 +7321,25 @@ def _run_match_rescore_task_runner(
 
         db.commit()
 
+        logger.info(
+            f"match_rescore: deterministic={deterministic} llm_fallback={llm_fallback} "
+            f"unscored={failed} total={len(jobs)}"
+        )
+
         try:
             db.add(
                 OperationLog(
                     operation_type="match_rescore",
                     status="Completed" if not failed else "Partial",
-                    summary=f"Re-scored {rescored} job(s) with {SCORE_METHOD}; {failed} skipped.",
+                    summary=(
+                        f"Re-scored {rescored} job(s): {deterministic} deterministic, "
+                        f"{llm_fallback} LLM fallback; {failed} skipped."
+                    ),
                     details_json=sanitize_log_details(
                         {
                             "rescored": rescored,
+                            "deterministic": deterministic,
+                            "llm_fallback": llm_fallback,
                             "failed": failed,
                             "limit": limit,
                             "started_at": started.isoformat(),
@@ -7127,7 +7354,13 @@ def _run_match_rescore_task_runner(
                 f"Failed to persist OperationLog for match re-score: {op_err}"
             )
 
-        return {"rescored": rescored, "failed": failed, "jobs_found": rescored}
+        return {
+            "rescored": rescored,
+            "failed": failed,
+            "jobs_found": rescored,
+            "deterministic": deterministic,
+            "llm_fallback": llm_fallback,
+        }
     finally:
         db.close()
 
@@ -7394,6 +7627,163 @@ def trigger_scheduled_job_now(job_id: str):
         "task_id": task_id,
         "message": f"Triggered scheduled job {job_id} as background task {task_id}.",
     }
+
+
+def _deterministic_match(
+    db,
+    resume_text: str,
+    description: str,
+    parsed_resume: dict | None = None,
+    job_title: str = "",
+    location: str = "",
+) -> dict | None:
+    """Deterministic requirement+classifier match. None when no usable requirements."""
+    # FAST PATH: deterministic requirement extraction + ML/heuristic classifier.
+    # Runs in milliseconds with no LLM call, so bulk ATS scoring does not saturate
+    # the LLM queue. Falls through to the LLM extractor only if it cannot produce
+    # a usable assessment.
+    from backend import jd_signals
+    from backend.match_classifier import (
+        build_deterministic_assessment,
+        extract_match_features,
+        get_classifier,
+    )
+    from backend.match_scoring import band_and_recommendation
+
+    try:
+        # Deterministic requirements so must/nice coverage is real (no LLM).
+        assessment = build_deterministic_assessment(
+            description,
+            parsed_resume,
+            resume_text=resume_text,
+            job_title=job_title or "",
+        )
+        if not assessment.requirements:
+            return None
+
+        known = [r for r in assessment.requirements if r.status in ("met", "partial", "missing")]
+        if not known:
+            return None
+
+        exp_hints = jd_signals.parse_experience(description)
+        min_years = max(
+            (h.get("min_years") for h in exp_hints if h.get("min_years")), default=None
+        )
+        max_years = max(
+            (h.get("max_years") for h in exp_hints if h.get("max_years")), default=None
+        )
+        jd_hints = {
+            "min_years": min_years or 0,
+            "max_years": max_years or 100,
+            "seniority_level": jd_signals.seniority_level(job_title or ""),
+            "education_mentioned": bool(jd_signals.parse_education(description)),
+        }
+        features = extract_match_features(
+            parsed_resume, jd_hints, assessment=assessment
+        )
+        classifier = get_classifier()
+        score = classifier.predict(features)
+
+        scoring_config = ScoringConfig.from_mapping(get_scoring_config(db))
+        gated = (
+            features.must_count > 0
+            and features.must_coverage < scoring_config.must_floor
+        )
+        over_qualified = features.over_qualified_flag > 0.5
+        band, recommendation = band_and_recommendation(
+            score, scoring_config, gated=gated, over_qualified=over_qualified
+        )
+
+        eligible, ineligibility_reason = _check_eligibility(db, job_title, location)
+
+        # Surface the requirement breakdown so the score is transparent, not a black box.
+        strengths, gaps = _derive_strengths_gaps(assessment)
+        known_reqs = [
+            r
+            for r in assessment.requirements
+            if r.status in ("met", "partial", "missing")
+        ]
+        met_count = sum(1 for r in known_reqs if r.status == "met")
+        unverified = [
+            r.text
+            for r in assessment.requirements
+            if r.status not in ("met", "partial", "missing") and r.text
+        ]
+        feedback = (
+            f"Matched {met_count} of {len(known_reqs)} requirements "
+            f"(must-have coverage {round(features.must_coverage * 100)}%, "
+            f"nice-to-have {round(features.nice_coverage * 100)}%)."
+        )
+        # Surface technology-tenure comparisons so the user can judge borderline cases.
+        tenure_notes = []
+        for r in assessment.requirements:
+            if (
+                r.kind != "experience_years"
+                or r.scope != "technology"
+                or not r.technology
+            ):
+                continue
+            need = (
+                f"{r.min_years:g}+ yrs"
+                if r.min_years is not None
+                else "the required experience"
+            )
+            if r.evidence == "unconfirmed":
+                tenure_notes.append(
+                    f"{r.technology}: requires {need}, but the resume does not state the tenure "
+                    f"— not enough information to confirm; please decide"
+                )
+            elif r.evidence == "not found":
+                tenure_notes.append(
+                    f"{r.technology}: requires {need}, but no evidence was found in the resume"
+                )
+            else:
+                tenure_notes.append(
+                    f"{r.technology}: requires {need}, resume {r.evidence} ({r.status})"
+                )
+        if tenure_notes:
+            feedback += " Tenure check — " + "; ".join(tenure_notes) + "."
+        return {
+            "assessment": assessment,
+            "features": features,
+            "score": score,
+            "band": band,
+            "recommendation": recommendation,
+            "must_coverage": features.must_coverage,
+            "nice_coverage": features.nice_coverage,
+            "over_qualified": over_qualified,
+            "strengths": strengths,
+            "gaps": gaps,
+            "unverified": unverified,
+            "feedback": feedback,
+            "eligible": eligible,
+            "ineligibility_reason": ineligibility_reason,
+            "method": "classifier_v1",
+            "score_method": "classifier_v1",
+        }
+
+    except Exception as classifier_err:
+        logger.warning(
+            f"Classifier-based scoring failed: {classifier_err}; falling back to LLM"
+        )
+        return None
+
+
+def _check_eligibility(db, job_title: str, location: str) -> tuple[bool, Optional[str]]:
+    """Checks if the job is eligible based on user preferences."""
+    try:
+        # Check location eligibility if provided
+        if (location or "").strip():
+            from backend.preference_filter import PreferenceFilter
+
+            reason = PreferenceFilter.from_db(db).rejection_reason(
+                job_title, location
+            )
+            if reason:
+                return False, reason
+    except Exception as e:
+        logger.debug(f"Eligibility check skipped: {e}")
+    return True, None
 
 
 # -------------------------------------------------------------

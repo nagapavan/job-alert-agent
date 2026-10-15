@@ -1567,6 +1567,18 @@ def test_llm_settings_never_exposes_raw_keys():
     assert data["allow_cloud_fallback"] is True
 
 
+def test_gmail_credentials_rejects_client_id_as_secret():
+    res = client.post(
+        "/api/gmail/credentials",
+        json={
+            "client_id": "cid.apps.googleusercontent.com",
+            "client_secret": "cid.apps.googleusercontent.com",
+        },
+    )
+    assert res.status_code == 400
+    assert "secret" in res.json()["detail"].lower()
+
+
 def test_gmail_credentials_connect_and_disconnect_flow():
     from unittest.mock import patch as _patch
 

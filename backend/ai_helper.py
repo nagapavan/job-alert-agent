@@ -4,11 +4,13 @@ import os
 import re
 import threading
 import time
+import uuid
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, List, Type, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar  # noqa: UP035
+
 import requests
-from pydantic import BaseModel, Field, ConfigDict, field_validator, AliasChoices
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from backend.company_catalog import compute_cosine_similarity
 
@@ -19,25 +21,28 @@ T = TypeVar("T", bound=BaseModel)
 
 from backend.config import (
     DEFAULT_LLM_PROVIDER,
+    ENABLE_DYNAMIC_MODEL_ROUTING,
     LLM_TIMEOUT,
     LM_STUDIO_BASE_URL,
-    LM_STUDIO_MODEL,
-    LM_STUDIO_FAST_MODEL,
-    LM_STUDIO_STANDARD_MODEL,
     LM_STUDIO_DEEP_MODEL,
-    UNSLOTH_BASE_URL,
-    UNSLOTH_MODEL,
+    LM_STUDIO_FAST_MODEL,
+    LM_STUDIO_MODEL,
+    LM_STUDIO_STANDARD_MODEL,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
+    UNSLOTH_BASE_URL,
+    UNSLOTH_MODEL,
     get_llm_credentials,
     is_cloud_fallback_allowed,
-    ENABLE_DYNAMIC_MODEL_ROUTING,
-    FAST_TIER_MODEL,
-    STANDARD_TIER_MODEL,
-    DEEP_TIER_MODEL,
 )
-from backend.llm_queue import llm_queue, LLMPriority
+from backend.llm_queue import LLMPriority, llm_queue
+from backend.llm_resilience import with_retry
 from backend.observability import log_llm_event
+from backend.prompts import (
+    JOB_MATCH_SCORING_SYSTEM,
+    JUDGE_SYSTEM,
+    interview_questions_system,
+)
 
 logger = logging.getLogger("ai_helper")
 
@@ -115,6 +120,7 @@ TASK_PROFILES: Dict[str, Dict[str, Any]] = {
         "temperature": 0.0,
         "max_tokens": 250,
         "top_p": 0.85,
+        "max_retries": 2,
         "description": "Categorizing recruiter and digest emails",
     },
     "json_repair": {
@@ -164,6 +170,7 @@ TASK_PROFILES: Dict[str, Dict[str, Any]] = {
         "temperature": 0.8,
         "max_tokens": 2500,
         "top_p": 0.95,
+        "max_retries": 4,
         "description": "Generating tailored high-impact cover letters",
     },
     "tailored_resume_points": {
@@ -213,6 +220,7 @@ TASK_PROFILES: Dict[str, Dict[str, Any]] = {
         "temperature": 0.8,
         "max_tokens": 350,
         "top_p": 0.85,
+        "max_retries": 1,
         "description": "Generating concise 3-5 sentence anti-slop grounded application pitches",
     },
 }
@@ -446,6 +454,40 @@ class PitchVerificationResult(BaseModel):
         default=None,
         description="Corrected 3-5 sentence pitch grounded strictly in real resume facts",
     )
+
+
+class JudgeVerdict(BaseModel):
+    """Structured verdict from the generic quality Judge for open-ended LLM outputs.
+
+    Used by ``judge_output`` to score correctness/completeness/groundedness/tone on a
+    0-5 scale and drive bounded re-generation for failing outputs.
+    """
+
+    model_config = ConfigDict(
+        from_attributes=True, populate_by_name=True, extra="allow"
+    )
+
+    score: float = Field(default=0.0, ge=0.0, le=5.0, description="Overall 0-5 quality grade")
+    pass_: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("pass_", "pass"),
+        description="True when score >= 4.0",
+    )
+    critique: str = Field(
+        default="", description="Short one-paragraph explanation of the grade"
+    )
+    issues: List[str] = Field(
+        default_factory=list, description="Specific weaknesses or hallucinated details"
+    )
+
+    @field_validator("score", mode="before")
+    @classmethod
+    def clamp_score(cls, v: Any) -> Optional[float]:
+        try:
+            val = float(v)
+            return max(0.0, min(5.0, val))
+        except Exception:
+            return 0.0
 
 
 from backend.parser import parse_open_source_resume, clean_job_description
@@ -751,7 +793,7 @@ def call_lmstudio(
                 m_data = m_res.json()
                 if m_data.get("data") and len(m_data["data"]) > 0:
                     model_to_use = m_data["data"][0]["id"]
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     effective_sys = system_prompt
@@ -1214,11 +1256,10 @@ def get_model_for_tier(provider_id: str, complexity: TaskComplexity) -> str:
     p_id = re.sub(r"[^a-z0-9]", "", (provider_id or "").lower())
 
     if p_id == "ollama":
-        if complexity == TaskComplexity.FAST:
-            return FAST_TIER_MODEL or "qwen2.5:3b"
-        elif complexity == TaskComplexity.DEEP_REASONING:
-            return DEEP_TIER_MODEL or "llama3.3:70b"
-        return STANDARD_TIER_MODEL or OLLAMA_MODEL
+        # Ollama uses a single configured model across all complexity tiers
+        # (see config OLLAMA_MODEL); the former 3-tier FAST/STANDARD/DEEP model
+        # selection was removed to keep local providers single-model like Unsloth.
+        return OLLAMA_MODEL
 
     elif p_id == "openai":
         if complexity == TaskComplexity.DEEP_REASONING:
@@ -1377,6 +1418,47 @@ PROVIDER_REGISTRY = {
 }
 
 
+def _call_provider_with_retry(
+    handler,
+    system_prompt: str,
+    user_prompt: str,
+    json_mode: bool,
+    call_kwargs: Dict[str, Any],
+    *,
+    task_type: Optional[str],
+    step_name: str,
+    max_retries: Optional[int] = None,
+) -> str:
+    """Invoke a provider handler wrapped in the exponential-backoff retry layer.
+
+    Only transient failures (429/5xx/connection/timeout) are retried; all other
+    errors propagate immediately through to the fallback cascade in the caller.
+    """
+    return with_retry(
+        step_name,
+        lambda: handler(system_prompt, user_prompt, json_mode, **call_kwargs),
+        task_type=task_type,
+        max_retries=max_retries,
+    )
+
+
+def _log_llm_audit(
+    *,
+    trace_id: Optional[str],
+    prompt_content: Optional[str],
+    response_content: Optional[str],
+    **kwargs: Any,
+) -> None:
+    """Emit an LLM audit event, forwarding the operation trace_id and (privacy-gated)
+    prompt/response content to the structured audit log."""
+    log_llm_event(
+        **kwargs,
+        trace_id=trace_id,
+        prompt_content=prompt_content,
+        response_content=response_content,
+    )
+
+
 def _execute_generate_text(
     system_prompt: str,
     user_prompt: str,
@@ -1387,11 +1469,15 @@ def _execute_generate_text(
     task_type: Optional[str] = None,
     model: Optional[str] = None,
     response_schema: Optional[Type[BaseModel]] = None,
+    max_retries: Optional[int] = None,
+    trace_id: Optional[str] = None,
 ) -> str:
     """
     Routes prompt to selected or auto-detected LLM provider using the key-value registry table.
     Enforces task-complexity dynamic hyperparameter tuning, model tier resolution, and native JSON Schema output.
     Strictly local-first. Cloud fallbacks execute ONLY if ALLOW_CLOUD_FALLBACK is True or provider is explicit.
+    ``trace_id`` (when set) is attached to every audit log entry for this call so multi-step
+    operations can be reconstructed end-to-end.
     """
     # 1. Resolve task-complexity parameters & model tier
     target_prov, routed_model, eff_temp, eff_max_tokens, complexity, eff_top_p = (
@@ -1416,17 +1502,27 @@ def _execute_generate_text(
 
     target = target_prov.replace("_", "").replace("-", "")
     t0 = time.perf_counter()
+    prompt_content = system_prompt + "\n" + user_prompt
 
     # 2. Direct provider routing via Registry lookup (O(1))
     if target in PROVIDER_REGISTRY:
         handler = PROVIDER_REGISTRY[target]["handler"]
         try:
             # pyrefly: ignore [unexpected-keyword]
-            res = handler(system_prompt, user_prompt, json_mode, **call_kwargs)
+            res = _call_provider_with_retry(
+                handler,
+                system_prompt,
+                user_prompt,
+                json_mode,
+                call_kwargs,
+                task_type=task_type,
+                step_name=f"llm:{target}",
+                max_retries=max_retries,
+            )
             lat = (time.perf_counter() - t0) * 1000
             prompt_toks = int(len(system_prompt + user_prompt) / 4)
             comp_toks = int(len(res) / 4)
-            log_llm_event(
+            _log_llm_audit(
                 task_name=task_type or "llm_generate",
                 model=model_to_use or target,
                 provider=target_prov,
@@ -1436,11 +1532,14 @@ def _execute_generate_text(
                 temperature=eff_temp,
                 is_cache_hit=False,
                 task_type=task_type or "general",
+                trace_id=trace_id,
+                prompt_content=prompt_content,
+                response_content=res,
             )
             return res
         except Exception as e:
             lat = (time.perf_counter() - t0) * 1000
-            log_llm_event(
+            _log_llm_audit(
                 task_name=task_type or "llm_generate",
                 model=model_to_use or target,
                 provider=target_prov,
@@ -1448,6 +1547,9 @@ def _execute_generate_text(
                 temperature=eff_temp,
                 task_type=task_type or "general",
                 error=str(e),
+                trace_id=trace_id,
+                prompt_content=prompt_content,
+                response_content=None,
             )
             raise
     elif target not in ("auto", "default", ""):
@@ -1455,13 +1557,20 @@ def _execute_generate_text(
         for key, p in PROVIDER_REGISTRY.items():
             if key in target or target in key:
                 try:
-                    res = p["handler"](
-                        system_prompt, user_prompt, json_mode, **call_kwargs
+                    res = _call_provider_with_retry(
+                        p["handler"],
+                        system_prompt,
+                        user_prompt,
+                        json_mode,
+                        call_kwargs,
+                        task_type=task_type,
+                        step_name=f"llm:{key}",
+                        max_retries=max_retries,
                     )
                     lat = (time.perf_counter() - t0) * 1000
                     prompt_toks = int(len(system_prompt + user_prompt) / 4)
                     comp_toks = int(len(res) / 4)
-                    log_llm_event(
+                    _log_llm_audit(
                         task_name=task_type or "llm_generate",
                         model=model_to_use or key,
                         provider=p["id"],
@@ -1471,11 +1580,14 @@ def _execute_generate_text(
                         temperature=eff_temp,
                         is_cache_hit=False,
                         task_type=task_type or "general",
+                        trace_id=trace_id,
+                        prompt_content=prompt_content,
+                        response_content=res,
                     )
                     return res
                 except Exception as e:
                     lat = (time.perf_counter() - t0) * 1000
-                    log_llm_event(
+                    _log_llm_audit(
                         task_name=task_type or "llm_generate",
                         model=model_to_use or key,
                         provider=p["id"],
@@ -1483,6 +1595,9 @@ def _execute_generate_text(
                         temperature=eff_temp,
                         task_type=task_type or "general",
                         error=str(e),
+                        trace_id=trace_id,
+                        prompt_content=prompt_content,
+                        response_content=None,
                     )
                     raise
 
@@ -1515,13 +1630,20 @@ def _execute_generate_text(
             fallback_kwargs["response_schema"] = response_schema
 
         try:
-            res = prov["handler"](
-                system_prompt, user_prompt, json_mode, **fallback_kwargs
+            res = _call_provider_with_retry(
+                prov["handler"],
+                system_prompt,
+                user_prompt,
+                json_mode,
+                fallback_kwargs,
+                task_type=task_type,
+                step_name=f"llm-fallback:{prov['id']}",
+                max_retries=max_retries,
             )
             lat = (time.perf_counter() - t0) * 1000
             prompt_toks = int(len(system_prompt + user_prompt) / 4)
             comp_toks = int(len(res) / 4)
-            log_llm_event(
+            _log_llm_audit(
                 task_name=task_type or "llm_generate_fallback",
                 model=prov_tier_model or prov["id"],
                 provider=prov["id"],
@@ -1531,6 +1653,9 @@ def _execute_generate_text(
                 temperature=eff_temp,
                 is_cache_hit=False,
                 task_type=task_type or "general",
+                trace_id=trace_id,
+                prompt_content=prompt_content,
+                response_content=res,
             )
             return res
         except Exception as e:
@@ -1538,7 +1663,7 @@ def _execute_generate_text(
 
     error_summary = "; ".join(errors)
     lat = (time.perf_counter() - t0) * 1000
-    log_llm_event(
+    _log_llm_audit(
         task_name=task_type or "llm_generate_failed",
         model=model_to_use or "unknown",
         provider=target_prov,
@@ -1546,6 +1671,9 @@ def _execute_generate_text(
         temperature=eff_temp,
         task_type=task_type or "general",
         error=error_summary,
+        trace_id=trace_id,
+        prompt_content=prompt_content,
+        response_content=None,
     )
     raise RuntimeError(
         f"All LLM providers failed to generate a response. Errors: {error_summary}"
@@ -1564,26 +1692,41 @@ def generate_text(
     task_type: Optional[str] = None,
     model: Optional[str] = None,
     response_schema: Optional[Type[BaseModel]] = None,
+    timeout: Optional[float] = None,
+    max_retries: Optional[int] = None,
+    trace_id: Optional[str] = None,
 ) -> str:
     """
     Submits LLM generation task to the serialized Priority Queue Manager.
     Applies task-complexity dynamic hyperparameter tuning, model tier selection, and optional structured schema format.
+    ``timeout`` bounds how long this call waits for the queue task (seconds); when omitted the
+    queue default applies. Used to keep interactive requests from blocking on a slow local model.
+    ``max_retries`` optionally overrides the retry policy for transient provider failures
+    (defaults resolve from per-task profile then global config).
+    ``trace_id`` (defaults to an autogenerated value) links this call's audit-log entries
+    to a larger operation.
     """
     eff_task_name = task_name or (f"Task:{task_type}" if task_type else "LLM-Inference")
-    return llm_queue.submit(
-        _execute_generate_text,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        json_mode=json_mode,
-        provider=provider,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        task_type=task_type,
-        model=model,
-        response_schema=response_schema,
-        priority=priority,
-        task_name=eff_task_name,
-    )
+    eff_trace = trace_id or f"gen-{uuid.uuid4().hex[:12]}"
+    submit_kwargs = {
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+        "json_mode": json_mode,
+        "provider": provider,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "task_type": task_type,
+        "model": model,
+        "response_schema": response_schema,
+        "priority": priority,
+        "task_name": eff_task_name,
+        "trace_id": eff_trace,
+    }
+    if max_retries is not None:
+        submit_kwargs["max_retries"] = max_retries
+    if timeout is not None:
+        submit_kwargs["timeout"] = timeout
+    return llm_queue.submit(_execute_generate_text, **submit_kwargs)
 
 
 def generate_structured(
@@ -1596,6 +1739,9 @@ def generate_structured(
     priority: LLMPriority = LLMPriority.ON_DEMAND,
     task_type: Optional[str] = None,
     task_name: str = "",
+    timeout: Optional[float] = None,
+    max_retries: Optional[int] = None,
+    trace_id: Optional[str] = None,
 ) -> T:
     """
     Strict Structured Output Generator.
@@ -1612,6 +1758,9 @@ def generate_structured(
         task_type=task_type,
         task_name=task_name or f"Structured:{schema.__name__}",
         response_schema=schema,
+        trace_id=trace_id,
+        timeout=timeout,
+        max_retries=max_retries,
     )
 
     try:
@@ -1831,28 +1980,7 @@ def analyze_job_match(
             "feedback": "Please provide a job description to analyze match alignment.",
         }
 
-    system_prompt = (
-        "You are an expert technical recruiter and talent advisor. Evaluate the candidate's resume "
-        "against the target job description. Output a STRICT, VALID JSON object with the following schema:\n"
-        "{\n"
-        '  "match_score": 0,\n'
-        '  "strengths": [\n'
-        '    "Direct experience with core tech stack (e.g. Python, distributed systems)",\n'
-        '    "Proven track record in relevant team leadership"\n'
-        "  ],\n"
-        '  "gaps": [\n'
-        '    "No explicit mention of Kubernetes or container orchestration"\n'
-        "  ],\n"
-        '  "feedback": "Tailor your project descriptions to highlight cloud infrastructure scale and quantifiable metrics."\n'
-        "}\n"
-        "Rules:\n"
-        "1. match_score MUST be an integer or float between 0 and 100 representing realistic qualification match.\n"
-        "2. strengths: AT MOST 4 concise bullet points, each 15 words or fewer.\n"
-        "3. gaps: AT MOST 3 concise bullet points, each 15 words or fewer.\n"
-        "4. feedback: AT MOST 5 sentences and MUST end with an explicit recommendation stating whether the candidate should apply or not.\n"
-        "5. Do NOT include any text outside the JSON object.\n"
-        "6. The value 0 in the example above is a PLACEHOLDER only. Compute the real match_score strictly from the evidence in the resume vs. the job description; never copy the placeholder or reuse the example values."
-    )
+    system_prompt = JOB_MATCH_SCORING_SYSTEM
 
     cleaned_jd = clean_job_description(job_description, max_chars=1200)
     user_prompt = (
@@ -1955,10 +2083,12 @@ def assess_job_requirements(
     parsed_resume: Optional[dict] = None,
     scoring_config=None,
     evidence: Optional[List[str]] = None,
+    timeout: Optional[float] = None,
 ):
     """Extract requirements, assess them against the resume, and score deterministically.
 
     Returns ``(RequirementAssessment, MatchResult)``. Raises ValueError on empty inputs.
+    On LLM timeout, falls back to deterministic parsing.
     """
     from backend import jd_signals, resume_signals
     from backend.match_scoring import RequirementAssessment, compute_match
@@ -1994,16 +2124,27 @@ def assess_job_requirements(
         f"--- TARGET JOB DESCRIPTION ---\n{clean_job_description(job_description, max_chars=4000)}"
     )
 
-    assessment: RequirementAssessment = generate_structured(
-        schema=RequirementAssessment,
-        system_prompt=_REQUIREMENT_EXTRACTION_PROMPT,
-        user_prompt=user_prompt,
-        provider=provider,
-        temperature=0.0,
-        max_tokens=1800,
-        task_type="job_match_scoring",
-        task_name="Requirement-Extraction",
-    )
+    try:
+        assessment: RequirementAssessment = generate_structured(
+            schema=RequirementAssessment,
+            system_prompt=_REQUIREMENT_EXTRACTION_PROMPT,
+            user_prompt=user_prompt,
+            provider=provider,
+            temperature=0.0,
+            max_tokens=1800,
+            task_type="job_match_scoring",
+            task_name="Requirement-Extraction",
+            timeout=timeout,
+        )
+    except (RuntimeError, TimeoutError) as e:
+        logger.warning(
+            f"Requirement-Extraction LLM call failed ({type(e).__name__}); falling back to deterministic parsing"
+        )
+        assessment = RequirementAssessment(
+            summary="Deterministic assessment (LLM timeout or unavailable)",
+            requirements=[],
+        )
+
     _normalize_assessment(assessment)
     _apply_over_qualification(assessment, candidate_years, hints)
     result = compute_match(assessment, scoring_config)
@@ -2079,29 +2220,7 @@ def generate_interview_questions(
             "error": "A resume and job title are required to generate interview questions.",
         }
 
-    system_prompt = (
-        "You are an expert interview coach. Generate likely interview questions for the target role, "
-        "mixing technical, behavioral, system-design, and role-fit questions. For each question, provide a "
-        "STAR scaffold and a concise first-person suggested answer.\n"
-        "Output a STRICT, VALID JSON object with this schema:\n"
-        "{\n"
-        '  "questions": [\n'
-        "    {\n"
-        '      "question": "Tell me about a time you scaled a service under load.",\n'
-        '      "category": "behavioral",\n'
-        '      "star_situation": "At <past employer from the resume>, the service hit a traffic spike.",\n'
-        '      "star_action": "I introduced caching and horizontal scaling based on the work described in the resume.",\n'
-        '      "star_result": "Latency dropped and throughput increased (use only resume facts).",\n'
-        '      "suggested_answer": "A concise 3-4 sentence STAR answer."\n'
-        "    }\n"
-        "  ]\n"
-        "}\n"
-        "Rules:\n"
-        "1. Ground EVERY answer strictly in the CANDIDATE RESUME. Do NOT invent employers, titles, metrics, or projects.\n"
-        "2. If the resume lacks evidence for a question, write the scaffold using only what is present; never fabricate.\n"
-        f"3. Generate at most {max(1, min(int(num_questions or 6), 15))} questions.\n"
-        "4. Do NOT include any text outside the JSON object."
-    )
+    system_prompt = interview_questions_system(num_questions)
 
     cleaned_jd = clean_job_description(job_description or job_title, max_chars=1200)
     user_prompt = (
@@ -3303,6 +3422,94 @@ def _correction_preserves_target(
         # Original never named the target company, so nothing needs preserving.
         return True
     return key in (corrected_text or "").lower()
+
+
+def judge_output(
+    text: str,
+    *,
+    context: str = "",
+    judge_prompt: Optional[str] = None,
+    regenerator: Optional[Callable[[str], str]] = None,
+    max_regenerations: int = 1,
+    provider: Optional[str] = None,
+    task_name: str = "Judge",
+    priority: LLMPriority = LLMPriority.INTERACTIVE,
+) -> dict:
+    """Generic quality Judge for open-ended LLM output.
+
+    Scores ``text`` (correctness / completeness / groundedness / tone) via the
+    ``JUDGE_SYSTEM`` prompt and, when the verdict fails and a ``regenerator`` callable
+    is provided, regenerates the output (bounded by ``max_regenerations``) and re-judges.
+    The LLM is never asked to mutate anything — this is a read-only quality gate.
+
+    Returns a dict::
+
+        {
+            "verdict": JudgeVerdict,
+            "text": final text (possibly regenerated),
+            "regenerated": bool,
+            "regenerations": int,
+        }
+
+    Judge failures are non-fatal: on any exception the original text is returned
+    unchanged with ``regenerated=False`` so the caller never loses a valid answer.
+    """
+    if not text or not text.strip():
+        return {"verdict": None, "text": text, "regenerated": False, "regenerations": 0}
+
+    current = text
+    regenerations = 0
+    verdict: Optional[JudgeVerdict] = None
+
+    while True:
+        judge_user = (
+            ("Context to judge against:\n" + context + "\n\n" if context else "")
+            + "Answer to evaluate:\n"
+            + current
+        )
+        try:
+            verdict = generate_structured(
+                schema=JudgeVerdict,
+                system_prompt=judge_prompt or JUDGE_SYSTEM,
+                user_prompt=judge_user,
+                provider=provider,
+                temperature=0.1,
+                max_tokens=400,
+                priority=priority,
+                task_type="grounded_pitch",
+                task_name=task_name,
+            )
+        except Exception as exc:  # noqa: BLE001 - non-fatal judge gate
+            logger.warning("LLM-Judge (%s) failed: %s; keeping original text.", task_name, exc)
+            return {
+                "verdict": None,
+                "text": current,
+                "regenerated": bool(regenerations),
+                "regenerations": regenerations,
+            }
+
+        if verdict.pass_ or regenerator is None or regenerations >= max_regenerations:
+            break
+
+        # Bounded re-generation on a failing verdict, using its critique as feedback.
+        try:
+            regenerated = regenerator(verdict.critique)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "LLM-Judge (%s) regeneration failed: %s; keeping current text.", task_name, exc
+            )
+            break
+        if not regenerated or regenerated.strip() == current.strip():
+            break
+        current = regenerated
+        regenerations += 1
+
+    return {
+        "verdict": verdict,
+        "text": current,
+        "regenerated": bool(regenerations),
+        "regenerations": regenerations,
+    }
 
 
 def verify_and_judge_grounded_pitch(

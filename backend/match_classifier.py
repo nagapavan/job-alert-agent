@@ -8,6 +8,7 @@ Trained on historical job assessments from the database.
 import json
 import logging
 import pickle
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -185,6 +186,316 @@ def extract_match_features(
         over_qualified_flag=over_qualified,
         must_count=must_count,
         nice_count=nice_count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic requirement extraction (no LLM)
+# Builds the same RequirementAssessment shape the LLM produces, using only the
+# JD text + parsed resume, so must/nice coverage can be computed without an LLM.
+# ---------------------------------------------------------------------------
+
+_SKILL_ALIASES = {
+    "golang": "go",
+    "postgres": "postgresql",
+    "k8s": "kubernetes",
+    "amazon web services": "aws",
+    "google cloud platform": "gcp",
+    "google cloud": "gcp",
+    "microsoft azure": "azure",
+    "llms": "llm",
+    "apache kafka": "kafka",
+}
+
+# Broad JD terms credit a partial match when the resume has related technologies.
+_CONCEPT_GROUPS = {
+    "distributed systems": {
+        "kafka", "grpc", "microservices", "rabbitmq", "redis",
+        "elasticsearch", "celery", "system design", "kubernetes",
+    },
+    "microservices": {"grpc", "docker", "kubernetes", "kafka", "rabbitmq", "rest api"},
+    "system design": {"microservices", "distributed systems", "grpc", "kafka", "rest api"},
+    "machine learning": {"llm", "nlp", "pytorch", "tensorflow", "pandas", "numpy", "scikit-learn"},
+}
+
+_CLOUD_PROVIDERS = {"aws", "gcp", "azure"}
+
+# Higher rank satisfies a lower education requirement (Masters meets Bachelor's, not vice versa).
+_EDU_RANK = {"high_school": 0, "associate": 1, "bachelor": 2, "master": 3, "phd": 4}
+
+_NICE_SECTION_RE = re.compile(
+    r"(preferred qualifications?|nice[\s-]?to[\s-]?have|good[\s-]?to[\s-]?have|"
+    r"bonus points?|a plus|desirable|stand out|standout|ideally)",
+    re.I,
+)
+
+# Company-intro block; skills mentioned only in this marketing prose (e.g. "40-year old
+# C++ code") are not treated as requirements. We skip from the intro to the next heading,
+# rather than requiring an explicit "Requirements" marker, so skill lists that appear
+# before a heading are still captured.
+_INTRO_RE = re.compile(
+    r"(about us|about the company|about the team|about the role|who we are|"
+    r"company overview|our story|our mission)",
+    re.I,
+)
+_SECTION_HEADING_RE = re.compile(
+    r"(what you'?ll do|what you'?ll be doing|how you'?ll make an impact|responsibilities|"
+    r"the role|role expectations|your role|who you are|what you bring|what you'?ll need|"
+    r"what we'?re looking for|key qualifications|preferred qualifications|requirements|"
+    r"qualifications|must[\s-]?have|skills|you have)",
+    re.I,
+)
+
+_SENIORITY_RANK = {
+    "intern": 0, "junior": 1, "mid": 2, "senior": 3, "lead": 4,
+    "staff": 5, "principal": 6, "manager": 7, "director": 8,
+}
+
+
+def _skill_token(pattern: str) -> re.Pattern:
+    """Boundary that tolerates symbols like C++ / Node.js / CI/CD."""
+    return re.compile(r"(?<![A-Za-z0-9])" + re.escape(pattern) + r"(?![A-Za-z0-9])", re.I)
+
+
+def _normalize_skill(name: str) -> str:
+    t = (name or "").strip().lower()
+    return _SKILL_ALIASES.get(t, t)
+
+
+def build_deterministic_assessment(
+    job_description: str,
+    parsed_resume: Optional[dict],
+    resume_text: str = "",
+    job_title: str = "",
+):
+    """Build a RequirementAssessment from JD/resume signals without any LLM call.
+
+    Covers the concrete, high-signal requirements (skills, years, seniority,
+    education, certifications) that dominate requirement-coverage scoring.
+    """
+    from backend import jd_signals, resume_signals
+    from backend.parser import COMMON_TECH_SKILLS
+    from backend.match_scoring import (
+        RequirementAssessment,
+        RequirementItem,
+        MUST_HAVE,
+        NICE_TO_HAVE,
+        MET,
+        MISSING,
+        PARTIAL,
+        UNKNOWN,
+    )
+
+    jd = job_description or ""
+    jd_lower = jd.lower()
+    reqs: List[RequirementItem] = []
+
+    resume_skills = {
+        _normalize_skill(s) for s in ((parsed_resume or {}).get("skills") or [])
+    }
+    # Fall back to scanning the raw resume text when structured skills are absent
+    # (e.g. resumes ingested before parsing, or inline resume text from the extension).
+    if not resume_skills and resume_text:
+        resume_skills = {
+            _normalize_skill(s)
+            for s in COMMON_TECH_SKILLS
+            if _skill_token(s).search(resume_text.lower())
+        }
+    resume_blob = " ".join(
+        [resume_text or ""] + [str(s) for s in ((parsed_resume or {}).get("skills") or [])]
+    ).lower()
+
+    nice_match = _NICE_SECTION_RE.search(jd)
+    nice_start = nice_match.start() if nice_match else len(jd)
+    # Skip the company-intro block (if any) so marketing prose is not read as requirements.
+    # Only honor the skip when it still leaves extractable skills; otherwise a nav/footer
+    # "About Us" could wipe the entire posting. Fall back to scanning the whole JD.
+    intro_match = _INTRO_RE.search(jd)
+    scan_start = 0
+    if intro_match:
+        next_heading = _SECTION_HEADING_RE.search(jd, intro_match.end())
+        candidate = next_heading.start() if next_heading else intro_match.end()
+        if candidate < len(jd) and any(
+            _skill_token(s).search(jd_lower, candidate) for s in COMMON_TECH_SKILLS
+        ):
+            scan_start = candidate
+
+    # Parse experience signals first, so a technology that carries a years requirement is
+    # not also credited as a plain (presence-only) skill. Scoped past the intro to avoid
+    # prose like "40-year old C++ code".
+    hints = jd_signals.parse_experience(jd[scan_start:] if scan_start else jd)
+    candidate_years = resume_signals.estimate_total_years(parsed_resume)
+    tech_hints = [h for h in hints if h.get("scope") == "technology" and h.get("technology")]
+    total_hints = [h for h in hints if (h.get("scope") or "total") == "total"]
+    if not total_hints and not tech_hints:
+        total_hints = hints
+    tech_required = {_normalize_skill(h["technology"]) for h in tech_hints}
+
+    seen = set()
+    cloud_hits = []
+    for skill in COMMON_TECH_SKILLS:
+        norm = _normalize_skill(skill)
+        if norm in seen or norm in tech_required:
+            continue
+        m = _skill_token(skill).search(jd_lower, scan_start)
+        if not m:
+            continue
+        seen.add(norm)
+        category = NICE_TO_HAVE if m.start() >= nice_start else MUST_HAVE
+        if norm in resume_skills:
+            status = MET
+        elif _CONCEPT_GROUPS.get(norm, set()) & resume_skills:
+            status = PARTIAL
+        else:
+            status = MISSING
+        if norm in _CLOUD_PROVIDERS:
+            cloud_hits.append((skill, category, status))
+            continue
+        reqs.append(
+            RequirementItem(text=skill, kind="skill", category=category, status=status)
+        )
+
+    # Collapse "one of AWS/GCP/Azure"-style alternatives into a single requirement so
+    # a candidate with any one provider is not penalized for the others.
+    if len(cloud_hits) > 1:
+        cstatus = MET if any(s == MET for _, _, s in cloud_hits) else (
+            PARTIAL if any(s == PARTIAL for _, _, s in cloud_hits) else MISSING
+        )
+        ccategory = MUST_HAVE if any(c == MUST_HAVE for _, c, _ in cloud_hits) else NICE_TO_HAVE
+        names = "/".join(dict.fromkeys(s for s, _, _ in cloud_hits))
+        reqs.append(
+            RequirementItem(
+                text=f"Cloud (one of {names})",
+                kind="skill",
+                category=ccategory,
+                status=cstatus,
+            )
+        )
+    else:
+        for s, c, st in cloud_hits:
+            reqs.append(RequirementItem(text=s, kind="skill", category=c, status=st))
+
+    # Technology-scoped years (e.g. "3 years Golang"): the resume confirms presence of the
+    # technology but not the exact tenure, so presence earns partial — never a full "met".
+    for h in tech_hints[:3]:
+        tech = h.get("technology")
+        min_y = h.get("min_years")
+        tech_years = resume_signals.estimate_technology_years(parsed_resume, tech)
+        present = _normalize_skill(tech) in resume_skills or bool(
+            re.search(
+                r"(?<![A-Za-z0-9])" + re.escape(str(tech).lower()) + r"(?![A-Za-z0-9])",
+                resume_blob,
+            )
+        )
+        if tech_years is not None:
+            evidence = f"~{tech_years:g} yrs"
+            if min_y is None or tech_years >= min_y:
+                status = MET
+            elif tech_years >= min_y * 0.7:
+                status = PARTIAL
+            else:
+                status = MISSING
+        else:
+            # Present somewhere in the resume but no dated work history mentions it ->
+            # partial, and explicitly flagged as unconfirmable (never a silent "met").
+            status = PARTIAL if present else MISSING
+            evidence = "unconfirmed" if present else "not found"
+        label = f"{min_y:g}+ years {tech}" if min_y is not None else f"{tech} experience"
+        reqs.append(
+            RequirementItem(
+                text=label,
+                kind="experience_years",
+                category=MUST_HAVE,
+                status=status,
+                scope="technology",
+                technology=tech,
+                min_years=min_y,
+                max_years=h.get("max_years"),
+                evidence=evidence,
+            )
+        )
+
+    # Total years of experience
+    for h in total_hints[:1]:
+        min_y = h.get("min_years")
+        if min_y is None:
+            continue
+        if candidate_years is None:
+            status = UNKNOWN
+        elif candidate_years >= min_y:
+            status = MET
+        elif candidate_years >= min_y * 0.7:
+            status = PARTIAL
+        else:
+            status = MISSING
+        reqs.append(
+            RequirementItem(
+                text=(h.get("snippet") or f"{min_y:g}+ years experience"),
+                kind="experience_years",
+                category=MUST_HAVE,
+                status=status,
+                scope="total",
+                min_years=min_y,
+                max_years=h.get("max_years"),
+            )
+        )
+
+    # Seniority level
+    job_sen = jd_signals.seniority_level(job_title or "")
+    cand_sen = resume_signals.latest_seniority(parsed_resume)
+    if job_sen and job_sen != "unknown":
+        jr = _SENIORITY_RANK.get(job_sen, 3)
+        cr = _SENIORITY_RANK.get(cand_sen, 3)
+        status = MET if cr >= jr else (PARTIAL if cr == jr - 1 else MISSING)
+        reqs.append(
+            RequirementItem(
+                text=f"{job_sen} level", kind="seniority", category=MUST_HAVE, status=status
+            )
+        )
+
+    # Education — a higher degree satisfies a lower requirement, never the reverse.
+    education = jd_signals.parse_education(jd)
+    if education:
+        # "Bachelor's or Master's" lists alternatives -> the lowest listed level is the
+        # requirement; a higher degree still satisfies it.
+        req_rank = min(_EDU_RANK.get(level, 0) for level in education)
+        edu_entries = (parsed_resume or {}).get("education") or []
+        edu_text = " ".join(str(e.get("degree") or "") for e in edu_entries)
+        cand_levels = jd_signals.parse_education(edu_text)
+        if not cand_levels and resume_text:
+            cand_levels = jd_signals.parse_education(resume_text)
+        cand_rank = max((_EDU_RANK.get(level, 0) for level in cand_levels), default=None)
+        if cand_rank is None:
+            # No verifiable degree on the resume -> cannot judge (excluded from scoring).
+            status = UNKNOWN
+        else:
+            status = MET if cand_rank >= req_rank else MISSING
+        reqs.append(
+            RequirementItem(
+                text=f"Education: {', '.join(education)}",
+                kind="education",
+                category=MUST_HAVE,
+                status=status,
+                evidence="",
+            )
+        )
+
+    # Certifications (nice-to-have; skip ones already covered as skills)
+    for cert in jd_signals.parse_certifications(jd):
+        if _normalize_skill(cert) in seen:
+            continue
+        reqs.append(
+            RequirementItem(
+                text=cert,
+                kind="certification",
+                category=NICE_TO_HAVE,
+                status=MET if cert.lower() in resume_blob else MISSING,
+            )
+        )
+
+    return RequirementAssessment(
+        requirements=reqs,
+        summary=f"Deterministic assessment: {len(reqs)} requirements extracted from JD signals.",
     )
 
 

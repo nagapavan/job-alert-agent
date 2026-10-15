@@ -11,8 +11,9 @@ Quick-lookup reference for locating where changes should be made.
 - `TokenTracker` — thread-safe token counting & cost estimation.
 - `call_lmstudio` / `call_ollama` / `call_openai` / `call_gemini` / `call_anthropic` — per-provider inference wrappers.
 - `get_model_for_tier` / `resolve_task_routing` — model selection by task complexity.
-- `generate_text` / `generate_structured` — unified generation entry points (with priority queueing).
+- `generate_text` / `generate_structured` — unified generation entry points (with priority queueing); both accept `max_retries` and `trace_id`.
 - `detect_active_llm_provider` — runtime provider discovery.
+- `JudgeVerdict` / `judge_output` — reusable quality Judge gate (score 0-5, bounded re-generation, non-fatal) used by `chat_agent.py`.
 - `analyze_job_match` — resume↔JD matching; returns `match_score=None` (+ `error`) on failure — never fabricates a score.
 - `generate_interview_questions` — JD-derived interview questions with STAR scaffolds & resume-grounded suggested answers.
 - `generate_embeddings` / `cosine_similarity` — semantic similarity primitives.
@@ -38,6 +39,7 @@ Quick-lookup reference for locating where changes should be made.
 - `ApplicationEvent` — application lifecycle event records.
 - `ApplicationQuestionAnswer` — Q&A persistence for applications.
 - `Job.match_scored` — Boolean flag set True only by a real AI analysis (discovery baselines stay False → UI "not AI-scored" cue); auto-migrated in `init_db()`.
+- `Job.sync_batch_id` — review marker set on jobs newly ingested by a LinkedIn sync run; cleared on any status change (drives the "new from sync" review banner). Auto-migrated in `init_db()`.
 - `prune_operation_logs` — caps `OperationLog` rows by count/age; `OperationLog.created_at` is indexed.
 
 ### `backend/gmail_client.py`
@@ -53,11 +55,26 @@ Quick-lookup reference for locating where changes should be made.
 - `LLMQueueManager` — local models run at concurrency 1 with pacing; cloud models scale to `MAX_CONCURRENCY`.
 - `set_concurrency` / `sync_provider_concurrency` — runtime tuning.
 
+### `backend/llm_resilience.py`
+**Responsibility:** Transient-failure retry / exponential backoff for provider calls.
+- `with_retry(step_name, fn, *, task_type, max_retries, backoff_base, backoff_max, jitter)` — retries 429/5xx/connection/timeout; non-transient errors propagate immediately.
+- `is_retryable(exc)` — retryable-exception classifier (429 + 5xx + conn + timeout).
+- `resolve_retry_config` — per-`TASK_PROFILES` override, then global `LLM_MAX_RETRIES` etc.
+- Wired into `ai_helper._execute_generate_text` via `_call_provider_with_retry`.
+
+### `backend/prompts.py`
+**Responsibility:** Central home for LLM system prompts (no hard-coded responses outside prompts).
+- `JOB_MATCH_SCORING_SYSTEM`, `JUDGE_SYSTEM` — constant templates.
+- `interview_questions_system(num_questions)` / `career_copilot_system(**kwargs)` — builders.
+- Consumed by `ai_helper.py` (match/interview/judge) and `chat_agent.py` (copilot).
+
 ### `backend/main.py`
 **Responsibility:** FastAPI app, routes, CORS/auth firewall, background-task endpoints.
 - `POST /api/match/analyze` — stateless structured resume↔job match analysis (`match_score`, `strengths`, `gaps`, `feedback`); falls back to the active resume and never fabricates a score (`match_score=None` + `error` on failure).
 - `POST /api/jobs/{job_id}/interview-questions` — JD-derived questions with STAR scaffolds & resume-grounded answers (400 without an active resume, 404 missing job, 502 on generation error).
 - `POST /api/tasks/sync/all` — one-shot "Sync All" orchestrator (ATS portals → Google Jobs → LinkedIn → application-status sync) with per-stage skip/fail handling.
+- `GET /api/linkedin/last-sync` — latest LinkedIn sync batch summary (batch id, added counts, pending-review count) powering the SPA "N new from sync" review banner.
+- `GET /api/jobs` — job list; supports `status`, `source_type` (linkedin/direct/email), `sync_batch`, and `new_from_sync` filters for the review queue.
 
 ### `backend/observability.py`
 **Responsibility:** Structured logging & LLM telemetry.
@@ -224,6 +241,54 @@ llm_queue.sync_provider_concurrency(is_local=True)   # 1 worker / 0.2s pacing
 status = llm_queue.get_status()                       # depth, backpressure, est_wait
 llm_queue.clear_background_tasks()                    # drain only BACKGROUND items
 ```
+
+### `backend/llm_resilience.py` — transient-failure retry / exponential backoff
+
+```python
+from backend.llm_resilience import with_retry, is_retryable
+
+# Wraps a provider call; retries 429/5xx/connection/timeout with backoff+jitter.
+# max_retries resolves from per-TASK_PROFILE override then LLM_MAX_RETRIES (default 3).
+result = with_retry("llm:openai", lambda: handler(...), task_type="job_match_scoring")
+
+is_retryable(ConnectionError("down"))   # True
+is_retryable(ValueError("bad input"))   # False (propagates immediately)
+```
+
+Wired into `ai_helper._execute_generate_text` at all three provider call sites
+(direct registry, alias, and fallback cascade) via `_call_provider_with_retry`. Non-
+transient errors (e.g. HTTP 400) propagate immediately so the fallback cascade still works.
+
+### `backend/prompts.py` — centralized LLM system prompts
+
+```python
+from backend.prompts import (
+    JOB_MATCH_SCORING_SYSTEM, JUDGE_SYSTEM, interview_questions_system, career_copilot_system,
+)
+
+sys = interview_questions_system(num_questions=6)
+sys = career_copilot_system(candidate_name=..., total_jobs=10, ...)
+```
+
+The canonical home for agent instruction text (no hard-coded responses outside prompts).
+Migrated subset: match scoring, interview questions, Career Copilot, and the Judge prompt.
+
+### `backend/ai_helper.py` — reusable quality Judge gate (`judge_output`)
+
+```python
+from backend.ai_helper import judge_output
+
+res = judge_output(
+    ai_reply,
+    context=user_prompt,
+    regenerator=lambda critique: generate_text(..., f"fix: {critique}"),
+    max_regenerations=1,
+)
+# res = {"verdict": JudgeVerdict|None, "text": final, "regenerated": bool, "regenerations": int}
+```
+
+Non-fatal on Judge/regenerator failure (keeps original text). Wired into
+`chat_agent.process_message` Career Copilot replies behind `COPILOT_JUDGE_ENABLED`.
 
 ### `backend/database.py` — session dependency & helpers
 

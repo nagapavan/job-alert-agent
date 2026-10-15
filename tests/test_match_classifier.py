@@ -7,6 +7,7 @@ from backend.match_classifier import (
     MatchFeatures,
     SimpleHeuristicClassifier,
     extract_match_features,
+    build_deterministic_assessment,
 )
 
 
@@ -138,3 +139,153 @@ class TestExtractMatchFeatures:
         jd_hints = {"education_mentioned": False}
         features = extract_match_features(None, jd_hints, assessment=None)
         assert features.education_match == 0.5
+
+
+class TestDeterministicAssessment:
+    """Deterministic (no-LLM) requirement extraction fed to the classifier."""
+
+    @pytest.mark.parametrize(
+        "jd, parsed, resume_text, skill, expected_status",
+        [
+            ("We need Python, Kubernetes, Terraform and AWS.", None,
+             "Skills: Python, AWS, Kubernetes.", "Python", "met"),
+            ("We need Python, Kubernetes, Terraform and AWS.", None,
+             "Skills: Python, AWS, Kubernetes.", "Kubernetes", "met"),
+            ("We need Python, Kubernetes, Terraform and AWS.", None,
+             "Skills: Python, AWS, Kubernetes.", "Terraform", "missing"),
+            ("Requires Python and Go.", None,
+             "I have 5 years of Python experience.", "Python", "met"),
+            ("Requires Python and Go.", None,
+             "I have 5 years of Python experience.", "Go", "missing"),
+            ("Must know Kubernetes and Docker.", {"skills": ["Kubernetes"]},
+             "", "Kubernetes", "met"),
+            ("Must know Kubernetes and Docker.", {"skills": ["Kubernetes"]},
+             "", "Docker", "missing"),
+        ],
+    )
+    def test_skill_status(self, jd, parsed, resume_text, skill, expected_status):
+        a = build_deterministic_assessment(
+            jd, parsed, resume_text=resume_text, job_title="Engineer"
+        )
+        by_text = {r.text: r.status for r in a.requirements}
+        assert by_text[skill] == expected_status
+
+    @pytest.mark.parametrize(
+        "skill, expected_category",
+        [("Python", "must_have"), ("Rust", "nice_to_have")],
+    )
+    def test_preferred_section_marks_nice_to_have(self, skill, expected_category):
+        jd = (
+            "Minimum Qualifications: Python required.\n"
+            "Preferred Qualifications: Rust experience."
+        )
+        a = build_deterministic_assessment(jd, {"skills": ["Python", "Rust"]})
+        by_text = {r.text: r.category for r in a.requirements}
+        assert by_text[skill] == expected_category
+
+    @pytest.mark.parametrize(
+        "jd_degree, resume_degree, expected_status",
+        [
+            ("Bachelor's degree required.", "Master of Science in CS", "met"),
+            ("Bachelor's degree required.", "PhD in Computer Science", "met"),
+            ("Bachelor's degree required.", "B.Tech in Computer Science", "met"),
+            ("Bachelor's degree required.", "Associate degree", "missing"),
+            ("Master's degree required.", "Bachelor of Science", "missing"),
+            ("Master's degree required.", "M.Tech in CS", "met"),
+            ("Bachelor's or Master's degree required.", "B.Tech in CS", "met"),
+            ("Bachelor's or Master's degree required.", "M.Tech in CS", "met"),
+            ("Bachelor's degree required.", "", "unknown"),
+        ],
+    )
+    def test_education_level_comparison(self, jd_degree, resume_degree, expected_status):
+        parsed = {"education": [{"degree": resume_degree}]} if resume_degree else None
+        a = build_deterministic_assessment(jd_degree, parsed, job_title="Engineer")
+        edu = [r for r in a.requirements if r.kind == "education"]
+        assert len(edu) == 1
+        assert edu[0].status == expected_status
+
+    @pytest.mark.parametrize(
+        "resume_skills, expected_status",
+        [(["Golang"], "partial"), (["Python"], "missing")],
+    )
+    def test_technology_years_not_over_credited(self, resume_skills, expected_status):
+        """A "N years <Tech>" requirement is partial (presence) or missing — never "met"."""
+        jd = "What You Bring: At least 3-years experience in Golang."
+        a = build_deterministic_assessment(jd, {"skills": resume_skills}, job_title="Engineer")
+        years = [r for r in a.requirements if r.technology == "Golang"]
+        assert len(years) == 1
+        assert years[0].status == expected_status
+        # Presence must not also be credited as a separate plain skill.
+        assert not [r for r in a.requirements if r.kind == "skill" and r.text == "Golang"]
+
+    def test_technology_years_met_when_dated_evidence_supports(self):
+        jd = "What You Bring: 3+ years of Java experience."
+        parsed = {
+            "skills": ["Java"],
+            "experience": [
+                {"title": "Engineer", "dates": "2014 - 2020", "details": "Java services"}
+            ],
+        }
+        a = build_deterministic_assessment(jd, parsed, job_title="Engineer")
+        java = [r for r in a.requirements if r.technology == "Java"]
+        assert len(java) == 1
+        assert java[0].status == "met"
+        assert "yrs" in java[0].evidence
+
+    def test_skills_in_about_section_ignored(self):
+        """Skills in company/marketing prose (the intro block) are ignored."""
+        jd = (
+            "About Us: we maintain 40-year old C++ code.\n"
+            "What You Bring: Python experience."
+        )
+        a = build_deterministic_assessment(jd, {"skills": ["Python"]}, job_title="Engineer")
+        skill_texts = {r.text for r in a.requirements if r.kind == "skill"}
+        assert "Python" in skill_texts
+        assert "C++" not in skill_texts
+
+    def test_skills_before_requirements_heading_are_captured(self):
+        """A skill list before a later "Requirements" heading must not be dropped."""
+        jd = "We need Python and Go engineers.\n\nRequirements: strong communication."
+        a = build_deterministic_assessment(jd, None, resume_text="Skills: Python, Go.", job_title="Engineer")
+        skill_texts = {r.text for r in a.requirements if r.kind == "skill"}
+        assert {"Python", "Go"} <= skill_texts
+
+    def test_intro_footer_does_not_wipe_requirements(self):
+        """A trailing "About Us" (nav/footer) must not cause the whole JD to be skipped."""
+        jd = (
+            "We need Python and Kubernetes engineers.\n\n"
+            "About Us: we are a great company."
+        )
+        a = build_deterministic_assessment(jd, None, resume_text="Skills: Python.", job_title="Engineer")
+        skill_texts = {r.text for r in a.requirements if r.kind == "skill"}
+        assert {"Python", "Kubernetes"} <= skill_texts
+
+    def test_ideally_section_marks_nice_to_have(self):
+        jd = "What You Bring: Python required.\nIdeally, you'll also have Rust experience."
+        a = build_deterministic_assessment(jd, {"skills": ["Python", "Rust"]})
+        by_text = {r.text: r.category for r in a.requirements}
+        assert by_text["Rust"] == "nice_to_have"
+
+    def test_cloud_providers_collapse_to_one_requirement(self):
+        a = build_deterministic_assessment(
+            "Managing Cloud Infrastructure on one of the Hyperscalers: AWS, GCP, or Azure.",
+            {"skills": ["AWS"]},
+            job_title="Staff Engineer",
+        )
+        cloud = [r for r in a.requirements if r.text.startswith("Cloud (one of")]
+        assert len(cloud) == 1
+        assert cloud[0].status == "met"
+
+    @pytest.mark.parametrize(
+        "jd",
+        [
+            "We are a small team that values curiosity and craft.",
+            "Join our mission to do great things.",
+            "About us: we build tools for people.",
+        ],
+    )
+    def test_signal_less_jd_yields_no_requirements(self, jd):
+        a = build_deterministic_assessment(
+            jd, None, resume_text="Alice.", job_title="Engineer"
+        )
+        assert a.requirements == []

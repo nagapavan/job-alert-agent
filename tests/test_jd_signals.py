@@ -27,6 +27,12 @@ def test_parse_experience_at_least():
     assert hints[0]["scope"] == "total"  # "professional" is not a technology
 
 
+def test_parse_experience_more_than():
+    hints = parse_experience("More than 10 years applied experience.")
+    assert hints and hints[0]["min_years"] == 10
+    assert hints[0]["scope"] == "total"
+
+
 def test_parse_experience_technology_specific():
     hints = parse_experience("3+ years of Kubernetes in production.")
     assert hints[0]["scope"] == "technology"
@@ -36,6 +42,19 @@ def test_parse_experience_technology_specific():
 def test_parse_experience_dedupes():
     hints = parse_experience("3+ years required. 3+ years minimum.")
     assert len(hints) == 1
+
+
+def test_parse_experience_hyphenated_technology():
+    hints = parse_experience("At least 3-years experience in Golang programming.")
+    tech = [h for h in hints if h["scope"] == "technology"]
+    assert len(tech) == 1
+    assert tech[0]["technology"] == "Golang"
+    assert tech[0]["min_years"] == 3
+
+
+def test_parse_education_abbreviations():
+    assert parse_education("B.Tech in Computer Science") == ["bachelor"]
+    assert parse_education("M.Tech / M.E. preferred") == ["master"]
 
 
 def test_seniority_levels():

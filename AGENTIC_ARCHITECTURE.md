@@ -54,20 +54,20 @@ graph TD
 
 ## 2. AI Autonomy Spectrum: Where This System Stands
 
-| Level | Classification | Description | Status in This System |
-| :---: | :--- | :--- | :---: |
-| **Level 0** | **Static Software** | Hardcoded scripts without machine learning or NLP. | ❌ Surpassed |
-| **Level 1** | **LLM Wrapper** | Single-prompt chatbots without state or tools (e.g. standard ChatGPT). | ❌ Surpassed |
-| **Level 2** | **Workflow Chain** | Multi-step deterministic pipelines with chained LLM prompts. | ✅ **Core Base** |
-| **Level 3** | **Interactive Copilot** | Human-in-the-loop agent with tools, state memory, and guided actuation. | ✅ **Implemented** |
-| **Level 4** | **Autonomous Agent** | Autonomous multi-turn ReAct loop with dynamic tool selection & self-correction. | ✅ **Implemented (`CareerChatAgent`)** |
-| **Level 5** | **Fully Autonomous Swarm** | Unsupervised multi-agent swarms operating without human intervention. | 🔮 Backlog |
+|    Level    | Classification             | Description                                                                     |         Status in This System          |
+| :---------: | :------------------------- | :------------------------------------------------------------------------------ | :------------------------------------: |
+| **Level 0** | **Static Software**        | Hardcoded scripts without machine learning or NLP.                              |              ❌ Surpassed              |
+| **Level 1** | **LLM Wrapper**            | Single-prompt chatbots without state or tools (e.g. standard ChatGPT).          |              ❌ Surpassed              |
+| **Level 2** | **Workflow Chain**         | Multi-step deterministic pipelines with chained LLM prompts.                    |            ✅ **Core Base**            |
+| **Level 3** | **Interactive Copilot**    | Human-in-the-loop agent with tools, state memory, and guided actuation.         |           ✅ **Implemented**           |
+| **Level 4** | **Autonomous Agent**       | Autonomous multi-turn ReAct loop with dynamic tool selection & self-correction. | ✅ **Implemented (`CareerChatAgent`)** |
+| **Level 5** | **Fully Autonomous Swarm** | Unsupervised multi-agent swarms operating without human intervention.           |               🔮 Backlog               |
 
 ---
 
 ## 3. What is an "Agentic Harness"?
 
-In modern AI systems engineering, an **Agentic Harness** (also called an *Agent Runtime Scaffold* or *Test & Execution Harness*) is the structural software framework that surrounds, controls, monitors, sandboxes, and evaluates an autonomous AI agent.
+In modern AI systems engineering, an **Agentic Harness** (also called an _Agent Runtime Scaffold_ or _Test & Execution Harness_) is the structural software framework that surrounds, controls, monitors, sandboxes, and evaluates an autonomous AI agent.
 
 If the LLM is the **engine**, the **Agentic Harness** is the **chassis, transmission, safety brakes, sensors, telemetry, and steering wheel**.
 
@@ -111,12 +111,14 @@ flowchart TD
 **Yes — and our codebase is fundamentally structured as an Agentic Harness.**
 
 Without an agentic harness:
-* Raw LLMs hallucinate non-existent API parameters.
-* Local GPU hardware overheats and throttles when flooded with unpaced requests.
-* Third-party search engines block requests with bot challenges (HTTP 202/429).
-* Applications are submitted without candidate verification or safety review.
+
+- Raw LLMs hallucinate non-existent API parameters.
+- Local GPU hardware overheats and throttles when flooded with unpaced requests.
+- Third-party search engines block requests with bot challenges (HTTP 202/429).
+- Applications are submitted without candidate verification or safety review.
 
 By wrapping our AI components in this structured harness, the system achieves:
+
 1. **Local-First Privacy**: Sensitive resume data is encrypted (AES-256 Fernet) and processed on-device.
 2. **Deterministic Reliability**: Business logic (status changes, prunes, database schema auto-migrations) is rock-solid.
 3. **Autonomous Adaptability**: The AI Career Copilot (`CareerChatAgent`) can dynamically inspect your career pipeline and execute tasks on demand.
@@ -128,7 +130,7 @@ By wrapping our AI components in this structured harness, the system achieves:
 This section documents the concrete AI/ML architecture the harness is built on: the model
 topology, the tiered routing "brain", the reasoning/verification loop, and the
 retrieval-augmented memory subsystem. `DESIGN_DIAGRAMS.md` renders the same topology as
-diagrams; this document explains the *why* and the exact runtime contracts.
+diagrams; this document explains the _why_ and the exact runtime contracts.
 
 ### 5.1 Model Topology — Local-First with Opt-In Cloud Fallback
 
@@ -146,21 +148,21 @@ def call_gemini(...)      # same signature
 def call_anthropic(...)   # same signature
 ```
 
-| Priority | Provider ID | Name | Local? | Default endpoint / SDK |
-| :---: | :--- | :--- | :---: | :--- |
-| 1 | `lmstudio` | LM Studio | ✅ | `http://localhost:1234/v1` (OpenAI-compatible) |
-| 2 | `unsloth` | Unsloth | ✅ | `http://localhost:8008/v1` (OpenAI-compatible) |
-| 3 | `ollama` | Ollama | ✅ | `http://localhost:11434` (native `/api/chat`, `/api/embeddings`) |
-| 4 | `openai` | OpenAI | ☁️ | `gpt-4o` / `gpt-4o-mini` |
-| 5 | `gemini` | Google Gemini | ☁️ | `gemini-1.5-pro` / `gemini-1.5-flash` |
-| 6 | `anthropic` | Anthropic Claude | ☁️ | `claude-3-5-sonnet` / `claude-3-5-haiku` |
+| Priority | Provider ID | Name             | Local? | Default endpoint / SDK                                           |
+| :------: | :---------- | :--------------- | :----: | :--------------------------------------------------------------- |
+|    1     | `lmstudio`  | LM Studio        |   ✅   | `http://localhost:1234/v1` (OpenAI-compatible)                   |
+|    2     | `unsloth`   | Unsloth          |   ✅   | `http://localhost:8008/v1` (OpenAI-compatible)                   |
+|    3     | `ollama`    | Ollama           |   ✅   | `http://localhost:11434` (native `/api/chat`, `/api/embeddings`) |
+|    4     | `openai`    | OpenAI           |   ☁️   | `gpt-4o` / `gpt-4o-mini`                                         |
+|    5     | `gemini`    | Google Gemini    |   ☁️   | `gemini-1.5-pro` / `gemini-1.5-flash`                            |
+|    6     | `anthropic` | Anthropic Claude |   ☁️   | `claude-3-5-sonnet` / `claude-3-5-haiku`                         |
 
-* **Auto-detection**: `detect_active_llm_provider()` probes local servers in priority order and
+- **Auto-detection**: `detect_active_llm_provider()` probes local servers in priority order and
   reports the first reachable one (`backend/main.py::GET /api/llm/status`).
-* **Cloud is opt-in**: cloud providers are skipped in the fallback cascade unless
+- **Cloud is opt-in**: cloud providers are skipped in the fallback cascade unless
   `is_cloud_fallback_allowed()` is true (env `ALLOW_CLOUD_FALLBACK` **or** the persisted
   Settings toggle). This preserves local-first privacy by default.
-* **Per-tier model ids**: `get_model_for_tier(provider_id, complexity)` maps the task tier to a
+- **Per-tier model ids**: `get_model_for_tier(provider_id, complexity)` maps the task tier to a
   concrete model id per provider, e.g. Ollama → `FAST_TIER_MODEL`/`STANDARD_TIER_MODEL`/`DEEP_TIER_MODEL`
   (`qwen2.5:3b` / `llama3:8b` / `llama3.3:70b` by default), OpenAI → `gpt-4o-mini`/`gpt-4o`,
   Gemini → `gemini-1.5-flash`/`gemini-1.5-pro`.
@@ -190,11 +192,11 @@ TASK_PROFILES = {
 }
 ```
 
-| Tier | Used for | Sampling (default profile values) | Target models |
-| :--- | :--- | :--- | :--- |
-| **FAST** | Skill extraction, JSON repair, boolean decisions, email classification, title cleanup | `temperature=0.0`, `max_tokens=100–1000` | Local 3B/7B, Gemini Flash, GPT-4o-mini, Claude Haiku |
-| **STANDARD** | Resume parsing, match scoring, cold outreach, company due diligence, application essay, grounded pitch | `temperature=0.1–0.3` (0.8 for grounded pitch), `max_tokens=350–1500` | Local 8B, balanced slot |
-| **DEEP_REASONING** | Cover letters, tailored resume points, STAR interview coaching, consolidated packages, company-intel synthesis | `temperature=0.3–0.8`, `max_tokens=1800–2500` | Local 70B/14B, GPT-4o, Gemini Pro, Claude Sonnet |
+| Tier               | Used for                                                                                                       | Sampling (default profile values)                                     | Target models                                        |
+| :----------------- | :------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------- | :--------------------------------------------------- |
+| **FAST**           | Skill extraction, JSON repair, boolean decisions, email classification, title cleanup                          | `temperature=0.0`, `max_tokens=100–1000`                              | Local 3B/7B, Gemini Flash, GPT-4o-mini, Claude Haiku |
+| **STANDARD**       | Resume parsing, match scoring, cold outreach, company due diligence, application essay, grounded pitch         | `temperature=0.1–0.3` (0.8 for grounded pitch), `max_tokens=350–1500` | Local 8B, balanced slot                              |
+| **DEEP_REASONING** | Cover letters, tailored resume points, STAR interview coaching, consolidated packages, company-intel synthesis | `temperature=0.3–0.8`, `max_tokens=1800–2500`                         | Local 70B/14B, GPT-4o, Gemini Pro, Claude Sonnet     |
 
 > **Note on `top_p`**: each profile also declares a `top_p` value (0.80–0.95) for
 > documentation/design intent, but the current `resolve_task_routing` return contract and the
@@ -207,7 +209,7 @@ TASK_PROFILES = {
 
 ### 5.3 The Reasoning Architecture: Deterministic Scaffold + LLM Reasoning + Verifier
 
-A recurring design question is *"how does the agent reason?"* The answer is deliberately **not**
+A recurring design question is _"how does the agent reason?"_ The answer is deliberately **not**
 a single free-form chain-of-thought or an unbounded ReAct loop. The system composes reasoning in
 five layers, using the cheapest mechanism that can answer each question:
 
@@ -258,12 +260,12 @@ embeddings and **hybrid scoring** (cosine similarity blended with lexical token 
 `cosine_similarity(vec1, vec2)` returns `dot / (‖v1‖·‖v2‖)`, safely returning `0.0` on empty,
 mismatched-length, or zero-norm vectors.
 
-| Memory bank | Table | Purpose | Retrieval | Threshold |
-| :--- | :--- | :--- | :--- | :--- |
-| Job embeddings | `jobs.embedding` | Semantic job search / copilot discovery | `compute_cosine_similarity` in `CareerChatAgent._execute_job_search` | boost when `sim > 0.4` |
-| Q&A memory | `application_question_answers` | Reuse screener/essay answers (1-click) | `search_qa_memory` (`top_k=3`) | `min_similarity=0.65` |
-| Essay/answer cache | `application_question_answers` | Zero-token cache-first screener answers | `resolve_semantic_essay_cache` | `threshold=0.85` (chat uses `0.82`) |
-| Negative role memory | `dismissed_job_patterns` | Zero-token ignore filter | `check_semantic_dismissal` | `threshold=0.80` |
+| Memory bank          | Table                          | Purpose                                 | Retrieval                                                            | Threshold                           |
+| :------------------- | :----------------------------- | :-------------------------------------- | :------------------------------------------------------------------- | :---------------------------------- |
+| Job embeddings       | `jobs.embedding`               | Semantic job search / copilot discovery | `compute_cosine_similarity` in `CareerChatAgent._execute_job_search` | boost when `sim > 0.4`              |
+| Q&A memory           | `application_question_answers` | Reuse screener/essay answers (1-click)  | `search_qa_memory` (`top_k=3`)                                       | `min_similarity=0.65`               |
+| Essay/answer cache   | `application_question_answers` | Zero-token cache-first screener answers | `resolve_semantic_essay_cache`                                       | `threshold=0.85` (chat uses `0.82`) |
+| Negative role memory | `dismissed_job_patterns`       | Zero-token ignore filter                | `check_semantic_dismissal`                                           | `threshold=0.80`                    |
 
 **Hybrid scoring** — because pure hash embeddings are weak, each lookup blends signals, e.g. for
 essay answers: `effective = max(cos_sim, 0.4*cos_sim + 0.6*token_sim)` (token blend applied only
@@ -282,20 +284,20 @@ intelligence, and decrypted resume into a grounded, role-specific interview-prep
 
 Generated application text is treated as untrusted until a second model pass verifies it:
 
-* **Grounding judges** — `verify_and_judge_grounded_pitch` and
+- **Grounding judges** — `verify_and_judge_grounded_pitch` and
   `verify_and_judge_grounded_cover_letter` prompt a "strict LLM Fact-Checking Judge" to return a
   schema-validated `PitchVerificationResult`
   (`is_grounded`, `hallucinated_entities`, `critique`, `corrected_pitch`). The target company/role
-  are explicitly *provided* context and are never treated as hallucinations; only *past*
+  are explicitly _provided_ context and are never treated as hallucinations; only _past_
   employers, titles, schools, certifications, and numeric metrics are verified against resume
   ground truth.
-* **Correction guard** — a proposed correction is accepted only if `_correction_preserves_target`
+- **Correction guard** — a proposed correction is accepted only if `_correction_preserves_target`
   passes and the corrected text clears a minimum length (pitch `>30`, cover letter `>80` chars),
   preventing the judge from silently stripping the target company.
-* **Anti-slop policing** — a 24-entry `BANNED_AI_SLOP_PHRASES` list ("thrilled to apply",
+- **Anti-slop policing** — a 24-entry `BANNED_AI_SLOP_PHRASES` list ("thrilled to apply",
   "passionate about", "testament to", …) is embedded directly into generation **and** verification
   prompts.
-* **No-Fabrication Contract** — failure is never papered over with a plausible default. When
+- **No-Fabrication Contract** — failure is never papered over with a plausible default. When
   generation or verification fails, the surface returns an explicit empty/error signal rather than
   an invented value: match scores return `None` (discovery baselines keep `match_scored=False` →
   "not AI-scored" cue), single tailor returns HTTP 502, bulk tailor marks the job `failed`, cold
@@ -314,7 +316,7 @@ contracts:
 1. **Persona** — "expert technical recruiter", "executive career coach", "strict fact-checking judge".
 2. **Strict schema** — either an inline JSON schema or a Pydantic model passed to
    `generate_structured`.
-3. **Length bounds** — e.g. cover letter 3–4 paragraphs; grounded pitch *strictly 3–5 sentences*;
+3. **Length bounds** — e.g. cover letter 3–4 paragraphs; grounded pitch _strictly 3–5 sentences_;
    cold note under `max_chars` (default 300).
 4. **Grounding rule** — "only reference employers/titles/metrics present in the APPLICANT RESUME".
 5. **Anti-slop rule** — explicit ban list of generic AI phrases.
@@ -388,17 +390,17 @@ The `task_type` becomes `star_interview_prep` for interview/mock/STAR/behavioral
 
 `generate_structured(schema, ...)` forces JSON mode and validates with Pydantic V2. Recovery is
 three-stage: `model_validate_json(raw)` → `_clean_json_string(raw)` → wrap a bare JSON array into
-`{"results": [...]}` for batch schemas. `_clean_json_string` strips ```` ```json ```` fences and
+`{"results": [...]}` for batch schemas. `_clean_json_string` strips ` ```json ` fences and
 `<think>…</think>` blocks, then isolates the outermost `[...]`/`{...}`.
 
 Per-provider schema handling in the clients:
 
-| Provider | Mechanism |
-| :--- | :--- |
-| OpenAI | `response_format={"type":"json_schema", "json_schema": {..., "strict": True}}` |
-| Gemini | `generationConfig.responseMimeType="application/json"` + `responseSchema` |
-| Anthropic | forced tool call (`tool_choice={"type":"tool","name":"record_structured_output"}`) |
-| Ollama | native `format = schema.model_json_schema()` |
+| Provider            | Mechanism                                                                                          |
+| :------------------ | :------------------------------------------------------------------------------------------------- |
+| OpenAI              | `response_format={"type":"json_schema", "json_schema": {..., "strict": True}}`                     |
+| Gemini              | `generationConfig.responseMimeType="application/json"` + `responseSchema`                          |
+| Anthropic           | forced tool call (`tool_choice={"type":"tool","name":"record_structured_output"}`)                 |
+| Ollama              | native `format = schema.model_json_schema()`                                                       |
 | LM Studio / Unsloth | system-prompt schema injection + `json_schema` response format (retry once without it on HTTP 400) |
 
 Alongside `JobMatchResult` and `ConsolidatedApplicationPackageSchema`, the interview-prep flow
@@ -424,9 +426,9 @@ human confirms (`submission_confirmed`).
 
 ### 6.5 Token-Efficient Prompting
 
-* **Task tiering** — small `max_tokens` budgets for FAST tasks.
-* **Zero-token filtering** — semantic dismissal runs before any match prompt.
-* **Cache-first answers** — verified answers are indexed and recalled at 0 tokens on the next match.
-* **Context truncation** — JDs trimmed (`clean_job_description` strips EEO/benefits boilerplate),
+- **Task tiering** — small `max_tokens` budgets for FAST tasks.
+- **Zero-token filtering** — semantic dismissal runs before any match prompt.
+- **Cache-first answers** — verified answers are indexed and recalled at 0 tokens on the next match.
+- **Context truncation** — JDs trimmed (`clean_job_description` strips EEO/benefits boilerplate),
   resume truncated to 4000 chars for embeddings, only the last 6 chat turns included.
-* **Batch prompting** — resume passed once across many jobs (see §6.2).
+- **Batch prompting** — resume passed once across many jobs (see §6.2).

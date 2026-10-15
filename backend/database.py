@@ -145,6 +145,11 @@ class Job(Base):
     # Assisted application: True only once the candidate confirms actual submission
     submission_confirmed = Column(Boolean, default=False)
 
+    # Review marker: id of the discovery-sync batch that ingested this job (e.g. a LinkedIn
+    # sync run). Non-null until the user acts on the job, so the UI can surface "new from sync"
+    # batches that still need review. Cleared on any status change.
+    sync_batch_id = Column(String(64), nullable=True, index=True)
+
     # True only when match_score came from a real AI analysis (vs. a source/baseline/saved default)
     match_scored = Column(Boolean, default=False)
     # Which scoring engine produced match_score (null for legacy/baseline scores) + when.
@@ -153,6 +158,12 @@ class Job(Base):
     # Deterministic engine's qualitative result (for UI display).
     match_band = Column(String(20), nullable=True)
     apply_recommendation = Column(String(30), nullable=True)
+
+    # Structured match insights (JSON lists) persisted at scoring time so the UI can render
+    # clean per-requirement bullets. Legacy rows stay NULL and the UI falls back to the
+    # flattened match_analysis narrative.
+    match_strengths_json = Column(Text, nullable=True)
+    match_gaps_json = Column(Text, nullable=True)
 
     # Timeline Dates
     applied_at = Column(DateTime, nullable=True)
@@ -164,6 +175,30 @@ class Job(Base):
     # Relationships
     company = relationship("Company", back_populates="jobs")
     events = relationship("ApplicationEvent", back_populates="job", cascade="all, delete-orphan")
+
+    @property
+    def match_strengths(self):
+        """Structured strengths list (parsed from ``match_strengths_json``), or None for legacy rows."""
+        return _parse_json_list(self.match_strengths_json)
+
+    @property
+    def match_gaps(self):
+        """Structured gaps list (parsed from ``match_gaps_json``), or None for legacy rows."""
+        return _parse_json_list(self.match_gaps_json)
+
+
+def _parse_json_list(raw):
+    """Best-effort parse of a persisted JSON list column; returns None when absent/invalid."""
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(value, list):
+        return None
+    return [str(item) for item in value if item is not None and str(item).strip()]
+
 
 class ApplicationEvent(Base):
     __tablename__ = "application_events"
@@ -314,6 +349,8 @@ DEFAULT_FEATURE_FLAGS = {
     "ats_ashby": True,
     # ---- Candidate-portal application-status sync (browser session) ----
     "ats_hirist": True,
+    # ---- UI insight surfaces ----
+    "resume_gap_insights": True,  # show structured resume-gap/strength insights per job
     # ---- Unofficial / ambiguous endpoints: opt-in with consent ----
     "ats_smartrecruiters": False,
     "ats_workable": False,
@@ -553,6 +590,12 @@ def init_db(custom_url: str = None):
                     conn.execute(text("ALTER TABLE jobs ADD COLUMN match_band VARCHAR(20);"))
                 if "apply_recommendation" not in col_names:
                     conn.execute(text("ALTER TABLE jobs ADD COLUMN apply_recommendation VARCHAR(30);"))
+                if "sync_batch_id" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN sync_batch_id VARCHAR(64);"))
+                if "match_strengths_json" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN match_strengths_json TEXT;"))
+                if "match_gaps_json" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN match_gaps_json TEXT;"))
 
         if "companies" in existing_tables:
             col_names = {c["name"] for c in inspector.get_columns("companies")}

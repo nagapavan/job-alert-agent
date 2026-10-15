@@ -1,4 +1,5 @@
 import pytest
+import urllib.parse
 from unittest.mock import patch, MagicMock
 
 from backend.playwright_app import (
@@ -147,6 +148,15 @@ def test_scan_gmail_for_job_alerts():
     assert emails[0]["sender"] == "Stripe Careers"
     assert emails[0]["category"] == "rejection"
     assert "moving forward" in emails[0]["snippet"]
+
+    # All-mail widening: the scan navigates straight to the global #search/ view
+    # (mailbox-wide), not the inbox, and widens the window to 90 days.
+    goto_url = mock_page.goto.call_args[0][0]
+    assert "#search/" in goto_url
+    decoded_query = urllib.parse.unquote_plus(goto_url.split("#search/", 1)[1])
+    assert "newer_than:90d" in decoded_query
+    assert "from:workday.com" in decoded_query
+    assert "#inbox" not in goto_url
 
 # -------------------------------------------------------------
 # Unit Tests: LinkedIn DOM Search

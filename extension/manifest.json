@@ -27,11 +27,8 @@
   "host_permissions": [
     "http://localhost:8000/*",
     "http://127.0.0.1:8000/*",
-    "https://*.greenhouse.io/*",
-    "https://*.lever.co/*",
-    "https://*.ashbyhq.com/*",
-    "https://*.myworkdayjobs.com/*",
-    "https://*.google.com/*"
+    "https://*/*",
+    "http://*/*"
   ],
   "content_scripts": [
     {

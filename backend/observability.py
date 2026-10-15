@@ -12,7 +12,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from backend.config import BASE_DIR
+from backend.config import BASE_DIR, LLM_AUDIT_CAPTURE_CONTENT, LLM_AUDIT_MAX_CONTENT_CHARS
 
 LOGS_DIR = BASE_DIR / "logs"
 APP_LOG_PATH = LOGS_DIR / "app.log"
@@ -172,37 +172,70 @@ def log_llm_event(
     temperature: float = 0.0,
     is_cache_hit: bool = False,
     task_type: str = "general",
-    error: Optional[str] = None
+    error: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    prompt_content: Optional[str] = None,
+    response_content: Optional[str] = None,
 ) -> None:
     """
     Logs structured audit telemetry for an LLM generation or memory cache resolution.
+
+    ``trace_id`` is a correlation id that links every LLM call inside one logical
+    operation (e.g. a sync, a match-analysis, a single assisted apply) so multi-step
+    flows can be reconstructed end-to-end.
+
+    ``prompt_content`` / ``response_content`` are captured ONLY when the opt-in
+    env flag ``LLM_AUDIT_CAPTURE_CONTENT`` is enabled (privacy gate — prompts may
+    contain PII such as resume text) and are truncated to ``LLM_AUDIT_MAX_CONTENT_CHARS``.
     """
     llm_logger = logging.getLogger("llm_audit")
-    extra = {
-        "extra_data": {
-            "event": "llm_invocation",
-            "task_name": task_name,
-            "task_type": task_type,
-            "model": model,
-            "provider": provider,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-            "latency_ms": round(latency_ms, 2),
-            "temperature": temperature,
-            "is_cache_hit": is_cache_hit,
-            "error": error
-        }
+    extra_data: Dict[str, Any] = {
+        "event": "llm_invocation",
+        "task_name": task_name,
+        "task_type": task_type,
+        "model": model,
+        "provider": provider,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "latency_ms": round(latency_ms, 2),
+        "temperature": temperature,
+        "is_cache_hit": is_cache_hit,
+        "error": error,
     }
+    if trace_id:
+        extra_data["trace_id"] = trace_id
+    if LLM_AUDIT_CAPTURE_CONTENT:
+        max_chars = max(0, int(LLM_AUDIT_MAX_CONTENT_CHARS))
+        if prompt_content:
+            extra_data["prompt_truncated"] = truncate_text(prompt_content, max_chars)
+        if response_content:
+            extra_data["response_truncated"] = truncate_text(response_content, max_chars)
+
+    extra = {"extra_data": extra_data}
     msg = (
         f"LLM [{task_name}] provider={provider} model={model} "
         f"tokens={prompt_tokens}+{completion_tokens} lat={latency_ms:.1f}ms "
         f"temp={temperature} hit={is_cache_hit}"
     )
+    if trace_id:
+        msg = f"{msg} trace={trace_id}"
     if error:
         llm_logger.error(f"{msg} error={error}", extra=extra)
     else:
         llm_logger.info(msg, extra=extra)
+
+
+def truncate_text(text: str, max_chars: int = 500) -> str:
+    """Truncate a string to ``max_chars`` for safe audit capture."""
+    if max_chars <= 0:
+        return ""
+    if not text:
+        return ""
+    text = str(text).replace("\n", " ").replace("\r", " ").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "…"
 
 
 def tail_log_file(lines: int = 100, log_path: Optional[Path] = None) -> List[Dict[str, Any]]:
