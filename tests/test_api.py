@@ -1,7 +1,7 @@
 import io
 import json
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from backend.config import encrypt_data, decrypt_data
 from backend.database import Base, Company, Resume, Job, ApplicationEvent
@@ -835,6 +835,94 @@ def test_scheduled_linkedin_sync_alerts_use_valid_kwargs(
     assert "max_alerts" in kwargs
 
 
+@patch("backend.main.fetch_linkedin_job_details")
+def test_linkedin_enrich_saved_job_repairs_merged_title_and_employer(mock_details):
+    """A collapsed card ("TitleCompany" + placeholder employer) is repaired from the detail page."""
+    from backend.main import _linkedin_enrich_saved_job
+
+    mock_details.return_value = {
+        "description": "About the job\nBuild large-scale data systems in Java and Spark.",
+        "title": "Staff Software Engineer",
+        "company": "Databricks",
+        "canonical_url": "https://www.linkedin.com/jobs/view/staff-software-engineer-at-databricks-4461133182/",
+    }
+    item = {
+        "title": "Staff Software EngineerDatabricks",
+        "company": "LinkedIn Network",
+        "url": "https://www.linkedin.com/jobs/view/4461133182/",
+    }
+
+    desc = _linkedin_enrich_saved_job(MagicMock(), item)
+
+    assert item["title"] == "Staff Software Engineer"
+    assert item["company"] == "Databricks"
+    assert "staff-software-engineer-at-databricks" in item["url"]
+    assert desc.startswith("About the job")
+
+
+@patch("backend.main.fetch_linkedin_job_details")
+def test_linkedin_enrich_saved_job_is_noop_on_fetch_failure(mock_details):
+    from backend.main import _linkedin_enrich_saved_job
+
+    mock_details.side_effect = RuntimeError("browser unavailable")
+    item = {
+        "title": "Staff Software EngineerDatabricks",
+        "company": "LinkedIn Network",
+        "url": "https://www.linkedin.com/jobs/view/4461133182/",
+        "description": "",
+    }
+
+    assert _linkedin_enrich_saved_job(MagicMock(), item) == ""
+    assert item["title"] == "Staff Software EngineerDatabricks"  # unchanged
+
+
+@patch("backend.playwright_app.fetch_linkedin_job_details")
+def test_linkedin_repair_existing_saved_job_fixes_and_rescores(mock_details, db_session):
+    """A pre-existing merged-title/0%-score row is repaired and re-scored from the detail page.
+
+    Back-catalog repair now lives in the migration (``backend.scripts.repair_linkedin_saved_jobs``)
+    rather than the sync ingest path; this exercises the script's fetch-enabled repair.
+    """
+    from backend.scripts.repair_linkedin_saved_jobs import repair_linkedin_saved_jobs
+
+    comp = Company(name="LinkedIn Network", domain="linkedinnetwork.com")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(
+        company_id=comp.id,
+        title="Staff Software EngineerDatabricks",
+        url="https://www.linkedin.com/jobs/view/4461133182/",
+        source="LinkedIn Saved Jobs",
+        source_type="LinkedIn",
+        status="Shortlisted",
+        match_score=0,
+        match_scored=False,
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    mock_details.return_value = {
+        "description": (
+            "About the job\nWe are hiring a Staff Software Engineer with 8+ years of experience "
+            "building distributed backend systems in Java, Python and Spark on AWS."
+        ),
+        "title": "Staff Software Engineer",
+        "company": "Databricks",
+        "canonical_url": job.url,
+    }
+
+    summary = repair_linkedin_saved_jobs(
+        db_session, apply=True, fetch=True, page=MagicMock()
+    )
+    db_session.commit()
+
+    assert summary["repaired"] >= 1
+    assert job.title == "Staff Software Engineer"
+    assert job.company.name == "Databricks"
+
+
+
+
 def test_job_target_filtering_and_prune():
     comp = client.post("/api/companies", json={"name": "FilterCorp"}).json()
     j1 = client.post(
@@ -1334,6 +1422,77 @@ def test_user_preferences_roundtrip_and_feature_flags():
         client.get("/api/preferences").json()["target_titles"]
         == "Staff Engineer, Backend"
     )
+
+
+def test_user_extra_skills_roundtrip_and_dedupe():
+    """The user-owned extra-skills profile round-trips through /api/preferences and is
+    normalized (dedupe + trim) so it can be merged on top of resume-extracted skills."""
+    upd = client.put(
+        "/api/preferences",
+        json={"extra_skills": [" Temporal ", "temporal", "Kafka Streams", "CKAD"]},
+    )
+    assert upd.status_code == 200, upd.text
+    assert upd.json()["extra_skills"] == ["Temporal", "Kafka Streams", "CKAD"]
+    assert client.get("/api/preferences").json()["extra_skills"] == [
+        "Temporal",
+        "Kafka Streams",
+        "CKAD",
+    ]
+    # Clearing the list round-trips too.
+    assert client.put("/api/preferences", json={"extra_skills": []}).json()["extra_skills"] == []
+
+
+def test_extra_skills_merge_into_parsed_resume():
+    """Extra skills are merged (case-insensitively) on top of resume-derived skills."""
+    from backend.main import _merge_extra_skills
+
+    parsed = {"skills": ["Python", "FastAPI"]}
+    merged = _merge_extra_skills(parsed, ["FASTAPI", "Temporal", "Kafka"])
+    assert merged["skills"] == ["Python", "FastAPI", "Temporal", "Kafka"]
+    # Empty/None inputs leave the original parsed dict untouched in effect.
+    assert _merge_extra_skills(parsed, [])["skills"] == ["Python", "FastAPI"]
+    assert _merge_extra_skills(None, ["Kafka"])["skills"] == ["Kafka"]
+
+
+def test_skills_insights_aggregates_gaps(db_session):
+    """GET /api/insights/skills aggregates per-job gap lists into ranked demand metrics,
+    deterministically (no LLM)."""
+    comp = Company(name="InsightCorp", domain="insightcorp.com")
+    db_session.add(comp)
+    db_session.flush()
+
+    def _job(title, gaps):
+        return Job(
+            company_id=comp.id,
+            title=title,
+            url=f"https://example.com/{title.replace(' ', '-').lower()}",
+            source="Greenhouse Portal",
+            match_score=70,
+            match_scored=True,
+            match_gaps_json=json.dumps(gaps) if gaps is not None else None,
+        )
+
+    db_session.add_all(
+        [
+            _job("Role A", ["React", "Kafka"]),
+            _job("Role B", ["React"]),
+            _job("Role C", ["React", "Kafka"]),
+            _job("Role D", None),  # scored but no gap payload (legacy row)
+        ]
+    )
+    db_session.commit()
+
+    res = client.get("/api/insights/skills")
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["total_scored"] >= 3
+    top = [g["skill"] for g in data["gaps"]]
+    assert top[0] == "React"
+    react = data["gaps"][0]
+    assert react["count"] == 3
+    assert 0 < react["share"] <= 1
+    share_map = {g["skill"]: g["share"] for g in data["gaps"]}
+    assert share_map["React"] > share_map["Kafka"]  # ranked by frequency
 
 
 @patch("backend.main.scrape_greenhouse_jobs")

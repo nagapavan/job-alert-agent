@@ -152,3 +152,46 @@ def test_met_and_known_counts():
     res = _score([_req("met"), _req("partial"), _req("unknown")])
     assert res.met_count == 1
     assert res.known_count == 2
+
+
+def test_derive_strengths_gaps_no_overlap():
+    """A requirement that pads strengths (when <4 met) must not also appear in partials,
+    and the comparison is case-insensitive so JD-text case variants don't double-list."""
+    from backend.main import _derive_strengths_gaps
+
+    items = [
+        _req("met", text="System Design"),
+        _req("met", text="5+ years"),
+        _req("met", text="principal level"),
+        _req("partial", text="Senior or Staff Software Engineer with 5+ years"),
+        _req("partial", text="senior or staff software engineer with 5+ years"),  # case variant
+    ]
+    assessment = RequirementAssessment(requirements=items)
+    strengths, gaps, partials = _derive_strengths_gaps(assessment)
+    # Strengths padded to 4 from the partial; the partial must then be removed from partials.
+    assert len(strengths) == 4
+    assert "Senior or Staff Software Engineer with 5+ years" in strengths
+    assert partials == []
+    # And no overlap across the two lists.
+    s_lower = {s.lower() for s in strengths}
+    assert not any(p.lower() in s_lower for p in partials)
+
+
+def test_derive_strengths_gaps_partials_kept_when_not_padded():
+    """With >=4 met requirements, partials remain listed but never overlap strengths."""
+    from backend.main import _derive_strengths_gaps
+
+    items = [
+        _req("met", text="Go"),
+        _req("met", text="K8s"),
+        _req("met", text="Kafka"),
+        _req("met", text="gRPC"),
+        _req("partial", text="Embeddings"),
+        _req("partial", text="Agentic AI"),
+    ]
+    assessment = RequirementAssessment(requirements=items)
+    strengths, gaps, partials = _derive_strengths_gaps(assessment)
+    assert len(strengths) == 4
+    assert partials == ["Embeddings", "Agentic AI"]
+    s_lower = {s.lower() for s in strengths}
+    assert not any(p.lower() in s_lower for p in partials)

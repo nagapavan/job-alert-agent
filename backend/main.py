@@ -118,6 +118,7 @@ from backend.parser import (
 from backend.playwright_app import (
     fetch_google_jobs_followed_queries_playwright,
     fetch_google_jobs_playwright,
+    fetch_linkedin_job_details,
     get_persistent_browser_context,
     launch_assisted_application_session,
     scan_and_sync_hirist_applications,
@@ -159,8 +160,15 @@ from backend.task_engine import CancellationToken, TaskProgress, task_engine
 # Initialize Observability, DB tables, and Periodic Scheduler on startup
 setup_observability()
 init_db()
-scheduler.start()
+# Maintenance scripts import this module (for the shared scorer) but must not boot the
+# discovery scheduler in their own process. They set JOB_ALERT_AGENT_NO_SCHEDULER=1.
+if os.environ.get("JOB_ALERT_AGENT_NO_SCHEDULER") != "1":
+    scheduler.start()
 
+# Graceful shutdown is driven entirely by the ASGI shutdown lifecycle (see the
+# `@app.on_event("shutdown")` handler below). We deliberately do NOT register our own
+# signal handlers: uvicorn owns SIGTERM/SIGINT and calls the lifecycle on every exit
+# path (--reload child, --workers, standalone). See backend/shutdown.py for why.
 app = FastAPI(
     title="Job Alert Agent API",
     description="Autonomous job hunting, application tracking, resume ATS tailoring, and browser assistance.",
@@ -181,6 +189,23 @@ def _startup_operation_log_maintenance():
             db.close()
     except Exception as e:
         logger.debug(f"Startup operation-log rotation skipped: {e}")
+
+
+@app.on_event("shutdown")
+def _graceful_shutdown_drain():
+    """Drain background work on server shutdown (SIGTERM/SIGINT/reload).
+
+    The ASGI server drives this on its own graceful-exit path, so it fires identically
+    for `--reload` children, `--workers`, and standalone runs. Doing the drain here
+    (rather than inside a signal handler) keeps the event loop intact and lets the
+    server/reloader parent survive and restart us.
+    """
+    try:
+        from backend.shutdown import run_shutdown
+
+        run_shutdown()
+    except Exception as e:
+        logger.warning(f"Graceful shutdown drain failed: {e}")
 
 
 # -------------------------------------------------------------
@@ -218,7 +243,7 @@ _extension_origin_regex = (
 ScoringResult = namedtuple(
     "ScoringResult",
     ["score", "analysis", "scored", "method", "timestamp", "band", "recommendation",
-     "strengths", "gaps"],
+     "strengths", "gaps", "partials"],
 )
 
 
@@ -570,6 +595,7 @@ class JobOut(BaseModel):
     match_analysis: Optional[str] = None
     match_strengths: Optional[List[str]] = None
     match_gaps: Optional[List[str]] = None
+    match_partials: Optional[List[str]] = None
     cover_letter_draft: Optional[str] = None
     tailored_resume_points: Optional[str] = None
     cold_message_draft: Optional[str] = None
@@ -716,6 +742,7 @@ class MatchAnalyzeResponse(BaseModel):
     )
     strengths: List[str] = Field(default_factory=list)
     gaps: List[str] = Field(default_factory=list)
+    partials: List[str] = Field(default_factory=list, description="Must-have requirements met partially (some resume evidence, not full coverage)")
     feedback: str = ""
     resume_available: bool = True
     analysis_source: str = Field(
@@ -1027,6 +1054,33 @@ def clear_operation_logs(db: Session = Depends(get_db)):
     return {"message": f"Successfully cleared {deleted} operation log record(s)."}
 
 
+@app.get("/api/learning/readiness")
+def get_learning_readiness(db: Session = Depends(get_db)):
+    """Reports whether enough implicit user outcomes exist to train the scorer.
+
+    Labels are derived from behaviour (applying, dismissing) — never from the model's own
+    output — so this makes "not enough data yet" an explicit outcome rather than a silent,
+    overfitted model.
+    """
+    from backend.learning_signals import learning_readiness
+    from backend.match_classifier import MIN_PER_CLASS_SAMPLES, MIN_TRAINING_SAMPLES
+
+    status = learning_readiness(db)
+    ready = (
+        status["trainable"] >= MIN_TRAINING_SAMPLES
+        and status["positives"] >= MIN_PER_CLASS_SAMPLES
+        and status["negatives"] >= MIN_PER_CLASS_SAMPLES
+    )
+    return {
+        **status,
+        "ready_to_train": ready,
+        "training_floor": {
+            "min_total": MIN_TRAINING_SAMPLES,
+            "min_per_class": MIN_PER_CLASS_SAMPLES,
+        },
+    }
+
+
 @app.get("/api/logs")
 def get_application_logs(
     lines: int = Query(default=100, ge=1, le=1000),
@@ -1336,11 +1390,22 @@ def get_qa_cache_stats(db: Session = Depends(get_db)):
 # -------------------------------------------------------------
 @app.get("/api/health")
 def health_check(db: Session = Depends(get_db)):
-    """Health check verifying API, Database, and Active LLM Engine readiness."""
+    """Health check verifying API, Database, and Active LLM Engine readiness.
+
+    Reports ``shutting_down: true`` while a graceful drain is in progress, so a
+    supervisor can distinguish "draining" from "dead" during a restart.
+    """
     try:
         db.query(Company).count()
         active_llm = detect_active_llm_provider()
-        return {"status": "ok", "database": "connected", "active_llm": active_llm}
+        from backend.shutdown import is_shutting_down
+
+        return {
+            "status": "shutting_down" if is_shutting_down() else "ok",
+            "database": "connected",
+            "active_llm": active_llm,
+            "shutting_down": is_shutting_down(),
+        }
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1477,6 +1542,87 @@ def update_llm_settings(payload: LlmSettingsIn):
     except Exception:
         pass
     return _masked_llm_settings()
+
+
+# -------------------------------------------------------------
+# Embedding Backend Settings (local-first, 384-d contract)
+# - Selecting a model is a machine-level choice; switching the model invalidates
+#   existing vectors, so the frontend prompts the user to reindex.
+# -------------------------------------------------------------
+class EmbeddingSettingsIn(BaseModel):
+    backend: Optional[str] = None
+    model: Optional[str] = None
+    allow_download: Optional[bool] = None
+    server_url: Optional[str] = None
+    server_model: Optional[str] = None
+
+
+class EmbeddingSettingsOut(BaseModel):
+    backend: str
+    model: str
+    allow_download: bool
+    server_url: str
+    server_model: str
+    active_backend: str
+    model_cached: bool
+    dim: int
+
+
+def _embedding_settings_out() -> "EmbeddingSettingsOut":
+    from backend import embeddings
+    from backend.config import EMBEDDING_DIM, get_embedding_settings
+
+    settings = get_embedding_settings()
+    return EmbeddingSettingsOut(
+        backend=settings["backend"],
+        model=settings["model"],
+        allow_download=settings["allow_download"],
+        server_url=settings["server_url"],
+        server_model=settings["server_model"],
+        active_backend=embeddings.active_backend_name(settings),
+        model_cached=embeddings.local_model_cached(settings),
+        dim=EMBEDDING_DIM,
+    )
+
+
+@app.get("/api/settings/embeddings", response_model=EmbeddingSettingsOut)
+def get_embedding_settings_endpoint():
+    """Returns the effective embedding backend/model and whether the model is cached."""
+    return _embedding_settings_out()
+
+
+@app.put("/api/settings/embeddings", response_model=EmbeddingSettingsOut)
+def update_embedding_settings_endpoint(payload: EmbeddingSettingsIn):
+    """Persists embedding backend/model selection (env vars still override)."""
+    from backend.config import save_embedding_settings
+
+    save_embedding_settings(
+        backend=payload.backend,
+        model=payload.model,
+        allow_download=payload.allow_download,
+        server_url=payload.server_url,
+        server_model=payload.server_model,
+    )
+    return _embedding_settings_out()
+
+
+@app.post("/api/settings/embeddings/download", response_model=EmbeddingSettingsOut)
+def download_embedding_model():
+    """
+    Downloads/warms the local ONNX model by running a single embedding. Enables
+    downloads for the call so the model is fetched, then reports cache status.
+    """
+    from backend import embeddings
+    from backend.config import get_embedding_settings
+
+    settings = dict(get_embedding_settings())
+    settings["allow_download"] = True
+    settings["backend"] = "standalone"
+    try:
+        embeddings.embed_text("warmup", settings=settings)
+    except Exception as e:
+        logger.warning(f"Embedding model warmup failed: {e}")
+    return _embedding_settings_out()
 
 
 # -------------------------------------------------------------
@@ -2118,6 +2264,11 @@ class OpportunityRadarItem(BaseModel):
 
 _UNKNOWN_COMPANY_NAMES = {"", "unknown company", "unknown", "n/a", "none", "null"}
 
+# Upper bound on per-sync LinkedIn saved-job detail-page navigations (each fetches the real
+# "About the job" text so the scorer has signal). Keeps a large saved-jobs library from turning
+# one sync into hundreds of page loads; the remainder stay unscored baselines.
+LINKEDIN_SAVED_JOB_DESC_FETCH_LIMIT = 25
+
 
 def _safe_company_name(name: Optional[str], fallback: str) -> str:
     """Returns a usable employer name, substituting ``fallback`` for empty/placeholder values."""
@@ -2206,6 +2357,82 @@ def radar_location_matches(
                 return False
         return True
     return check_location_match(job_location or "", loc_filters, city_filters)
+
+
+class SkillGapInsight(BaseModel):
+    skill: str
+    count: int
+    share: float
+    sample_job_ids: List[int] = []
+
+
+class SkillsInsightsOut(BaseModel):
+    total_jobs: int
+    total_scored: int
+    rows_with_gaps: int
+    gaps: List[SkillGapInsight] = []
+
+
+_INSIGHTS_SCAN_CAP = 2000
+
+
+@app.get("/api/insights/skills", response_model=SkillsInsightsOut)
+def get_skills_insights(
+    limit: int = Query(8, ge=1, le=30),
+    db: Session = Depends(get_db),
+):
+    """Aggregates persisted per-job Resume Gap lists into ranked skill-demand metrics.
+
+    Deterministic only (no LLM): counts each skill's frequency across the structured
+    ``match_gaps_json`` payloads that scoring persisted, so the user can see which missing
+    skills block the most opportunities. Legacy rows without a gap payload are counted in
+    the totals but contribute no per-skill data.
+    """
+    rows = (
+        db.query(Job.id, Job.match_gaps_json)
+        .filter(Job.match_scored == True)
+        .order_by(Job.created_at.desc())
+        .limit(_INSIGHTS_SCAN_CAP)
+        .all()
+    )
+    total_scored = len(rows)
+    counts: Dict[str, int] = {}
+    samples: Dict[str, List[int]] = {}
+    rows_with_gaps = 0
+    for job_id, payload in rows:
+        if not payload:
+            continue
+        try:
+            gaps = json.loads(payload)
+        except Exception:
+            continue
+        if not isinstance(gaps, list) or not gaps:
+            continue
+        rows_with_gaps += 1
+        for raw in gaps:
+            skill = str(raw).strip()
+            if not skill:
+                continue
+            counts[skill] = counts.get(skill, 0) + 1
+            bucket = samples.setdefault(skill, [])
+            if len(bucket) < 5 and job_id not in bucket:
+                bucket.append(job_id)
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+    denom = rows_with_gaps or 1
+    return SkillsInsightsOut(
+        total_jobs=db.query(Job).count(),
+        total_scored=total_scored,
+        rows_with_gaps=rows_with_gaps,
+        gaps=[
+            SkillGapInsight(
+                skill=skill,
+                count=count,
+                share=round(count / denom, 3),
+                sample_job_ids=samples.get(skill, []),
+            )
+            for skill, count in ranked
+        ],
+    )
 
 
 @app.get("/api/opportunities/radar", response_model=List[OpportunityRadarItem])
@@ -2825,6 +3052,7 @@ class UserPreferenceIn(BaseModel):
     scoring_config: Optional[Dict[str, float]] = None
     excluded_companies: Optional[str] = None
     skip_topics: Optional[str] = None
+    extra_skills: Optional[List[str]] = None
 
 
 class UserPreferenceOut(BaseModel):
@@ -2842,6 +3070,7 @@ class UserPreferenceOut(BaseModel):
     scoring_config: Dict[str, float] = {}
     excluded_companies: str = ""
     skip_topics: str = ""
+    extra_skills: List[str] = []
 
 
 def normalize_target_cities(raw: Optional[str]) -> str:
@@ -2856,6 +3085,49 @@ def normalize_target_cities(raw: Optional[str]) -> str:
         return ""
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     return ", ".join(p for p in parts if p.lower() != "remote")
+
+
+def _normalize_extra_skills(raw: Any) -> List[str]:
+    """Dedupe/trim a raw extra-skills payload (list or JSON) case-insensitively."""
+    items = raw if isinstance(raw, list) else []
+    seen: set = set()
+    out: List[str] = []
+    for s in items:
+        token = str(s).strip()
+        key = token.lower()
+        if token and key not in seen:
+            seen.add(key)
+            out.append(token)
+    return out
+
+
+def get_extra_skills(pref: "UserPreference") -> List[str]:
+    """Reads the user-owned extra-skills list from preferences JSON (deduped, trimmed)."""
+    try:
+        raw = json.loads(pref.extra_skills_json or "[]")
+    except Exception:
+        raw = []
+    return _normalize_extra_skills(raw)
+
+
+def _merge_extra_skills(parsed_resume: Optional[dict], extra_skills: List[str]) -> Optional[dict]:
+    """Merges the user-owned extra skills on top of the resume-derived skill list.
+
+    Returns a shallow copy (never mutates the caller's dict). Case-insensitive dedupe so a
+    skill the resume already covers is not double-counted by the scorer.
+    """
+    existing = [str(s) for s in ((parsed_resume or {}).get("skills") or [])]
+    seen = {s.lower() for s in existing}
+    additions: List[str] = []
+    for s in extra_skills or []:
+        token = (s or "").strip()
+        key = token.lower()
+        if token and key not in seen:
+            seen.add(key)
+            additions.append(token)
+    merged = dict(parsed_resume or {})
+    merged["skills"] = existing + additions
+    return merged
 
 
 @app.get("/api/preferences", response_model=UserPreferenceOut)
@@ -2879,6 +3151,7 @@ def get_preferences(db: Session = Depends(get_db)):
         if pref.excluded_companies is not None
         else "amazon",
         skip_topics=pref.skip_topics or "",
+        extra_skills=get_extra_skills(pref),
     )
 
 
@@ -2953,6 +3226,8 @@ def update_preferences(payload: UserPreferenceIn, db: Session = Depends(get_db))
             if t.strip()
         ]
         pref.skip_topics = ", ".join(dict.fromkeys(tokens))
+    if payload.extra_skills is not None:
+        pref.extra_skills_json = json.dumps(_normalize_extra_skills(payload.extra_skills))
     db.commit()
     db.refresh(pref)
     return get_preferences(db=db)
@@ -3610,6 +3885,7 @@ def _execute_ats_scrape(
                     apply_recommendation,
                     strengths,
                     gaps,
+                    partials,
                 ) = _score_job_with_engine(
                     db,
                     resume_text,
@@ -3644,6 +3920,7 @@ def _execute_ats_scrape(
                 apply_recommendation=apply_recommendation,
                 match_strengths_json=json.dumps(strengths) if match_scored else None,
                 match_gaps_json=json.dumps(gaps) if match_scored else None,
+                match_partials_json=json.dumps(partials) if match_scored else None,
                 cover_letter_draft=None,
                 tailored_resume_points=None,
                 cold_message_draft=None,
@@ -3812,6 +4089,8 @@ def _apply_generated_package(
         job.match_strengths_json = json.dumps([str(s) for s in pkg["strengths"]])
     if pkg.get("gaps"):
         job.match_gaps_json = json.dumps([str(g) for g in pkg["gaps"]])
+    if pkg.get("partials"):
+        job.match_partials_json = json.dumps([str(p) for p in pkg["partials"]])
     for attr, key in (
         ("cover_letter_draft", "cover_letter"),
         ("tailored_resume_points", "tailored_resume_points"),
@@ -4383,19 +4662,53 @@ def career_copilot_chat(req: ChatAssistantRequest, db: Session = Depends(get_db)
 
 
 def _derive_strengths_gaps(assessment, match=None) -> tuple:
-    """Derive the strengths/gaps bullet lists from the requirement breakdown.
+    """Derive the strengths/gaps/partials bullet lists from the requirement breakdown.
 
-    ``match`` is optional; missing must-haves are derived from the assessment when
-    it is omitted (used by the deterministic classifier path).
+    Returns ``(strengths, gaps, partials)``:
+    - strengths: requirements whose status is ``met`` (top up to 4 with partials so the
+      panel is never empty when the resume meets at least some requirements).
+    - gaps: must-have requirements with status ``missing`` (truly absent from the resume).
+    - partials: must-have requirements with status ``partial`` (resume has *some*
+      evidence but not full coverage — e.g. "10+ years" when the candidate has fewer).
+      Surfaced separately so a moderate score is explainable without polluting the
+      Skills Insights aggregation (which only counts truly-missing skills).
+
+    ``match`` is optional; missing must-haves are derived from the assessment when it is
+    omitted (used by the deterministic classifier path).
     """
     reqs = assessment.requirements
     strengths = [r.text for r in reqs if r.status == "met" and r.text]
+    partials = [
+        r.text
+        for r in reqs
+        if r.category == "must_have" and r.status == "partial" and r.text
+    ]
+    # Case-insensitive helper so JD-text duplicates that differ only in case are treated
+    # as the same requirement.
+    def _norm(s: str) -> str:
+        return s.strip().lower()
+
+    seen_strengths = {_norm(s) for s in strengths}
+    # Pad strengths to 4 with partials first, so the padding items are removed from the
+    # partials list afterward (an item never appears in BOTH panels).
     if len(strengths) < 4:
-        strengths += [
-            r.text
-            for r in reqs
-            if r.status == "partial" and r.text and r.text not in strengths
-        ]
+        for p in partials:
+            if len(strengths) >= 4:
+                break
+            if _norm(p) not in seen_strengths:
+                seen_strengths.add(_norm(p))
+                strengths.append(p)
+    strengths = list(dict.fromkeys(strengths))[:4]  # case-sensitive dedupe + hard cap
+    # Now build partials: drop anything already claimed by strengths (case-insensitive),
+    # and dedupe among themselves.
+    seen_partials: set = set()
+    unique_partials: List[str] = []
+    for p in partials:
+        key = _norm(p)
+        if key not in seen_strengths and key not in seen_partials:
+            seen_partials.add(key)
+            unique_partials.append(p)
+    partials = unique_partials[:4]
     if match is not None:
         gaps = list(match.missing_must_haves)
     else:
@@ -4407,7 +4720,7 @@ def _derive_strengths_gaps(assessment, match=None) -> tuple:
     for req in reqs:
         if req.status == "missing" and req.text and req.text not in gaps:
             gaps.append(req.text)
-    return strengths[:4], gaps[:3]
+    return strengths[:4], gaps[:3], partials[:4]
 
 
 def _parsed_resume_of(resume):
@@ -4436,10 +4749,17 @@ def _looks_like_job_description(text: str) -> bool:
 
 
 def _deterministic_analysis_text(det) -> str:
-    """Compact strengths/gaps narrative for the deterministic classifier path."""
-    strengths, gaps = det["strengths"], det["gaps"]
-    if strengths or gaps:
-        return f"Strengths: {', '.join(strengths)}. Gaps: {', '.join(gaps)}"
+    """Compact strengths/gaps/partials narrative for the deterministic classifier path."""
+    strengths, gaps, partials = det.get("strengths") or [], det.get("gaps") or [], det.get("partials") or []
+    parts = []
+    if strengths:
+        parts.append(f"Strengths: {', '.join(strengths)}")
+    if partials:
+        parts.append(f"Partial coverage: {', '.join(partials)}")
+    if gaps:
+        parts.append(f"Gaps: {', '.join(gaps)}")
+    if parts:
+        return ". ".join(parts)
     return det["feedback"]
 
 
@@ -4452,12 +4772,21 @@ def _score_job_with_engine(
     match_band, apply_recommendation)``. Failures degrade to an unscored baseline rather
     than fabricating a score.
     """
-    unscored = ScoringResult(0, "", False, None, None, None, None, [], [])
+    unscored = ScoringResult(0, "", False, None, None, None, None, [], [], [])
     if not (resume_text or "").strip() or not (description or "").strip():
         return unscored
     if len(description.strip()) < MIN_JOB_DESCRIPTION_CHARS:
         # No substantive job description -> do not fabricate a score.
         return unscored
+
+    # The user-owned extra-skills profile is evidence on top of the resume: every scoring
+    # path (deterministic + LLM fallback) reads parsed_resume, so merge once here.
+    try:
+        extra = get_extra_skills(get_user_preferences(db))
+    except Exception:
+        extra = []
+    if extra:
+        parsed_resume = _merge_extra_skills(parsed_resume, extra)
 
     det_errored = False
     det_match_details = None
@@ -4483,6 +4812,7 @@ def _score_job_with_engine(
             recommendation=det_match_details["recommendation"],
             strengths=list(det_match_details.get("strengths") or []),
             gaps=list(det_match_details.get("gaps") or []),
+            partials=list(det_match_details.get("partials") or []),
         )
 
     # A deterministic *error* always falls back (per requirement); a clean "no requirements"
@@ -4518,8 +4848,9 @@ def _score_job_with_engine(
             recommendation=None,
             strengths=[],
             gaps=[],
+            partials=[],
         )
-    l_strengths, l_gaps = _derive_strengths_gaps(assessment, match)
+    l_strengths, l_gaps, l_partials = _derive_strengths_gaps(assessment, match)
     return ScoringResult(
         score=match.score,
         analysis=_match_analysis_text(assessment, match),
@@ -4530,6 +4861,7 @@ def _score_job_with_engine(
         recommendation=match.apply_recommendation,
         strengths=list(l_strengths),
         gaps=list(l_gaps),
+        partials=list(l_partials),
     )
 
 
@@ -4667,7 +4999,7 @@ def analyze_job_match_endpoint(
             ),
         )
 
-    strengths, gaps = _derive_strengths_gaps(assessment, match)
+    strengths, gaps, partials = _derive_strengths_gaps(assessment, match)
 
     eligible, ineligibility_reason = _check_eligibility(
         db, payload.job_title, payload.location, description
@@ -4677,6 +5009,7 @@ def analyze_job_match_endpoint(
         match_score=match.score,
         strengths=strengths,
         gaps=gaps,
+        partials=partials,
         feedback=assessment.summary or "",
         analysis_source="llm",
         band=match.band,
@@ -4760,13 +5093,14 @@ def generate_detailed_match_analysis(job_id: int, db: Session = Depends(get_db))
         }
 
     # Format narrative
-    strengths, gaps = _derive_strengths_gaps(assessment, match)
+    strengths, gaps, partials = _derive_strengths_gaps(assessment, match)
     narrative = _match_analysis_text(assessment, match)
 
     # Cache in database (narrative + structured lists for the gap-insights UI)
     job.match_analysis = narrative
     job.match_strengths_json = json.dumps(list(strengths))
     job.match_gaps_json = json.dumps(list(gaps))
+    job.match_partials_json = json.dumps(list(partials))
     db.commit()
 
     logger.info(f"Cached detailed analysis for job {job_id}")
@@ -4775,6 +5109,7 @@ def generate_detailed_match_analysis(job_id: int, db: Session = Depends(get_db))
         "analysis": narrative,
         "strengths": strengths,
         "gaps": gaps,
+        "partials": partials,
         "feedback": assessment.summary or "",
         "cached": False,
         "job_id": job_id,
@@ -4887,6 +5222,45 @@ def _linkedin_resolve_portal(
     if canonical and "linkedin.com" not in canonical:
         return canonical, portal_info
     return url, portal_info
+
+
+def _linkedin_enrich_saved_job(page, item: Dict[str, Any]) -> str:
+    """Fetches a saved-job posting's detail page to (a) supply a real description for scoring and
+    (b) repair a merged title / placeholder employer produced by a collapsed list card.
+
+    Mutates ``item`` in place for title/company and returns the description text. Best-effort:
+    any failure leaves the item untouched so ingest degrades to the unscored baseline.
+    """
+    url = item.get("url", "")
+    if "/jobs/view/" not in url:
+        return (item.get("description") or "").strip()
+    try:
+        details = fetch_linkedin_job_details(page, url)
+    except Exception as e:
+        logger.debug(f"LinkedIn saved-job detail fetch skipped: {e}")
+        return (item.get("description") or "").strip()
+
+    dom_title = (details.get("title") or "").strip()
+    dom_company = (details.get("company") or "").strip()
+    cur_title = (item.get("title") or "").strip()
+    cur_company = (item.get("company") or "").strip()
+
+    # Repair the merged "TitleCompany" title when the detail page gives a shorter, clean title.
+    if dom_title:
+        norm_title = re.sub(r"[^a-z0-9]", "", cur_title.lower())
+        norm_dom = re.sub(r"[^a-z0-9]", "", dom_title.lower())
+        if not cur_title or (norm_dom and norm_dom in norm_title):
+            item["title"] = dom_title
+
+    if dom_company and (
+        not cur_company
+        or cur_company.lower() in ("unknown company", "linkedin network", "linkedin")
+    ):
+        item["company"] = dom_company
+
+    if details.get("canonical_url"):
+        item["url"] = details["canonical_url"]
+    return (details.get("description") or "").strip()
 
 
 def _linkedin_find_existing_job(
@@ -5143,6 +5517,7 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                                 apply_recommendation,
                                 strengths,
                                 gaps,
+                                partials,
                             ) = _score_job_with_engine(
                                 db,
                                 resume_text,
@@ -5175,6 +5550,7 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                             apply_recommendation=apply_recommendation,
                             match_strengths_json=json.dumps(strengths) if match_scored else None,
                             match_gaps_json=json.dumps(gaps) if match_scored else None,
+                            match_partials_json=json.dumps(partials) if match_scored else None,
                             cover_letter_draft=None,
                             tailored_resume_points=None,
                             cold_message_draft=None,
@@ -5190,6 +5566,7 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                 )
                 saved_checked = len(saved_jobs)
                 saved_added = 0
+                saved_jd_fetches = 0
 
                 for item in saved_jobs:
                     if item.get("is_closed"):
@@ -5232,10 +5609,19 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                         if existing_job:
                             already_existing += 1
                             # Respect the user's explicit save: promote anything not yet actioned.
+                            # Back-catalog repair of rows ingested before the card parser was fixed
+                            # is handled by backend/scripts/repair_linkedin_saved_jobs.py, not here.
                             if existing_job.status in ("To Apply", "Not Interested"):
                                 existing_job.status = "Shortlisted"
                         else:
-                            # Ingest new active saved job
+                            # Ingest new active saved job. Enrich from the detail page first so a
+                            # merged card title / placeholder employer is repaired and the scorer
+                            # gets the real JD text (cards carry no description).
+                            saved_jd = (item.get("description") or "").strip()
+                            if saved_jd_fetches < LINKEDIN_SAVED_JOB_DESC_FETCH_LIMIT:
+                                saved_jd_fetches += 1
+                                saved_jd = _linkedin_enrich_saved_job(page, item) or saved_jd
+
                             comp = _linkedin_upsert_company(db, item.get("company"))
 
                             resolved_url, _portal_info = _linkedin_resolve_portal(
@@ -5259,10 +5645,11 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                                 apply_recommendation,
                                 strengths,
                                 gaps,
+                                partials,
                             ) = _score_job_with_engine(
                                 db,
                                 resume_text,
-                                item.get("description") or "",
+                                saved_jd or "",
                                 parsed_resume=parsed_resume,
                                 job_title=item.get("title") or "",
                             )
@@ -5270,12 +5657,12 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                                 match_analysis = "Saved directly on LinkedIn."
 
                             job_emb = generate_embeddings(
-                                f"{item['title']} {clean_job_description(item.get('description', '') or item['title'])}"
+                                f"{item['title']} {clean_job_description(saved_jd or item['title'])}"
                             )
                             new_saved_job = Job(
                                 company_id=comp.id,
                                 title=item["title"],
-                                description=f"LinkedIn Saved Job opening for {item['title']} at {comp.name}.",
+                                description=saved_jd or f"LinkedIn Saved Job opening for {item['title']} at {comp.name}.",
                                 url=item.get("url", ""),
                                 location=item.get("location", "Remote / Various"),
                                 source="LinkedIn Saved Jobs",
@@ -5291,6 +5678,7 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                                 apply_recommendation=apply_recommendation,
                                 match_strengths_json=json.dumps(strengths) if match_scored else None,
                                 match_gaps_json=json.dumps(gaps) if match_scored else None,
+                                match_partials_json=json.dumps(partials) if match_scored else None,
                                 cover_letter_draft=None,
                                 tailored_resume_points=None,
                                 cold_message_draft=None,
@@ -5617,6 +6005,7 @@ def scrape_google_jobs_endpoint(
                         apply_recommendation,
                         strengths,
                         gaps,
+                        partials,
                     ) = _score_job_with_engine(
                         db,
                         resume_text,
@@ -5656,6 +6045,7 @@ def scrape_google_jobs_endpoint(
                     apply_recommendation=apply_recommendation,
                     match_strengths_json=json.dumps(strengths) if match_scored else None,
                     match_gaps_json=json.dumps(gaps) if match_scored else None,
+                    match_partials_json=json.dumps(partials) if match_scored else None,
                     cover_letter_draft=None,
                     tailored_resume_points=None,
                     cold_message_draft=None,
@@ -6298,6 +6688,7 @@ def _execute_external_sync(
                             apply_recommendation,
                             strengths,
                             gaps,
+                            partials,
                         ) = _score_job_with_engine(
                             db,
                             resume_text,
@@ -6330,6 +6721,7 @@ def _execute_external_sync(
                             apply_recommendation=apply_recommendation,
                             match_strengths_json=json.dumps(strengths) if match_scored else None,
                             match_gaps_json=json.dumps(gaps) if match_scored else None,
+                            match_partials_json=json.dumps(partials) if match_scored else None,
                             applied_at=now_utc
                             if target_status in ["Applied", "Interview", "Rejected"]
                             else None,
@@ -6822,80 +7214,159 @@ def _run_linkedin_sync_task_runner(
         # Review batch id for this background sync run: every job newly ingested is tagged so the
         # UI can show a "new from sync" review queue until the user acts on each job.
         sync_batch_id = f"li-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S')}"
+
+        # Active resume drives match scoring for newly ingested saved jobs (same inputs the manual
+        # sync path uses).
+        active_resume = (
+            db.query(Resume)
+            .filter(Resume.is_active == True)
+            .order_by(Resume.created_at.desc())
+            .first()
+        )
+        resume_text = (
+            decrypt_data(active_resume.content_encrypted) if active_resume else ""
+        )
+        parsed_resume = _parsed_resume_of(active_resume)
+        saved_jd_fetches = 0
+
         try:
             with sync_playwright() as p:
-                saved_jobs = scan_and_sync_linkedin_saved_jobs(
-                    p, headless=True, auto_unsave_closed=True, max_pages=3
-                )
-                for item in saved_jobs or []:
-                    if item.get("is_closed"):
-                        matched_job = (
-                            db.query(Job)
-                            .filter(
-                                (Job.title.ilike(item.get("title", "")))
-                                | (Job.url == item.get("url", "___"))
-                            )
-                            .first()
+                # The saved-jobs scan manages its own browser context. Enrichment (detail-page
+                # fetches) reuses the scan's page when available; otherwise we lazily open a
+                # context only if there is actually a new job to enrich, so a no-op sync never
+                # spawns a browser.
+                enrichment_page = None
+                enrichment_context = None
+
+                def _get_enrichment_page():
+                    nonlocal enrichment_page, enrichment_context
+                    if enrichment_page is None:
+                        enrichment_context = get_persistent_browser_context(p, headless=True)
+                        enrichment_page = (
+                            enrichment_context.pages[0]
+                            if (hasattr(enrichment_context, "pages") and isinstance(enrichment_context.pages, list) and len(enrichment_context.pages) > 0)
+                            else enrichment_context.new_page()
                         )
-                        if matched_job and matched_job.status in (
-                            "To Apply",
-                            "Shortlisted",
-                            "Not Interested",
-                        ):
-                            matched_job.status = "Rejected"
-                            matched_job.rejected_at = datetime.datetime.now(
-                                datetime.timezone.utc
+                    return enrichment_page
+
+                try:
+                    saved_jobs = scan_and_sync_linkedin_saved_jobs(
+                        p, headless=True, auto_unsave_closed=True, max_pages=3
+                    )
+                    for item in saved_jobs or []:
+                        if item.get("is_closed"):
+                            matched_job = (
+                                db.query(Job)
+                                .filter(
+                                    (Job.title.ilike(item.get("title", "")))
+                                    | (Job.url == item.get("url", "___"))
+                                )
+                                .first()
                             )
-                            event = ApplicationEvent(
-                                job_id=matched_job.id,
-                                event_type="status_change",
-                                description="Closed on LinkedIn: position expired or no longer accepting applications (automatically unsaved).",
-                            )
-                            db.add(event)
-                    else:
-                        existing = _linkedin_find_existing_job(
-                            db, item.get("title", ""), item.get("url", "___")
-                        )
-                        if existing:
-                            # Respect the user's explicit save: promote anything not yet actioned.
-                            if existing.status in ("To Apply", "Not Interested"):
-                                existing.status = "Shortlisted"
+                            if matched_job and matched_job.status in (
+                                "To Apply",
+                                "Shortlisted",
+                                "Not Interested",
+                            ):
+                                matched_job.status = "Rejected"
+                                matched_job.rejected_at = datetime.datetime.now(
+                                    datetime.timezone.utc
+                                )
+                                event = ApplicationEvent(
+                                    job_id=matched_job.id,
+                                    event_type="status_change",
+                                    description="Closed on LinkedIn: position expired or no longer accepting applications (automatically unsaved).",
+                                )
+                                db.add(event)
                         else:
-                            comp = _linkedin_upsert_company(db, item.get("company"))
+                            existing = _linkedin_find_existing_job(
+                                db, item.get("title", ""), item.get("url", "___")
+                            )
+                            if existing:
+                                # Respect the user's explicit save: promote anything not yet actioned.
+                                # Back-catalog repair of rows ingested before the card parser was fixed
+                                # is handled by backend/scripts/repair_linkedin_saved_jobs.py.
+                                if existing.status in ("To Apply", "Not Interested"):
+                                    existing.status = "Shortlisted"
+                            else:
+                                # Enrich from the detail page first so a merged card title /
+                                # placeholder employer is repaired and the scorer gets real JD text.
+                                saved_jd = (item.get("description") or "").strip()
+                                if saved_jd_fetches < LINKEDIN_SAVED_JOB_DESC_FETCH_LIMIT:
+                                    saved_jd_fetches += 1
+                                    saved_jd = _linkedin_enrich_saved_job(_get_enrichment_page(), item) or saved_jd
 
-                            resolved_url, _portal_info = _linkedin_resolve_portal(
-                                comp, item.get("url", ""), comp.name
-                            )
-                            item["url"] = resolved_url
+                                comp = _linkedin_upsert_company(db, item.get("company"))
 
-                            dd = evaluate_job_due_diligence(
-                                job_title=item.get("title", ""),
-                                source_type="LinkedIn",
-                                portal_jobs=[],
-                            )
-                            job_emb = generate_embeddings(
-                                f"{item.get('title', '')} {clean_job_description(item.get('description', '') or item.get('title', ''))}"
-                            )
-                            new_job = Job(
-                                company_id=comp.id,
-                                title=item.get("title", ""),
-                                description=item.get("description", ""),
-                                url=item.get("url", ""),
-                                location=item.get("location", "Remote / Various"),
-                                source="LinkedIn Saved Job",
-                                source_type="LinkedIn",
-                                status="Shortlisted",
-                                sync_batch_id=sync_batch_id,
-                                match_score=0,
-                                match_scored=False,
-                                match_analysis="Saved on LinkedIn (High user interest).",
-                                is_ghost_job=dd.get("is_ghost_job", False),
-                                embedding=job_emb,
-                            )
-                            db.add(new_job)
-                            saved_count += 1
-                db.commit()
-                total_found += saved_count
+                                resolved_url, _portal_info = _linkedin_resolve_portal(
+                                    comp, item.get("url", ""), comp.name
+                                )
+                                item["url"] = resolved_url
+
+                                dd = evaluate_job_due_diligence(
+                                    job_title=item.get("title", ""),
+                                    source_type="LinkedIn",
+                                    portal_jobs=[],
+                                )
+
+                                (
+                                    match_score,
+                                    match_analysis,
+                                    match_scored,
+                                    score_method,
+                                    match_scored_at,
+                                    match_band,
+                                    apply_recommendation,
+                                    strengths,
+                                    gaps,
+                                    partials,
+                                ) = _score_job_with_engine(
+                                    db,
+                                    resume_text,
+                                    saved_jd or "",
+                                    parsed_resume=parsed_resume,
+                                    job_title=item.get("title") or "",
+                                )
+                                if not match_analysis:
+                                    match_analysis = "Saved on LinkedIn (High user interest)."
+
+                                job_emb = generate_embeddings(
+                                    f"{item.get('title', '')} {clean_job_description(saved_jd or item.get('title', ''))}"
+                                )
+                                new_job = Job(
+                                    company_id=comp.id,
+                                    title=item.get("title", ""),
+                                    description=saved_jd
+                                    or f"LinkedIn Saved Job opening for {item.get('title', '')} at {comp.name}.",
+                                    url=item.get("url", ""),
+                                    location=item.get("location", "Remote / Various"),
+                                    source="LinkedIn Saved Jobs",
+                                    source_type="LinkedIn",
+                                    status="Shortlisted",
+                                    sync_batch_id=sync_batch_id,
+                                    match_score=match_score,
+                                    match_analysis=match_analysis,
+                                    match_scored=match_scored,
+                                    score_method=score_method,
+                                    match_scored_at=match_scored_at,
+                                    match_band=match_band,
+                                    apply_recommendation=apply_recommendation,
+                                    match_strengths_json=json.dumps(strengths) if match_scored else None,
+                                    match_gaps_json=json.dumps(gaps) if match_scored else None,
+                                    match_partials_json=json.dumps(partials) if match_scored else None,
+                                    is_ghost_job=dd.get("is_ghost_job", False),
+                                    embedding=job_emb,
+                                )
+                                db.add(new_job)
+                                saved_count += 1
+                    db.commit()
+                    total_found += saved_count
+                finally:
+                    if enrichment_context is not None:
+                        try:
+                            enrichment_context.close()
+                        except Exception:
+                            pass
         except Exception as s_err:
             logger.warning(f"LinkedIn saved jobs scan notice: {s_err}")
 
@@ -7230,9 +7701,16 @@ class RescoreRequest(BaseModel):
 
 
 def _match_analysis_text(assessment, match) -> str:
-    strengths, gaps = _derive_strengths_gaps(assessment, match)
-    if strengths or gaps:
-        return f"Strengths: {', '.join(strengths)}. Gaps: {', '.join(gaps)}"
+    strengths, gaps, partials = _derive_strengths_gaps(assessment, match)
+    parts = []
+    if strengths:
+        parts.append(f"Strengths: {', '.join(strengths)}")
+    if partials:
+        parts.append(f"Partial coverage: {', '.join(partials)}")
+    if gaps:
+        parts.append(f"Gaps: {', '.join(gaps)}")
+    if parts:
+        return ". ".join(parts)
     return assessment.summary or ""
 
 
@@ -7308,6 +7786,7 @@ def _run_match_rescore_task_runner(
                     job.apply_recommendation = result.recommendation
                     job.match_strengths_json = json.dumps(result.strengths)
                     job.match_gaps_json = json.dumps(result.gaps)
+                    job.match_partials_json = json.dumps(result.partials)
                     rescored += 1
                     if result.method == "classifier_v1":
                         deterministic += 1
@@ -7705,13 +8184,14 @@ def _deterministic_match(
         eligible, ineligibility_reason = _check_eligibility(db, job_title, location, description)
 
         # Surface the requirement breakdown so the score is transparent, not a black box.
-        strengths, gaps = _derive_strengths_gaps(assessment)
+        strengths, gaps, partials = _derive_strengths_gaps(assessment)
         known_reqs = [
             r
             for r in assessment.requirements
             if r.status in ("met", "partial", "missing")
         ]
         met_count = sum(1 for r in known_reqs if r.status == "met")
+        partial_count = sum(1 for r in known_reqs if r.status == "partial")
         unverified = [
             r.text
             for r in assessment.requirements
@@ -7722,6 +8202,8 @@ def _deterministic_match(
             f"(must-have coverage {round(features.must_coverage * 100)}%, "
             f"nice-to-have {round(features.nice_coverage * 100)}%)."
         )
+        if partial_count > 0:
+            feedback += f" {partial_count} requirement{'s' if partial_count != 1 else ''} met partially — see Partial Coverage below."
         # Surface technology-tenure comparisons so the user can judge borderline cases.
         tenure_notes = []
         for r in assessment.requirements:
@@ -7762,6 +8244,7 @@ def _deterministic_match(
             "over_qualified": over_qualified,
             "strengths": strengths,
             "gaps": gaps,
+            "partials": partials,
             "unverified": unverified,
             "feedback": feedback,
             "eligible": eligible,

@@ -142,6 +142,7 @@ class CareerChatAgent:
                 "location": j.location,
                 "status": j.status,
                 "match_score": int(j.match_score or 0),
+                "match_scored": bool(j.match_scored),
                 "url": j.url
             })
 
@@ -220,6 +221,7 @@ class CareerChatAgent:
                 "location": j.location,
                 "status": j.status,
                 "match_score": int(j.match_score or 0),
+                "match_scored": bool(j.match_scored),
                 "url": j.url,
                 "cover_letter_draft": bool(j.cover_letter_draft),
                 "tailored_points": bool(j.tailored_resume_points)
@@ -519,6 +521,7 @@ class CareerChatAgent:
                         "title": target_job.title,
                         "company": target_job.company.name if target_job.company else "Company",
                         "match_score": int(target_job.match_score or 0),
+                        "match_scored": bool(target_job.match_scored),
                         "status": target_job.status,
                         "url": target_job.url
                     })

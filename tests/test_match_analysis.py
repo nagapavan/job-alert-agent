@@ -63,6 +63,36 @@ def test_match_analyze_deterministic_classifier_path_no_llm(db_session):
     mock_assess.assert_not_called()
 
 
+def test_match_analyze_detects_ai_stack_and_preferred_section(db_session):
+    """AI/GenAI/NLU requirements are detected, and the Preferred section is not dropped."""
+    _add_active_resume(
+        db_session,
+        "Alice. Skills: LLM, GenAI, NLU, prompt design, RAG, embeddings, React, Node.js, CI/CD.",
+    )
+    with patch("backend.main.assess_job_requirements") as mock_assess:
+        res = client.post("/api/match/analyze", json={
+            "job_title": "Senior Software Engineer",
+            "job_description": (
+                "Required experience and skills\n"
+                "12+ years software engineering experience.\n"
+                "Strong JavaScript/Node.js, React and API integration skills.\n"
+                "Hands-on experience with AI/GenAI or ML-driven features (LLM prompting, NLU).\n"
+                "Preferred Experience\n"
+                "Payroll and benefits domain depth.\n"
+            ),
+        })
+    assert res.status_code == 200
+    data = res.json()
+    assert data["analysis_source"] == "classifier"
+    # The AI vocabulary is scored (not filtered out by a fixed tech list).
+    assert data["nice_coverage"] >= 0.0
+    req_text = " ".join(r["text"] for r in data["requirements"])
+    assert "LLM" in req_text or "NLU" in req_text
+    # Preferred section is parsed as nice-to-have (previously reported "nice-to-have 0%").
+    assert any(r["category"] == "nice_to_have" for r in data["requirements"])
+    mock_assess.assert_not_called()
+
+
 def test_match_analyze_unconfirmable_tenure_asks_user_to_decide(db_session):
     """Tech presented without dated tenure -> partial + explicit 'please decide' note."""
     _add_active_resume(db_session, "Alice. Skills: Golang, Python.")

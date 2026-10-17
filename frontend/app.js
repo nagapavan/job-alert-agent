@@ -1674,6 +1674,44 @@ function updateKPIStats(filteredJobs) {
     if (elHigh) elHigh.innerText = highMatches;
     if (elGhost) elGhost.innerText = ghost;
     if (elGen) elGen.innerText = genuine;
+    updateSkillsInsights();
+}
+
+// -------------------------------------------------------------
+// Skills Insights: ranked resume gaps across scored jobs
+// -------------------------------------------------------------
+let skillsInsightsFetchedAt = 0;
+
+async function updateSkillsInsights(force = false) {
+    const gapsEl = document.getElementById("skills-insights-gaps");
+    const metaEl = document.getElementById("skills-insights-meta");
+    if (!gapsEl) return;
+    const now = Date.now();
+    if (!force && now - skillsInsightsFetchedAt < 60000) return; // max once per minute
+    try {
+        const res = await fetch(`${API_BASE}/api/insights/skills`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        skillsInsightsFetchedAt = now;
+        if (metaEl) {
+            metaEl.innerText = `${data.total_scored} AI-scored jobs · ${data.rows_with_gaps} with gap data`;
+        }
+        if (!data.gaps || data.gaps.length === 0) {
+            gapsEl.innerHTML = `<span class="insights-empty">No gap data yet — score jobs with full descriptions first.</span>`;
+            return;
+        }
+        gapsEl.innerHTML = data.gaps.map(g => {
+            const pct = Math.round((g.share || 0) * 100);
+            return `
+                <div class="insights-gap-row" title="Click to open job #${g.sample_job_ids[0] || ''}">
+                    <span class="gap-skill">${escapeHTML(g.skill)}</span>
+                    <span class="gap-bar"><span class="gap-bar-fill" style="width:${pct}%"></span></span>
+                    <span class="gap-num">${pct}% · ${g.count} job${g.count === 1 ? '' : 's'}</span>
+                </div>`;
+        }).join("");
+    } catch {
+        if (gapsEl) gapsEl.innerHTML = `<span class="insights-empty">Skills insights unavailable.</span>`;
+    }
 }
 
 // -------------------------------------------------------------
@@ -2036,14 +2074,17 @@ function renderJobFeed(jobs) {
     }
 
     feed.innerHTML = jobs.map(job => {
-        const hasScore = job.match_score !== null && job.match_score !== undefined;
+        // A numeric score is only meaningful when a real analysis produced it. Unscored rows carry
+        // match_score=0 as a baseline sentinel, which must not render as "0% Match".
+        const hasScore = job.match_scored === true
+            && job.match_score !== null && job.match_score !== undefined;
         const score = hasScore ? Math.round(job.match_score) : null;
         let scoreClass = "low";
         if (score !== null && score >= 80) scoreClass = "high";
         else if (score !== null && score >= 60) scoreClass = "medium";
         const scoreTitle = !hasScore
             ? "Not yet analyzed"
-            : (job.match_scored ? "AI match score" : "Source baseline — not AI match-scored");
+            : "AI match score";
 
         const recMap = {
             apply: { label: "✅ Apply", cls: "rec-apply" },
@@ -2104,7 +2145,7 @@ function renderJobFeed(jobs) {
 
                 <div class="job-actions-right">
                     <div class="match-pill ${scoreClass}" title="${scoreTitle}">
-                        ${hasScore ? `🎯 ${score}% Match${job.match_scored ? '' : ' <span class="not-scored-cue">not AI-scored</span>'}` : '🎯 —'}
+                        ${hasScore ? `🎯 ${score}% Match` : '🎯 —'}
                     </div>
                     <select class="status-dropdown status-${statusSlug}" onchange="updateJobStatus(${job.id}, this.value, this)">
                         <option value="Shortlisted" ${isShortlisted ? 'selected' : ''}>⭐ Shortlisted</option>
@@ -3240,25 +3281,34 @@ function renderGapInsights(job) {
         return;
     }
     // Structured lists (persisted at scoring time) take precedence; legacy rows
-    // fall back to the flattened "Strengths: ... Gaps: ..." narrative.
+    // fall back to the flattened "Strengths: ... Partial coverage: ... Gaps: ..." narrative.
     let strengths = Array.isArray(job.match_strengths) ? job.match_strengths : null;
     let gaps = Array.isArray(job.match_gaps) ? job.match_gaps : null;
+    let partials = Array.isArray(job.match_partials) ? job.match_partials : null;
     let legacy = false;
-    if (!strengths && !gaps) {
+    if (!strengths && !gaps && !partials) {
         const ma = job.match_analysis || "";
         const gapIdx = ma.indexOf("Gaps:");
-        if (gapIdx >= 0) {
+        const partIdx = ma.indexOf("Partial coverage:");
+        if (gapIdx >= 0 || partIdx >= 0) {
             legacy = true;
-            const gapText = ma.slice(gapIdx + 5).replace(/\.$/, "").trim();
+            const gapText = gapIdx >= 0
+                ? ma.slice(gapIdx + 5).replace(/\.$/, "").trim()
+                : "";
+            const partText = partIdx >= 0
+                ? ma.slice(partIdx + 18, (gapIdx >= 0 && gapIdx > partIdx) ? gapIdx : ma.length).replace(/\.$/, "").trim()
+                : "";
             const strIdx = ma.indexOf("Strengths:");
+            const strEnd = partIdx >= 0 ? partIdx : (gapIdx >= 0 ? gapIdx : ma.length);
             const strText = strIdx >= 0
-                ? ma.slice(strIdx + 10, gapIdx).replace(/\.$/, "").trim()
+                ? ma.slice(strIdx + 10, strEnd).replace(/\.$/, "").trim()
                 : "";
             gaps = gapText ? [gapText] : [];
+            partials = partText ? [partText] : [];
             strengths = strText ? [strText] : [];
         }
     }
-    if ((!gaps || !gaps.length) && (!strengths || !strengths.length)) {
+    if ((!gaps || !gaps.length) && (!strengths || !strengths.length) && (!partials || !partials.length)) {
         card.style.display = "none";
         return;
     }
@@ -3272,6 +3322,12 @@ function renderGapInsights(job) {
                 <span style="font-size:11px; text-transform:uppercase; color:#fab387; font-weight:700; letter-spacing:0.5px;">
                     ⚠️ Gaps to address${legacy ? " (from last analysis)" : ""}</span>
                 <ul style="margin:4px 0 0 18px; padding:0;">${bullets(gaps)}</ul>
+            </div>` : "",
+        partials && partials.length ? `
+            <div style="margin-top:10px;">
+                <span style="font-size:11px; text-transform:uppercase; color:#f9e2af; font-weight:700; letter-spacing:0.5px;">
+                    ◐ Partial coverage${legacy ? " (from last analysis)" : ""}</span>
+                <ul style="margin:4px 0 0 18px; padding:0;">${bullets(partials)}</ul>
             </div>` : "",
         strengths && strengths.length ? `
             <div style="margin-top:10px;">
@@ -3313,17 +3369,18 @@ function openJobDetailsModal(jobId) {
     }
 
     // Score & Analysis
-    const hasScore = job.match_score !== null && job.match_score !== undefined;
+    const hasScore = job.match_scored === true
+        && job.match_score !== null && job.match_score !== undefined;
     const score = hasScore ? Math.round(job.match_score) : null;
     const circleEl = document.getElementById("modal-score-circle");
     if (hasScore) {
         circleEl.innerText = `${score}%`;
-        circleEl.title = job.match_scored ? "AI match score" : "Source baseline — not AI match-scored";
+        circleEl.title = "AI match score";
     } else {
         circleEl.innerText = "—";
         circleEl.title = "Not yet analyzed";
     }
-    const unscoredCue = (!hasScore || !job.match_scored)
+    const unscoredCue = !hasScore
         ? "\n\nℹ️ This role has not been AI match-scored. Run '⚡ Tailor AI' to generate a real ATS score."
         : "";
     document.getElementById("modal-analysis-details").innerText = (job.match_analysis || "Comparison summary available.") + unscoredCue;
@@ -3799,6 +3856,9 @@ async function loadPreferencesFromServer() {
         if (data.skip_topics !== undefined && data.skip_topics !== null) {
             state.skipTopics = data.skip_topics;
         }
+        if (Array.isArray(data.extra_skills)) {
+            state.extraSkills = data.extra_skills;
+        }
         applyFeatureFlags(data.features || {});
         initTargetPreferences();
     } catch (e) {
@@ -3814,6 +3874,9 @@ async function persistPreferencesToServer(featuresOverride, excludedOverride, sk
         if (excluded !== undefined && excluded !== null) payload.excluded_companies = excluded;
         const skipTopics = skipTopicsOverride !== undefined ? skipTopicsOverride : state.skipTopics;
         if (skipTopics !== undefined && skipTopics !== null) payload.skip_topics = skipTopics;
+        if (state.extraSkills !== undefined && state.extraSkills !== null) {
+            payload.extra_skills = state.extraSkills;
+        }
         await fetch(`${API_BASE}/api/preferences`, {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
@@ -3855,6 +3918,9 @@ async function populateSettingsPanel() {
     const skipTopicsEl = document.getElementById("set-skip-topics");
     if (skipTopicsEl) skipTopicsEl.value = (state.skipTopics !== undefined && state.skipTopics !== null)
         ? state.skipTopics : "";
+    const extraSkillsEl = document.getElementById("set-extra-skills");
+    if (extraSkillsEl) extraSkillsEl.value = Array.isArray(state.extraSkills)
+        ? state.extraSkills.join(", ") : "";
     try {
         const res = await fetch(`${API_BASE}/api/settings/llm`);
         if (res.ok) {
@@ -3866,7 +3932,44 @@ async function populateSettingsPanel() {
         }
     } catch (e) { /* settings endpoint optional */ }
     loadGmailSection();
+    loadEmbeddingSection();
     switchSettingsTab("preferences");
+}
+
+async function loadEmbeddingSection() {
+    const statusEl = document.getElementById("set-embedding-status");
+    if (!statusEl) return;
+    try {
+        const res = await fetch(`${API_BASE}/api/settings/embeddings`);
+        if (!res.ok) { statusEl.innerText = "Embedding settings unavailable."; return; }
+        const s = await res.json();
+        const backendEl = document.getElementById("set-embedding-backend");
+        if (backendEl) backendEl.value = s.backend;
+        const modelEl = document.getElementById("set-embedding-model");
+        if (modelEl && !modelEl.value) modelEl.value = s.model;
+        const urlEl = document.getElementById("set-embedding-server-url");
+        if (urlEl) urlEl.value = s.server_url || "";
+        const srvModelEl = document.getElementById("set-embedding-server-model");
+        if (srvModelEl) srvModelEl.value = s.server_model || "";
+        const dlEl = document.getElementById("set-embedding-allow-download");
+        if (dlEl) dlEl.checked = !!s.allow_download;
+        statusEl.innerText = `Active: ${s.active_backend} · ${s.dim}-d · standalone model ${s.model_cached ? "cached" : "not cached"}.`;
+    } catch (e) {
+        statusEl.innerText = "Embedding settings unavailable.";
+    }
+}
+
+async function downloadEmbeddingModel() {
+    showToast("⬇️ Downloading embedding model (this may take a moment)…");
+    try {
+        const res = await fetch(`${API_BASE}/api/settings/embeddings/download`, { method: "POST" });
+        if (!res.ok) throw new Error("Download failed");
+        const s = await res.json();
+        showToast(s.model_cached ? "✅ Embedding model ready." : "⚠️ Model not cached yet — check network/logs.");
+    } catch (e) {
+        showToast("⚠️ " + e.message);
+    }
+    loadEmbeddingSection();
 }
 
 async function loadGmailSection() {
@@ -3952,6 +4055,16 @@ async function saveSettingsModal() {
     const excluded = exclEl ? exclEl.value : undefined;
     const skipTopicsEl = document.getElementById("set-skip-topics");
     const skipTopics = skipTopicsEl ? skipTopicsEl.value : undefined;
+    const extraSkillsEl = document.getElementById("set-extra-skills");
+    const extraSkills = extraSkillsEl
+        ? extraSkillsEl.value
+              .split(",")
+              .map(s => s.trim())
+              .filter(s => s)
+        : [];
+    if (extraSkills.length > 0 || state.extraSkills !== undefined) {
+        state.extraSkills = extraSkills;
+    }
     await persistPreferencesToServer(features, excluded, skipTopics);
     applyFeatureFlags(features);
 
@@ -3969,6 +4082,27 @@ async function saveSettingsModal() {
             body: JSON.stringify(body)
         });
     } catch (e) { /* ignore */ }
+
+    const embModelEl = document.getElementById("set-embedding-model");
+    const embBackendEl = document.getElementById("set-embedding-backend");
+    const embDownloadEl = document.getElementById("set-embedding-allow-download");
+    const embUrlEl = document.getElementById("set-embedding-server-url");
+    const embSrvModelEl = document.getElementById("set-embedding-server-model");
+    if (embBackendEl) {
+        try {
+            await fetch(`${API_BASE}/api/settings/embeddings`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    backend: embBackendEl.value,
+                    model: embModelEl ? embModelEl.value.trim() : undefined,
+                    allow_download: embDownloadEl ? embDownloadEl.checked : undefined,
+                    server_url: embUrlEl ? embUrlEl.value.trim() : undefined,
+                    server_model: embSrvModelEl ? embSrvModelEl.value.trim() : undefined
+                })
+            });
+        } catch (e) { /* ignore */ }
+    }
 
     initTargetPreferences();
     showToast("⚙️ Settings saved.");
@@ -4763,6 +4897,7 @@ window.preseedAllCompanies = preseedAllCompanies;
 window.quickAddCompany = quickAddCompany;
 window.scrapeCompanyJobs = scrapeCompanyJobs;
 window.scanAndOpenCompanyRadar = scanAndOpenCompanyRadar;
+window.updateSkillsInsights = updateSkillsInsights;
 window.openEditCompanyModal = openEditCompanyModal;
 window.closeEditCompanyModal = closeEditCompanyModal;
 window.saveCompanyEdit = saveCompanyEdit;
@@ -4942,7 +5077,7 @@ function renderCopilotMessages() {
                             <div class="copilot-job-card-title">${escapeHTML(j.title)}</div>
                             <div class="copilot-job-card-company">${escapeHTML(j.company)} • ${escapeHTML(j.location || 'Remote')}</div>
                         </div>
-                        <span class="badge ${(j.match_score || 0) >= 80 ? 'active' : 'verified'}" style="font-size: 10px;">${j.match_score != null ? Math.round(j.match_score) + '% Match' : 'Not scored'}</span>
+                        <span class="badge ${(j.match_score || 0) >= 80 ? 'active' : 'verified'}" style="font-size: 10px;">${(j.match_scored || (j.match_score || 0) > 0) ? Math.round(j.match_score) + '% Match' : 'Not scored'}</span>
                     </div>
                     <div class="copilot-job-card-actions">
                         <button class="copilot-card-btn" onclick="copilotApplyJob(${j.id})">⚡ Apply</button>

@@ -23,6 +23,11 @@ geonamescache==3.0.2
 pycountry==26.2.16
 # scikit-learn==1.5.2  # Optional: Install manually if needed for ML-trained classifier
 # On Python 3.14+, pre-built wheels may not be available; fallback heuristic is always active
+# Optional local embedding backend (in-process ONNX). Degrades to the built-in
+# deterministic hash fallback when absent, so the app runs fully offline without it.
+onnxruntime>=1.17.0
+tokenizers>=0.15.0
+huggingface_hub>=0.23.0
 
 # NOTE: PyMuPDF (pymupdf / pymupdf4llm) is intentionally NOT a dependency because it is
 # dual-licensed AGPL-3.0 / Artifex Commercial, which is incompatible with this project's MIT

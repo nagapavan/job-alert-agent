@@ -238,6 +238,7 @@ class JobAgentRuntimeAdapter {
   _formatMatchAnalysis(score, data) {
     const strengths = (data.strengths || []).map(s => String(s).trim()).filter(Boolean).slice(0, 6);
     const gaps = (data.gaps || []).map(g => String(g).trim()).filter(Boolean).slice(0, 6);
+    const partials = (data.partials || []).map(p => String(p).trim()).filter(Boolean).slice(0, 6);
     const feedback = String(data.feedback || data.summary || "").trim();
     const band = String(data.band || "").trim();
     const rec = String(data.apply_recommendation || "").trim();
@@ -265,6 +266,11 @@ class JobAgentRuntimeAdapter {
     lines.push("");
     lines.push("Missing Keywords / Gaps:");
     lines.push(gaps.length ? gaps.map(g => `• ${g}`).join("\n") : "• None detected.");
+    if (partials.length) {
+      lines.push("");
+      lines.push("Partial Coverage (you have some evidence — not full):");
+      lines.push(partials.map(p => `• ${p}`).join("\n"));
+    }
     if (missingMust.length) {
       lines.push("");
       lines.push("Missing Must-Haves:");

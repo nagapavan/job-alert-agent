@@ -419,6 +419,17 @@
                     </div>
                 </div>
 
+                <!-- Skills Insights: ranked resume gaps across scored jobs (deterministic aggregation) -->
+                <div class="insights-card" id="skills-insights-card">
+                    <div class="insights-head">
+                        <h3><span class="stat-icon">📈</span> Skills Insights</h3>
+                        <span class="insights-sub" id="skills-insights-meta"></span>
+                    </div>
+                    <div class="insights-gaps" id="skills-insights-gaps">
+                        <span class="insights-empty">Loading…</span>
+                    </div>
+                </div>
+
                 <!-- Job Listings Filter & Container -->
                 <div class="listings-container">
                     <!-- Compact Active Target Criteria Bar -->
@@ -1373,6 +1384,13 @@
                             <div class="settings-hint" style="margin-bottom:6px;">Comma-separated; only skips jobs where these skills are in must-have requirements or titles.</div>
                             <input id="set-skip-topics" class="settings-input" placeholder="vue, ruby, angular" />
                         </div>
+
+                        <!-- Extra skills override -->
+                        <div class="settings-group">
+                            <div class="settings-group-title">⭐ Extra skills</div>
+                            <div class="settings-hint" style="margin-bottom:6px;">Comma-separated; added on top of resume-extracted skills when scoring jobs.</div>
+                            <input id="set-extra-skills" class="settings-input" placeholder="Temporal, Grafana, Kafka Streams" />
+                        </div>
                     </div>
 
                     <div id="settings-tab-models" class="settings-tab-panel" style="display:none;">
@@ -1389,6 +1407,34 @@
                         <label>Anthropic API Key <span id="set-anthropic-status" class="settings-hint"></span></label>
                         <input id="set-anthropic-key" type="password" class="settings-input"
                             placeholder="Leave blank to keep current" />
+
+                        <h4 class="settings-title" style="margin-top:18px;">🧠 Embedding Model
+                            <span class="settings-hint">(local-first; powers semantic matching, Q&amp;A cache &amp;
+                                dismissal)</span></h4>
+                        <div id="set-embedding-status" class="settings-hint" style="margin:4px 0 10px;">Checking…</div>
+                        <label>Backend</label>
+                        <select id="set-embedding-backend" class="settings-input">
+                            <option value="auto">Auto (standalone when cached, else external, else hash)</option>
+                            <option value="standalone">Standalone (in-process ONNX model)</option>
+                            <option value="external">External embedding server (Ollama / LM Studio / custom)</option>
+                            <option value="hash">Deterministic hash (no semantics)</option>
+                        </select>
+                        <label>Model <span class="settings-hint">(HuggingFace repo id, 384-d)</span></label>
+                        <input id="set-embedding-model" class="settings-input"
+                            placeholder="Xenova/bge-small-en-v1.5" spellcheck="false" />
+                        <label>External server URL <span class="settings-hint">(blank = Ollama default)</span></label>
+                        <input id="set-embedding-server-url" class="settings-input"
+                            placeholder="http://localhost:11434" spellcheck="false" />
+                        <label>External server model <span class="settings-hint">(blank = server default)</span></label>
+                        <input id="set-embedding-server-model" class="settings-input"
+                            placeholder="nomic-embed-text" spellcheck="false" />
+                        <label class="settings-check"><input type="checkbox" id="set-embedding-allow-download">
+                            Allow downloading the standalone model on first use</label>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+                            <button class="btn btn-outline btn-sm" onclick="downloadEmbeddingModel()">Download / warm up model</button>
+                        </div>
+                        <div class="settings-hint" style="margin-top:6px;">Changing the model requires a reindex —
+                            existing vectors are re-embedded when you next rescore.</div>
                     </div>
 
                     <div id="settings-tab-gmail" class="settings-tab-panel" style="display:none;">

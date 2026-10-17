@@ -2607,48 +2607,22 @@ def generate_consolidated_application_package(
 def generate_embeddings(text: str, dimensions: int = 384) -> list[float]:
     """
     Generates embedding vector (default 384 dimensions) for semantic retrieval.
-    Tries Ollama embeddings first, with fallback to an L2-normalized deterministic vectorizer.
+
+    Delegates to the pluggable local-first chain in ``backend.embeddings``:
+    in-process ONNX model -> Ollama -> deterministic hash fallback.
     """
     if not text or not text.strip():
         return [0.0] * dimensions
 
-    truncated = text[:4000]
+    from backend.embeddings import embed_text
 
-    # 1. Try Ollama embeddings endpoint
-    try:
-        base = OLLAMA_BASE_URL.rstrip("/")
-        url = f"{base}/api/embeddings"
-        payload = {"model": OLLAMA_MODEL, "prompt": truncated}
-        res = requests.post(url, json=payload, timeout=10)
-        if res.status_code == 200:
-            embedding = res.json().get("embedding", [])
-            if embedding:
-                # Resize or pad vector to required dimensions
-                if len(embedding) > dimensions:
-                    vec = embedding[:dimensions]
-                elif len(embedding) < dimensions:
-                    vec = embedding + [0.0] * (dimensions - len(embedding))
-                else:
-                    vec = embedding
+    vector = embed_text(text)
 
-                # L2 normalize
-                norm = sum(x * x for x in vec) ** 0.5
-                return [x / norm for x in vec] if norm > 0 else vec
-    except Exception as e:
-        logger.debug(f"Ollama embeddings offline or failed: {e}")
-
-    # 2. Deterministic Fallback Vectorizer (L2-normalized character/word hash)
-    # Allows fully functional semantic/cosine similarity even without an embedding model running
-    import hashlib
-
-    vector = [0.0] * dimensions
-    words = truncated.lower().split()
-
-    for word in words:
-        h = int(hashlib.md5(word.encode("utf-8")).hexdigest(), 16)
-        idx = h % dimensions
-        weight = 1.0 + (len(word) / 10.0)
-        vector[idx] += weight
+    # Enforce the caller's requested dimensionality (the chain always emits 384-d).
+    if len(vector) > dimensions:
+        vector = vector[:dimensions]
+    elif len(vector) < dimensions:
+        vector = list(vector) + [0.0] * (dimensions - len(vector))
 
     norm = sum(x * x for x in vector) ** 0.5
     if norm > 0:

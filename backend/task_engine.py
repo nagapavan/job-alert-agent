@@ -229,6 +229,23 @@ class BackgroundTaskEngine:
                 return True
             return False
 
+    def cancel_all(self) -> int:
+        """Cooperatively cancel every queued/running task. Returns the count cancelled.
+
+        Used by graceful shutdown so an in-flight scrape/bulk-apply does not get abandoned
+        mid-write when the process receives SIGTERM/SIGINT.
+        """
+        cancelled = 0
+        with self._lock:
+            targets = [
+                t for t in self._tasks.values()
+                if t.progress.status in (TaskStatus.QUEUED, TaskStatus.RUNNING)
+            ]
+        for task in targets:
+            if self.cancel_task(task.task_id):
+                cancelled += 1
+        return cancelled
+
     def get_task(self, task_id: str) -> Optional[TaskProgress]:
         with self._lock:
             t = self._tasks.get(task_id)

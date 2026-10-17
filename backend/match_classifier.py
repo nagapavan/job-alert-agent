@@ -14,10 +14,17 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 import numpy as np
 
+from backend import section_intent
+
 logger = logging.getLogger("match_classifier")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CLASSIFIER_PATH = BASE_DIR / "data" / "match_classifier.pkl"
+
+# Training floors. Learning is refused below these so a model fitted on a handful of
+# outcomes cannot silently ship and degrade scoring (see backend/learning_signals.py).
+MIN_TRAINING_SAMPLES = 50
+MIN_PER_CLASS_SAMPLES = 15
 
 
 @dataclass
@@ -195,70 +202,18 @@ def extract_match_features(
 # JD text + parsed resume, so must/nice coverage can be computed without an LLM.
 # ---------------------------------------------------------------------------
 
-_SKILL_ALIASES = {
-    "golang": "go",
-    "postgres": "postgresql",
-    "k8s": "kubernetes",
-    "amazon web services": "aws",
-    "google cloud platform": "gcp",
-    "google cloud": "gcp",
-    "microsoft azure": "azure",
-    "llms": "llm",
-    "apache kafka": "kafka",
-    # Node.js is frequently written "nodejs"/"node.js" in resumes/JDs; both collapse
-    # to the canonical "node.js" so a Node developer gets credit against JS requirements.
-    "nodejs": "node.js",
-}
-
-# Surface spellings (alias keys) for each canonical skill, so a resume/JD that writes
-# "NodeJS" is still detected when we scan for the canonical "node.js".
-_SKILL_ALIAS_SURFACES: "dict[str, set]" = {}
-for _surface, _canon in _SKILL_ALIASES.items():
-    _SKILL_ALIAS_SURFACES.setdefault(_canon, set()).add(_surface)
-
-# Broad JD terms credit a partial match when the resume has related technologies.
-_CONCEPT_GROUPS = {
-    "distributed systems": {
-        "kafka", "grpc", "microservices", "rabbitmq", "redis",
-        "elasticsearch", "celery", "system design", "kubernetes",
-    },
-    "microservices": {"grpc", "docker", "kubernetes", "kafka", "rabbitmq", "rest api"},
-    "system design": {"microservices", "distributed systems", "grpc", "kafka", "rest api"},
-    "machine learning": {"llm", "nlp", "pytorch", "tensorflow", "pandas", "numpy", "scikit-learn"},
-    # Front-end language family: knowing one language transfers partially to the others
-    # (a Node.js developer is partially aligned with a JavaScript/TypeScript requirement).
-    "javascript": {"node.js", "typescript"},
-    "typescript": {"javascript", "node.js"},
-    "node.js": {"javascript", "typescript"},
-}
-
-_CLOUD_PROVIDERS = {"aws", "gcp", "azure"}
+# Skill vocabulary, aliases and concept groups come from the curated taxonomy
+# (data/skill_taxonomy.json) so the vocabulary can grow without code changes.
+from backend.skill_taxonomy import (
+    CLOUD_PROVIDERS as _CLOUD_PROVIDERS,
+    CONCEPT_GROUPS as _CONCEPT_GROUPS,
+    DISPLAY_SKILLS as _DISPLAY_SKILLS,
+    alias_surfaces as _alias_surfaces,
+    normalize_skill as _normalize_skill,
+)
 
 # Higher rank satisfies a lower education requirement (Masters meets Bachelor's, not vice versa).
 _EDU_RANK = {"high_school": 0, "associate": 1, "bachelor": 2, "master": 3, "phd": 4}
-
-_NICE_SECTION_RE = re.compile(
-    r"(preferred qualifications?|nice[\s-]?to[\s-]?have|good[\s-]?to[\s-]?have|"
-    r"bonus points?|a plus|desirable|stand out|standout|ideally)",
-    re.I,
-)
-
-# Company-intro block; skills mentioned only in this marketing prose (e.g. "40-year old
-# C++ code") are not treated as requirements. We skip from the intro to the next heading,
-# rather than requiring an explicit "Requirements" marker, so skill lists that appear
-# before a heading are still captured.
-_INTRO_RE = re.compile(
-    r"(about us|about the company|about the team|about the role|who we are|"
-    r"company overview|our story|our mission)",
-    re.I,
-)
-_SECTION_HEADING_RE = re.compile(
-    r"(what you'?ll do|what you'?ll be doing|how you'?ll make an impact|responsibilities|"
-    r"the role|role expectations|your role|who you are|what you bring|what you'?ll need|"
-    r"what we'?re looking for|key qualifications|preferred qualifications|requirements|"
-    r"qualifications|must[\s-]?have|skills|you have)",
-    re.I,
-)
 
 _SENIORITY_RANK = {
     "intern": 0, "junior": 1, "mid": 2, "senior": 3, "lead": 4,
@@ -278,28 +233,18 @@ def _skill_patterns(skill: str) -> "List[re.Pattern]":
     since resumes/JDs frequently write it without the dot.
     """
     patterns = [_skill_token(skill)]
-    patterns += [
-        _skill_token(surface)
-        for surface in _SKILL_ALIAS_SURFACES.get(_normalize_skill(skill), set())
-    ]
+    patterns += [_skill_token(surface) for surface in _alias_surfaces(skill)]
     return patterns
 
 
 def _resume_skill_scan(resume_text: str) -> "set[str]":
     """Skills detected from raw resume text (union of canonical + alias surfaces)."""
-    from backend.parser import COMMON_TECH_SKILLS  # local import avoids a cycle
-
     lowered = (resume_text or "").lower()
     found = set()
-    for s in COMMON_TECH_SKILLS:
+    for s in _DISPLAY_SKILLS:
         if any(p.search(lowered) for p in _skill_patterns(s)):
             found.add(_normalize_skill(s))
     return found
-
-
-def _normalize_skill(name: str) -> str:
-    t = (name or "").strip().lower()
-    return _SKILL_ALIASES.get(t, t)
 
 
 def build_deterministic_assessment(
@@ -314,7 +259,6 @@ def build_deterministic_assessment(
     education, certifications) that dominate requirement-coverage scoring.
     """
     from backend import jd_signals, resume_signals
-    from backend.parser import COMMON_TECH_SKILLS
     from backend.match_scoring import (
         RequirementAssessment,
         RequirementItem,
@@ -329,7 +273,6 @@ def build_deterministic_assessment(
     jd = job_description or ""
     jd_lower = jd.lower()
     reqs: List[RequirementItem] = []
-
     resume_skills = {
         _normalize_skill(s) for s in ((parsed_resume or {}).get("skills") or [])
     }
@@ -343,25 +286,23 @@ def build_deterministic_assessment(
         [resume_text or ""] + [str(s) for s in ((parsed_resume or {}).get("skills") or [])]
     ).lower()
 
-    nice_match = _NICE_SECTION_RE.search(jd)
-    nice_start = nice_match.start() if nice_match else len(jd)
-    # Skip the company-intro block (if any) so marketing prose is not read as requirements.
-    # Only honor the skip when it still leaves extractable skills; otherwise a nav/footer
-    # "About Us" could wipe the entire posting. Fall back to scanning the whole JD.
-    intro_match = _INTRO_RE.search(jd)
-    scan_start = 0
-    if intro_match:
-        next_heading = _SECTION_HEADING_RE.search(jd, intro_match.end())
-        candidate = next_heading.start() if next_heading else intro_match.end()
-        if candidate < len(jd) and any(
-            _skill_token(s).search(jd_lower, candidate) for s in COMMON_TECH_SKILLS
-        ):
-            scan_start = candidate
+    # Section-aware: split the JD into required / preferred / intro spans using the
+    # shared section-intent primitive, then blank out company-intro prose so marketing
+    # sentences (e.g. "40-year old C++ code") are not read as requirements. Offsets are
+    # preserved by masking, so category lookups stay aligned with the original text.
+    spans = section_intent.jd_section_spans(jd)
+    intro_spans = [s for s in spans if s.label == "intro"]
+    jd_scan = section_intent.mask_spans(jd, intro_spans)
+    jd_scan_lower = jd_scan.lower()
+
+    def _category_at(offset: int) -> str:
+        label = section_intent.label_at(spans, offset)
+        return NICE_TO_HAVE if label == "preferred" else MUST_HAVE
 
     # Parse experience signals first, so a technology that carries a years requirement is
     # not also credited as a plain (presence-only) skill. Scoped past the intro to avoid
     # prose like "40-year old C++ code".
-    hints = jd_signals.parse_experience(jd[scan_start:] if scan_start else jd)
+    hints = jd_signals.parse_experience(jd_scan)
     candidate_years = resume_signals.estimate_total_years(parsed_resume)
     tech_hints = [h for h in hints if h.get("scope") == "technology" and h.get("technology")]
     total_hints = [h for h in hints if (h.get("scope") or "total") == "total"]
@@ -371,15 +312,21 @@ def build_deterministic_assessment(
 
     seen = set()
     cloud_hits = []
-    for skill in COMMON_TECH_SKILLS:
+    for skill in _DISPLAY_SKILLS:
         norm = _normalize_skill(skill)
         if norm in seen or norm in tech_required:
             continue
-        m = _skill_token(skill).search(jd_lower, scan_start)
+        # Match the display name OR any alias surface (e.g. "golang" -> Go,
+        # "genai" -> LLM, "prompt design" -> Prompt Engineering).
+        m = None
+        for pattern in _skill_patterns(skill):
+            m = pattern.search(jd_scan_lower)
+            if m:
+                break
         if not m:
             continue
         seen.add(norm)
-        category = NICE_TO_HAVE if m.start() >= nice_start else MUST_HAVE
+        category = _category_at(m.start())
         if norm in resume_skills:
             status = MET
         elif _CONCEPT_GROUPS.get(norm, set()) & resume_skills:
@@ -412,6 +359,27 @@ def build_deterministic_assessment(
     else:
         for s, c, st in cloud_hits:
             reqs.append(RequirementItem(text=s, kind="skill", category=c, status=st))
+
+    # Residual JD units (Tier A/B): phrases the taxonomy does not cover are credited only
+    # when the candidate's own resume evidences them; otherwise they are queued for
+    # taxonomy review rather than scored (never invent requirements from JD prose).
+    try:
+        from backend import requirements_extractor
+
+        for item in requirements_extractor.extract_residual_requirements(
+            jd, spans, resume_text=resume_text or resume_blob
+        ):
+            reqs.append(
+                RequirementItem(
+                    text=item["text"],
+                    kind="skill",
+                    category=item["category"],
+                    status=PARTIAL,
+                    evidence=item.get("evidence", ""),
+                )
+            )
+    except Exception as exc:  # noqa: BLE001 - residual mining is best-effort
+        logger.debug(f"Residual requirement extraction skipped: {exc}")
 
     # Technology-scoped years (e.g. "3 years Golang"): the resume confirms presence of the
     # technology but not the exact tenure, so presence earns partial — never a full "met".
@@ -542,11 +510,17 @@ def build_deterministic_assessment(
 
 
 def train_classifier_from_db(db_session, output_path: Optional[Path] = None):
-    """
-    Train a logistic regression classifier on historical assessments.
+    """Train a logistic-regression classifier on *implicit user outcomes*.
 
-    Loads jobs with match_scored=True, extracts features, and trains.
-    Saves to data/match_classifier.pkl (or custom output_path).
+    Labels are derived by :mod:`backend.learning_signals` from real behaviour (the user
+    applied, or deliberately dismissed a role) — never from the model's own previous
+    output. System-generated states (discovery auto-filtering, rows pre-set at ingestion)
+    are excluded, because they carry no preference signal.
+
+    Refuses to train below ``MIN_TRAINING_SAMPLES`` with at least
+    ``MIN_PER_CLASS_SAMPLES`` in each class. This is deliberate: a model fitted on a
+    handful of positives would memorise noise and silently degrade scoring while looking
+    like it had learned something.
     """
     try:
         from sklearn.linear_model import LogisticRegression
@@ -557,66 +531,97 @@ def train_classifier_from_db(db_session, output_path: Optional[Path] = None):
         return False
 
     from backend.database import Job
-    from backend import jd_signals, resume_signals, match_scoring
+    from backend import learning_signals, jd_signals
 
     output = output_path or CLASSIFIER_PATH
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    # Query training data: jobs with assessed matches
-    jobs = (
-        db_session.query(Job)
-        .filter(Job.match_scored == True, Job.match_score != None)
-        .limit(500)  # Cap training set for now
-        .all()
-    )
+    decisions = learning_signals.collect_decisions(db_session)
+    trainable = [d for d in decisions if d.is_trainable]
+    excluded = len(decisions) - len(trainable)
 
-    if len(jobs) < 10:
+    positives = [d for d in trainable if d.label in (
+        learning_signals.POSITIVE, learning_signals.STRONG_POSITIVE
+    )]
+    negatives = [d for d in trainable if d.label in (
+        learning_signals.NEGATIVE, learning_signals.NEGATIVE_OUTCOME
+    )]
+
+    if len(trainable) < MIN_TRAINING_SAMPLES:
         logger.warning(
-            f"Insufficient training data ({len(jobs)} jobs); classifier not trained"
+            "Insufficient training signal: %d trainable decisions (need >= %d). "
+            "%d rows excluded as system-generated. Not training.",
+            len(trainable), MIN_TRAINING_SAMPLES, excluded,
+        )
+        return False
+    if min(len(positives), len(negatives)) < MIN_PER_CLASS_SAMPLES:
+        logger.warning(
+            "Insufficient class balance: %d positive / %d negative "
+            "(need >= %d each). Not training.",
+            len(positives), len(negatives), MIN_PER_CLASS_SAMPLES,
         )
         return False
 
-    logger.info(f"Training classifier on {len(jobs)} historical assessments")
+    logger.info(
+        "Training classifier on %d user decisions (%d positive, %d negative); "
+        "%d system-generated rows excluded",
+        len(trainable), len(positives), len(negatives), excluded,
+    )
 
     X_list = []
     y_list = []
 
-    for job in jobs:
+    for decision in trainable:
         try:
-            # Re-extract signals deterministically
-            jd_hints = jd_signals.parse_experience(job.description or "")
-            parsed_resume = None  # We don't have resume context here; use None
-            assessment = None  # We don't have the full assessment; use basic heuristic
-
-            features = extract_match_features(parsed_resume, jd_hints, assessment)
-            X = TrainedClassifier._features_to_array(features)
-
-            # Target: threshold match_score at 60% for binary classification
-            # (this is a simplification; you can tune or make it regression)
-            y = 1 if (job.match_score or 0) >= 60 else 0
-
-            X_list.append(X)
-            y_list.append(y)
+            job = db_session.query(Job).filter(Job.id == decision.job_id).first()
+            if job is None:
+                continue
+            # Re-derive features from the job's own JD so training uses the same code path
+            # as live scoring (train/serve parity). Stored match_*_json columns are NULL for
+            # progressed rows, so they cannot be used as features.
+            assessment = build_deterministic_assessment(
+                job.description or "", None, job_title=job.title or ""
+            )
+            if not assessment.requirements:
+                continue
+            jd_hints = {
+                "min_years": 0,
+                "max_years": 100,
+                "seniority_level": jd_signals.seniority_level(job.title or ""),
+                "education_mentioned": bool(jd_signals.parse_education(job.description or "")),
+            }
+            features = extract_match_features(None, jd_hints, assessment=assessment)
+            X_list.append(TrainedClassifier._features_to_array(features))
+            y_list.append(
+                1 if decision.label in (
+                    learning_signals.POSITIVE, learning_signals.STRONG_POSITIVE
+                ) else 0
+            )
         except Exception as e:
-            logger.debug(f"Skipped job {job.id}: {e}")
+            logger.debug(f"Skipped job {decision.job_id}: {e}")
             continue
 
-    if len(X_list) < 10:
-        logger.warning("Not enough valid samples to train classifier")
+    if len(X_list) < MIN_TRAINING_SAMPLES:
+        logger.warning(
+            "Only %d rows yielded usable features (need >= %d). Not training.",
+            len(X_list), MIN_TRAINING_SAMPLES,
+        )
         return False
 
     X_train = np.array(X_list, dtype=np.float32)
     y_train = np.array(y_list)
 
-    # Train logistic regression
+    if len(set(y_train.tolist())) < 2:
+        logger.warning("Training data contains a single class; not training.")
+        return False
+
     model = LogisticRegression(max_iter=1000, random_state=42)
     model.fit(X_train, y_train)
 
-    # Save model
     with open(output, "wb") as f:
         pickle.dump(model, f)
 
-    logger.info(f"✓ Trained classifier saved to {output}")
+    logger.info(f"Trained classifier saved to {output}")
     logger.info(f"  Features: {X_train.shape[1]}, Samples: {X_train.shape[0]}")
     logger.info(f"  Positive class: {y_train.sum()} / {len(y_train)}")
 

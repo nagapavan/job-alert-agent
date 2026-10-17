@@ -71,6 +71,15 @@ def isolate_llm_settings_file(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "backend.config.GMAIL_SETTINGS_FILE", tmp_path / "gmail_settings.json"
     )
+    monkeypatch.setattr(
+        "backend.config.EMBEDDING_SETTINGS_FILE", tmp_path / "embedding_settings.json"
+    )
+    # Never let the standalone ONNX backend attempt a network download during tests.
+    monkeypatch.setattr("backend.config._ENV_EMBEDDING_ALLOW_DOWNLOAD", "false")
+    monkeypatch.setattr("backend.config._ENV_EMBEDDING_BACKEND", None)
+    monkeypatch.setattr("backend.config._ENV_EMBEDDING_MODEL", None)
+    monkeypatch.setattr("backend.config._ENV_EMBEDDING_SERVER_URL", None)
+    monkeypatch.setattr("backend.config._ENV_EMBEDDING_SERVER_MODEL", None)
     yield
 
 

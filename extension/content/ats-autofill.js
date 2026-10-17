@@ -260,23 +260,35 @@
   // `JobDetails_AboutTheJob_<jobId>` id prefix, handled in the Tier-1 selector list below.
 
   // Host-agnostic challenge/blocked-page detection. Only an *actual* challenge surface
-  // counts: a challenge URL, a rendered reCAPTCHA challenge iframe, or a page whose
+  // counts: a challenge URL, a *visible* reCAPTCHA challenge iframe, or a page whose
   // visible text is dominated by bot-check language. Merely loading recaptcha/api.js,
   // having a `data-sitekey`, or an (often invisible) `.g-recaptcha` badge on a normal
   // form is NOT a challenge — that would false-positive on ordinary application pages.
+  // Nor is a chat/support widget that preloads a hidden reCAPTCHA: those frames report a
+  // size from getBoundingClientRect() even while collapsed, so size alone proves nothing.
   function isChallengeOrBlockedPage() {
     const href = (window.location.href || "").toLowerCase();
     const host = (window.location.hostname || "").toLowerCase();
     // 1. URL-level: challenge/blocked endpoints.
     if (/\/sorry\/|\/recaptcha\/|\/checkpoint|\/authwall|\/challenge/.test(href)) return true;
     if (host.includes("google.com") && /recaptcha|sorry/.test(href)) return true;
-    // 2. DOM-level: a *rendered* reCAPTCHA challenge iframe (the interstitial itself).
+    // 2. DOM-level: a reCAPTCHA challenge iframe that is *actually being displayed*.
     try {
       const frames = document.querySelectorAll("iframe[src*='google.com/recaptcha']");
       for (const f of frames) {
-        // The challenge frame renders with a visible size; the invisible badge is tiny.
+        if (!isFrameVisiblyRendered(f)) continue;
         const r = f.getBoundingClientRect();
-        if (r.width >= 250 && r.height >= 100) return true;
+        // Visible, on-screen, and interstitial-sized (the badge is tiny).
+        if (
+          r.width >= 250 &&
+          r.height >= 100 &&
+          r.bottom > 0 &&
+          r.right > 0 &&
+          r.top < (window.innerHeight || 0) &&
+          r.left < (window.innerWidth || 0)
+        ) {
+          return true;
+        }
       }
     } catch (e) {
       /* ignore */
@@ -285,6 +297,45 @@
     const bodyText = (document.body && (document.body.innerText || "")) || "";
     const head = bodyText.slice(0, 600).toLowerCase();
     return /unusual activity|unusual traffic|verify you'?re a human|let'?s do a quick security check|security verification|complete the captcha|i'?m not a robot/i.test(head);
+  }
+
+  // True only when an element is genuinely displayed to the user. getBoundingClientRect()
+  // still returns a non-zero box for collapsed/off-screen/hidden elements (e.g. a chat
+  // widget's preloaded reCAPTCHA), so we must check computed style and ancestor visibility.
+  function isFrameVisiblyRendered(el) {
+    try {
+      if (!el || !el.isConnected) return false;
+      const style = window.getComputedStyle(el);
+      if (!style) return false;
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        style.visibility === "collapse" ||
+        parseFloat(style.opacity || "1") === 0
+      ) {
+        return false;
+      }
+      // Walk ancestors: a hidden container hides the frame even if the frame itself is not.
+      let node = el.parentElement;
+      let hops = 0;
+      while (node && hops < 8) {
+        const ps = window.getComputedStyle(node);
+        if (
+          ps &&
+          (ps.display === "none" ||
+            ps.visibility === "hidden" ||
+            ps.visibility === "collapse" ||
+            parseFloat(ps.opacity || "1") === 0)
+        ) {
+          return false;
+        }
+        node = node.parentElement;
+        hops++;
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
   function extractJsonLdJobPosting() {

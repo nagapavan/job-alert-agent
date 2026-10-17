@@ -320,12 +320,131 @@ def save_llm_settings(openai_api_key=None, gemini_api_key=None, anthropic_api_ke
         pass
     return current
 
+# -------------------------------------------------------------
+# Embedding Backend Configuration (local-first, fixed 384-d contract)
+# - Embeddings power semantic search, Q&A caching, dismissal matching and
+#   requirement<->resume pairing. Preference order:
+#     standalone local ONNX model -> external embedding server -> hash fallback.
+# - EMBEDDING_BACKEND: "auto" | "standalone" | "external" | "ollama" | "hash"
+#     auto       -> standalone when cached, else external, else hash
+#     standalone -> in-process ONNX (may download on first use when allowed)
+#     external   -> any OpenAI-compatible embeddings endpoint (/v1/embeddings):
+#                   Ollama, LM Studio, Unsloth, vLLM, llama.cpp, or a custom URL
+#     ollama     -> external, pinned to the Ollama endpoint (back-compat alias)
+#     hash       -> deterministic fallback (no semantics; last resort)
+# - The vector dimension is a hard contract (SafeVector(384)). Changing the model
+#   does not change the dimension, but existing rows must be re-embedded.
+# -------------------------------------------------------------
+EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
+_ENV_EMBEDDING_BACKEND = os.environ.get("EMBEDDING_BACKEND")
+_ENV_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL")
+_ENV_EMBEDDING_SERVER_URL = os.environ.get("EMBEDDING_SERVER_URL")
+_ENV_EMBEDDING_SERVER_MODEL = os.environ.get("EMBEDDING_SERVER_MODEL")
+EMBEDDING_BACKEND = (_ENV_EMBEDDING_BACKEND or "auto").strip().lower()
+EMBEDDING_MODEL = (_ENV_EMBEDDING_MODEL or "Xenova/bge-small-en-v1.5").strip()
+# Generic external server URL (OpenAI-compatible). Empty -> Ollama default at runtime.
+EMBEDDING_SERVER_URL = (_ENV_EMBEDDING_SERVER_URL or "").strip()
+EMBEDDING_SERVER_MODEL = (_ENV_EMBEDDING_SERVER_MODEL or "").strip()
+EMBEDDING_CACHE_DIR = Path(
+    os.environ.get("EMBEDDING_CACHE_DIR", str(BASE_DIR / "data" / "models"))
+)
+# Allow the standalone ONNX backend to download model weights on first use. Default OFF
+# so tests and offline runs never hit the network; the Settings UI flips it on.
+_ENV_EMBEDDING_ALLOW_DOWNLOAD = os.environ.get("EMBEDDING_ALLOW_DOWNLOAD")
+EMBEDDING_ALLOW_DOWNLOAD = (_ENV_EMBEDDING_ALLOW_DOWNLOAD or "false").lower() in (
+    "true", "1", "yes", "on",
+)
+EMBEDDING_SETTINGS_FILE = BASE_DIR / "data" / "embedding_settings.json"
+
+_VALID_EMBEDDING_BACKENDS = ("auto", "standalone", "external", "ollama", "hash")
+
+_EMBEDDING_DEFAULTS = {
+    "backend": "auto",
+    "model": "Xenova/bge-small-en-v1.5",
+    "allow_download": False,
+    "server_url": "",
+    "server_model": "",
+}
+
+
+def _read_embedding_settings() -> dict:
+    """Loads persisted embedding settings (machine-level, not per-user)."""
+    settings = dict(_EMBEDDING_DEFAULTS)
+    if EMBEDDING_SETTINGS_FILE.exists():
+        try:
+            raw = json.loads(EMBEDDING_SETTINGS_FILE.read_text("utf-8"))
+            backend = str(raw.get("backend") or "").strip().lower()
+            if backend in _VALID_EMBEDDING_BACKENDS:
+                settings["backend"] = backend
+            model = str(raw.get("model") or "").strip()
+            if model:
+                settings["model"] = model
+            if "allow_download" in raw:
+                settings["allow_download"] = _bool(raw["allow_download"])
+            settings["server_url"] = str(raw.get("server_url") or "").strip()
+            settings["server_model"] = str(raw.get("server_model") or "").strip()
+        except Exception:
+            pass
+    return settings
+
+
+def get_embedding_settings() -> dict:
+    """Effective embedding settings; environment variables override persisted values."""
+    stored = _read_embedding_settings()
+    backend = (_ENV_EMBEDDING_BACKEND or stored["backend"]).strip().lower()
+    if backend not in _VALID_EMBEDDING_BACKENDS:
+        backend = "auto"
+    model = (_ENV_EMBEDDING_MODEL or stored["model"]).strip() or "Xenova/bge-small-en-v1.5"
+    allow_download = stored["allow_download"]
+    if _ENV_EMBEDDING_ALLOW_DOWNLOAD is not None:
+        allow_download = _ENV_EMBEDDING_ALLOW_DOWNLOAD.lower() in ("true", "1", "yes", "on")
+    server_url = _ENV_EMBEDDING_SERVER_URL or stored["server_url"]
+    server_model = _ENV_EMBEDDING_SERVER_MODEL or stored["server_model"]
+    return {
+        "backend": backend,
+        "model": model,
+        "allow_download": bool(allow_download),
+        "server_url": server_url,
+        "server_model": server_model,
+    }
+
+
+def save_embedding_settings(backend=None, model=None, allow_download=None,
+                            server_url=None, server_model=None) -> dict:
+    """Persists embedding backend/model selection. None leaves a value unchanged."""
+    current = _read_embedding_settings()
+    if backend is not None:
+        backend = str(backend).strip().lower()
+        if backend in _VALID_EMBEDDING_BACKENDS:
+            current["backend"] = backend
+    if model is not None and str(model).strip():
+        current["model"] = str(model).strip()
+    if allow_download is not None:
+        current["allow_download"] = _bool(allow_download)
+    if server_url is not None:
+        current["server_url"] = str(server_url).strip()
+    if server_model is not None:
+        current["server_model"] = str(server_model).strip()
+
+    EMBEDDING_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    EMBEDDING_SETTINGS_FILE.write_text(json.dumps(current, indent=2), encoding="utf-8")
+    try:
+        os.chmod(EMBEDDING_SETTINGS_FILE, 0o600)
+    except Exception:
+        pass
+    return current
+
+
 # Dynamic Model Routing
 ENABLE_DYNAMIC_MODEL_ROUTING = os.environ.get("ENABLE_DYNAMIC_MODEL_ROUTING", "true").lower() in ("true", "1", "yes")
 
 # LinkedIn automation is opt-in and rate-limited. Conservative inter-action pause (seconds)
 # to reduce load/risk on the user's LinkedIn session.
-LINKEDIN_AUTOMATION_PACING_SECONDS = float(os.environ.get("LINKEDIN_AUTOMATION_PACING_SECONDS", "2.5"))
+# Pacing between LinkedIn session-driven requests. LinkedIn's ToS §8.2 restricts
+# automated scripts; this value spaces out page loads so live sync and the repair
+# script (backend/scripts/repair_linkedin_saved_jobs.py) look less bursty. Default
+# 4.0s + 0-50% jitter (applied at call sites). Raise via env for stricter pacing.
+LINKEDIN_AUTOMATION_PACING_SECONDS = float(os.environ.get("LINKEDIN_AUTOMATION_PACING_SECONDS", "4.0"))
 
 # Self-identifying User-Agent for HTML/index scraping (custom careers pages, Google for Jobs).
 # Public ATS JSON APIs keep the standard browser UA; identifying crawlers is the compliance-

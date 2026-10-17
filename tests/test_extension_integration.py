@@ -339,6 +339,26 @@ def test_challenge_detection_ignores_invisible_recaptcha_on_normal_forms():
     assert "getBoundingClientRect" in guard
 
 
+def test_challenge_detection_requires_a_visible_challenge_frame():
+    """A preloaded/hidden reCAPTCHA (chat widget) must NOT flag the page.
+
+    Regression: a support widget preloads `api2/bframe`, which reports a plausible
+    bounding box even while collapsed. Size alone is not evidence of a displayed
+    challenge, so detection must also require genuine computed-style visibility.
+    """
+    src = _read("content/ats-autofill.js")
+    assert "function isFrameVisiblyRendered" in src
+    # The visibility helper rejects hidden/collapsed/transparent frames and ancestors.
+    helper = src[src.index("function isFrameVisiblyRendered"):]
+    helper = helper[: helper.index("\n  }\n") + 4]
+    assert "getComputedStyle" in helper
+    assert "visibility" in helper
+    # The frame branch must consult the visibility helper before trusting the box.
+    guard = src[src.index("function isChallengeOrBlockedPage"):]
+    guard = guard[: guard.index("\n  }\n") + 4]
+    assert "isFrameVisiblyRendered(f)" in guard
+
+
 def test_sidepanel_handles_challenge_and_unrendered_job():
     """The side panel shows an actionable state instead of a fabricated score."""
     src = _read("sidepanel/sidepanel.js")

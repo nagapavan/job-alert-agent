@@ -7,65 +7,9 @@ from pypdf import PdfReader
 # Lexicons & Regular Expressions (OpenResume / ATS Standard)
 # -------------------------------------------------------------
 
-COMMON_TECH_SKILLS = [
-    "Python",
-    "FastAPI",
-    "Django",
-    "Flask",
-    "PostgreSQL",
-    "MySQL",
-    "SQLite",
-    "MongoDB",
-    "Redis",
-    "Kafka",
-    "RabbitMQ",
-    "Docker",
-    "Kubernetes",
-    "AWS",
-    "GCP",
-    "Azure",
-    "Terraform",
-    "CI/CD",
-    "Git",
-    "GitHub",
-    "Linux",
-    "React",
-    "Next.js",
-    "TypeScript",
-    "JavaScript",
-    "HTML",
-    "CSS",
-    "Tailwind",
-    "Node.js",
-    "Express",
-    "GraphQL",
-    "REST API",
-    "Microservices",
-    "System Design",
-    "Distributed Systems",
-    "Machine Learning",
-    "LLM",
-    "LLMs",
-    "NLP",
-    "PyTorch",
-    "TensorFlow",
-    "Pandas",
-    "NumPy",
-    "Scikit-Learn",
-    "Java",
-    "Spring Boot",
-    "C++",
-    "C#",
-    "Go",
-    "Golang",
-    "Rust",
-    "SQL",
-    "Elasticsearch",
-    "Celery",
-    "Airflow",
-    "Apache Kafka",
-    "gRPC",
-]
+# Skill vocabulary is loaded from data/skill_taxonomy.json (curated, extensible data)
+# instead of a hardcoded list. A built-in fallback keeps the app working if it is absent.
+from backend.skill_taxonomy import DISPLAY_SKILLS as COMMON_TECH_SKILLS
 
 MONTH_REGEX_STR = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
 
@@ -127,45 +71,10 @@ TITLE_KEYWORDS = [
     "analyst",
 ]
 
-ALL_SECTION_HEADERS = {
-    "summary": [
-        "summary",
-        "professional summary",
-        "executive summary",
-        "profile",
-        "about me",
-        "objective",
-        "about",
-    ],
-    "experience": [
-        "work experience",
-        "professional experience",
-        "experience",
-        "employment history",
-        "career history",
-        "work history",
-    ],
-    "education": [
-        "education",
-        "academic background",
-        "academic history",
-        "qualifications",
-        "academics",
-        "education & certifications",
-        "education and certifications",
-    ],
-    "skills": [
-        "skills",
-        "technical skills",
-        "technical skill set",
-        "core competencies",
-        "technologies",
-        "skills & competencies",
-        "tech stack",
-    ],
-    "projects": ["projects", "key projects", "personal projects", "open source"],
-    "certifications": ["certifications", "licenses", "certificates", "awards"],
-}
+# Resume section headings are shared with the JD/heading-intent primitive so the same
+# vocabulary serves both, without duplicating phrase lists in each module.
+from backend.section_intent import RESUME_SECTION_HEADERS as ALL_SECTION_HEADERS
+from backend import section_intent
 
 # -------------------------------------------------------------
 # Text Normalization & Cleaners
@@ -368,13 +277,17 @@ def segment_resume_sections(text: str) -> Dict[str, str]:
         matched_section = None
 
         if len(line.split()) <= 4:
-            for sec_name, header_keywords in ALL_SECTION_HEADERS.items():
-                if any(
-                    cleaned_line == kw or cleaned_line.startswith(kw)
-                    for kw in header_keywords
-                ):
-                    matched_section = sec_name
-                    break
+            intent = section_intent.classify_heading(line, "resume")
+            if intent != "unknown":
+                matched_section = intent
+            else:
+                for sec_name, header_keywords in ALL_SECTION_HEADERS.items():
+                    if any(
+                        cleaned_line == kw or cleaned_line.startswith(kw)
+                        for kw in header_keywords
+                    ):
+                        matched_section = sec_name
+                        break
 
         if matched_section:
             current_section = matched_section

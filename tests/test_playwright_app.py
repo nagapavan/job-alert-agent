@@ -235,15 +235,10 @@ def test_scan_linkedin_job_recommendations():
     mock_title = MagicMock()
     mock_title.inner_text.return_value = "Staff AI Engineer"
     mock_title.get_attribute.return_value = "/jobs/view/987654321/"
-    mock_comp = MagicMock()
-    mock_comp.inner_text.return_value = "Anthropic"
-    mock_loc = MagicMock()
-    mock_loc.inner_text.return_value = "San Francisco, CA"
+    mock_card.inner_text.return_value = "Staff AI Engineer\nAnthropic · San Francisco, CA"
 
     mock_card.query_selector.side_effect = lambda sel: {
         ".job-card-list__title, a.job-card-container__link, .artdeco-entity-lockup__title a": mock_title,
-        ".job-card-container__company-name, .artdeco-entity-lockup__subtitle": mock_comp,
-        ".job-card-container__metadata-item, .artdeco-entity-lockup__caption": mock_loc
     }.get(sel)
 
     mock_page.query_selector_all.return_value = [mock_card]
@@ -327,5 +322,114 @@ def test_extract_linkedin_job_from_anchor_collapsed_card():
     assert rec["location"] == "Bengaluru"
     assert rec["is_closed"] is False
     assert "333" in rec["url"]
+
+
+def test_parse_linkedin_view_slug_splits_title_and_company_on_last_at():
+    from backend.playwright_app import _parse_linkedin_view_slug
+
+    assert _parse_linkedin_view_slug(
+        "https://www.linkedin.com/jobs/view/staff-software-engineer-at-databricks-4416423111"
+    ) == ("Staff Software Engineer", "Databricks")
+    # "data-at-scale-engineer" must not fool the split: use the LAST "-at-".
+    assert _parse_linkedin_view_slug(
+        "https://www.linkedin.com/jobs/view/data-at-scale-engineer-at-acme-4416423999"
+    ) == ("Data At Scale Engineer", "Acme")
+    # A bare numeric id carries no slug.
+    assert _parse_linkedin_view_slug("https://www.linkedin.com/jobs/view/4469681606/") == ("", "")
+
+
+def test_extract_linkedin_job_from_anchor_reads_semantic_children():
+    """The employer is read from its own element, never inferred from the role text."""
+    from backend.playwright_app import _extract_linkedin_job_from_anchor
+
+    anchor = MagicMock()
+    anchor.get_attribute.return_value = "/jobs/view/4461133182/?refId=abc"
+
+    def _evaluate(arg, *_):
+        if "job-card-list__title" in arg:
+            return {"title": "Staff Software Engineer", "company": "Databricks", "location": "Bengaluru"}
+        return "Staff Software EngineerDatabricks\nBengaluru\nSave"
+
+    anchor.evaluate.side_effect = _evaluate
+
+    rec = _extract_linkedin_job_from_anchor(anchor)
+    assert rec["title"] == "Staff Software Engineer"
+    assert rec["company"] == "Databricks"
+    assert rec["location"] == "Bengaluru"
+
+
+def test_extract_linkedin_job_from_anchor_strips_employer_glued_to_title():
+    """Slug carries the employer: a merged "TitleCompany" title must not duplicate it."""
+    from backend.playwright_app import _extract_linkedin_job_from_anchor
+
+    anchor = MagicMock()
+    anchor.get_attribute.return_value = (
+        "/jobs/view/principal-software-engineer-at-autodesk-4469681606/"
+    )
+    anchor.evaluate.return_value = (
+        "Principal Software EngineerAutodesk\nBengaluru, Karnataka, India (On-site)\nSave"
+    )
+    anchor.inner_text.return_value = "Principal Software EngineerAutodesk"
+
+    rec = _extract_linkedin_job_from_anchor(anchor)
+    assert rec["company"] == "Autodesk"
+    assert rec["title"] == "Principal Software Engineer"
+
+
+def test_extract_linkedin_job_never_mistakes_location_for_company():
+    """Merged title + numeric-only URL: the location row must not become the employer."""
+    from backend.playwright_app import _extract_linkedin_job_from_anchor
+
+    anchor = MagicMock()
+    anchor.get_attribute.return_value = "/jobs/view/4469681606/"
+    anchor.evaluate.return_value = (
+        "Principal Software Engineer\nBengaluru, Karnataka, India (On-site)\nSave"
+    )
+    anchor.inner_text.return_value = "Principal Software Engineer"
+
+    rec = _extract_linkedin_job_from_anchor(anchor)
+    assert rec["title"] == "Principal Software Engineer"
+    assert rec["company"] == "Unknown Company"
+    assert "Bengaluru" in rec["location"]
+
+
+def test_fetch_linkedin_job_details_reads_about_the_job_and_topcard():
+    from backend.playwright_app import fetch_linkedin_job_details
+
+    page = MagicMock()
+    page.evaluate.return_value = {
+        "description": "About the job\nWe build distributed systems in Go.",
+        "title": "Staff Software Engineer",
+        "company": "Databricks",
+        "canonical_url": "https://www.linkedin.com/jobs/view/staff-software-engineer-at-databricks-4461133182/",
+    }
+
+    details = fetch_linkedin_job_details(page, "https://www.linkedin.com/jobs/view/4461133182/")
+    assert details["description"].startswith("About the job")
+    assert details["title"] == "Staff Software Engineer"
+    assert details["company"] == "Databricks"
+    assert "staff-software-engineer-at-databricks" in details["canonical_url"]
+    page.goto.assert_called_once()
+
+
+def test_fetch_linkedin_job_details_returns_empty_on_non_job_url():
+    from backend.playwright_app import fetch_linkedin_job_details
+
+    page = MagicMock()
+    assert fetch_linkedin_job_details(page, "https://www.linkedin.com/feed/") == {
+        "description": "", "title": "", "company": "", "canonical_url": "",
+    }
+    page.goto.assert_not_called()
+
+
+def test_fetch_linkedin_job_details_degrades_on_navigation_error():
+    from backend.playwright_app import fetch_linkedin_job_details
+
+    page = MagicMock()
+    page.goto.side_effect = RuntimeError("net::ERR_TIMED_OUT")
+    assert fetch_linkedin_job_details(page, "https://www.linkedin.com/jobs/view/123/")["description"] == ""
+
+
+
 
 

@@ -155,6 +155,20 @@ class LLMQueueManager:
             logger.error(f"Task [{task.task_name}] ({task.task_id}) failed or timed out: {e}")
             raise
 
+    def stop(self) -> None:
+        """Stop dispatching new work; workers exit on their next poll iteration.
+
+        Used by graceful shutdown. Already-running provider calls are not interrupted
+        (they are external HTTP requests); this only prevents *new* dispatch so the
+        process can drain instead of firing requests it will never read.
+
+        Workers already poll with a bounded timeout, so flipping the running flag is
+        sufficient — no queue sentinel is injected. (A sentinel would be unsafe here:
+        ``PriorityQueue`` compares entries on pop, and ``None`` is not orderable.)
+        """
+        with self._lock:
+            self._running = False
+
     def _worker_loop(self, worker_id: int):
         """Worker loop that pulls prioritized tasks."""
         while self._running:
@@ -167,6 +181,11 @@ class LLMQueueManager:
                 task: LLMTask = self._queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+
+            if task is None:
+                # Shutdown sentinel. Break immediately so the worker exits.
+                self._queue.task_done()
+                break
 
             if task.future.cancelled():
                 self._queue.task_done()

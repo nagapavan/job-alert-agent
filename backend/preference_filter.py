@@ -479,30 +479,24 @@ class PreferenceFilter:
                 if re.search(pattern, title_lower):
                     return "skip_topic"
             
-            # Check description for must-have requirements with skip topics
+            # Check description for must-have requirements with skip topics.
+            # Section-aware: a skip topic only rejects when it appears under a
+            # must-have/required heading (title check above already ran).
             if description:
-                # Look for must-have requirement patterns in description
-                desc_lower = description.lower()
-                # Common must-have requirement markers
-                must_have_markers = [
-                    "must have", "must-have", "must:", "required:", "requirement:", 
-                    "you must", "candidate must", "we require", "requires"
-                ]
-                
-                # Find must-have requirement sections
-                for marker in must_have_markers:
-                    if marker in desc_lower:
-                        # Look for skip topics near must-have sections
-                        marker_index = desc_lower.find(marker)
-                        # Check a reasonable window after the marker
-                        window_start = marker_index
-                        window_end = min(len(desc_lower), marker_index + 500)
-                        window_text = desc_lower[window_start:window_end]
-                        
-                        for topic in self.criteria.skip_topics:
-                            pattern = rf'\b{re.escape(topic)}\b'
-                            if re.search(pattern, window_text):
-                                return "skip_topic"
+                from backend import section_intent
+
+                in_must_have = False
+                for raw_line in description.splitlines():
+                    if not raw_line.strip():
+                        continue
+                    if len(raw_line.split()) <= 8 and section_intent.is_must_have_heading(raw_line):
+                        in_must_have = True
+                    if not in_must_have:
+                        continue
+                    line_lower = raw_line.lower()
+                    for topic in self.criteria.skip_topics:
+                        if re.search(rf'\b{re.escape(topic)}\b', line_lower):
+                            return "skip_topic"
         
         if not self.title_ok(title):
             return "title"

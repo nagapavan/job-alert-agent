@@ -91,3 +91,57 @@ def test_resume_gap_insights_flag_defaults_on(db_session):
     assert DEFAULT_FEATURE_FLAGS["resume_gap_insights"] is True
     flags = get_feature_flags(db_session)
     assert flags.get("resume_gap_insights") is True
+
+
+def test_job_partials_property_round_trip(db_session):
+    """match_partials holds must-have requirements whose status is 'partial' (resume has
+    some evidence but not full coverage). Persisted separately from gaps so the Skills
+    Insights aggregation only counts truly-missing skills."""
+    comp = Company(name="PartialsCo")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(
+        company_id=comp.id,
+        title="Partial Role",
+        match_partials_json=json.dumps(["Embeddings", "10+ years experience"]),
+    )
+    db_session.add(job)
+    db_session.commit()
+    assert job.match_partials == ["Embeddings", "10+ years experience"]
+
+
+def test_job_partials_none_for_legacy_rows(db_session):
+    comp = Company(name="Legacy2")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(
+        company_id=comp.id,
+        title="Legacy2 Job",
+        match_partials_json=None,
+    )
+    db_session.add(job)
+    db_session.commit()
+    assert job.match_partials is None
+
+
+def test_job_out_exposes_partials(db_session):
+    comp = Company(name="Exposed2")
+    db_session.add(comp)
+    db_session.flush()
+    db_session.add(
+        Job(
+            company_id=comp.id,
+            title="Exposed2 Job",
+            match_strengths_json=json.dumps(["Go"]),
+            match_gaps_json=json.dumps(["React"]),
+            match_partials_json=json.dumps(["Kubernetes"]),
+        )
+    )
+    db_session.commit()
+
+    res = client.get("/api/jobs")
+    assert res.status_code == 200
+    row = next(j for j in res.json() if j["title"] == "Exposed2 Job")
+    assert row["match_strengths"] == ["Go"]
+    assert row["match_gaps"] == ["React"]
+    assert row["match_partials"] == ["Kubernetes"]

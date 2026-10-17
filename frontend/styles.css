@@ -1196,15 +1196,6 @@ body {
     border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
-.match-pill .not-scored-cue {
-    font-size: 9.5px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
-    opacity: 0.7;
-    padding-left: 2px;
-}
-
 .rec-badge {
     display: inline-flex;
     align-items: center;
@@ -3907,4 +3898,68 @@ body {
 /* Settings: two equal preference columns; wide cards span the full row. */
 .settings-preferences-grid {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+/* Skills Insights: ranked resume gaps across scored jobs */
+.insights-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px 20px;
+    margin: 18px 0;
+}
+.insights-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+}
+.insights-head h3 {
+    margin: 0;
+    font-size: 15px;
+}
+.insights-sub {
+    font-size: 11px;
+    color: var(--text-dim);
+}
+.insights-gaps {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 12px;
+}
+.insights-empty {
+    font-size: 12px;
+    color: var(--text-dim);
+    font-style: italic;
+}
+.insights-gap-row {
+    display: grid;
+    grid-template-columns: 140px 1fr auto;
+    align-items: center;
+    gap: 12px;
+    font-size: 12px;
+}
+.gap-skill {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.gap-bar {
+    display: block;
+    height: 6px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.06);
+    overflow: hidden;
+}
+.gap-bar-fill {
+    display: block;
+    height: 100%;
+    border-radius: 4px;
+    background: linear-gradient(90deg, var(--primary), var(--accent));
+}
+.gap-num {
+    color: var(--text-dim);
+    white-space: nowrap;
 }

@@ -164,6 +164,7 @@ class Job(Base):
     # flattened match_analysis narrative.
     match_strengths_json = Column(Text, nullable=True)
     match_gaps_json = Column(Text, nullable=True)
+    match_partials_json = Column(Text, nullable=True)  # must-have requirements met partially (some resume evidence)
 
     # Timeline Dates
     applied_at = Column(DateTime, nullable=True)
@@ -185,6 +186,11 @@ class Job(Base):
     def match_gaps(self):
         """Structured gaps list (parsed from ``match_gaps_json``), or None for legacy rows."""
         return _parse_json_list(self.match_gaps_json)
+
+    @property
+    def match_partials(self):
+        """Structured partial-coverage list (must-have requirements met partially), or None."""
+        return _parse_json_list(self.match_partials_json)
 
 
 def _parse_json_list(raw):
@@ -322,6 +328,7 @@ class UserPreference(Base):
     consents_json = Column(Text, default="{}")     # explicit per-feature consent records (JSON, versioned)
     excluded_companies = Column(Text, default="amazon")  # comma-separated name/domain blocklist
     skip_topics = Column(Text, default="")  # comma-separated skill/keyword blocklist (titles + JDs)
+    extra_skills_json = Column(Text, default="[]")  # user-owned skills added on top of resume-extracted ones (JSON list)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
 
@@ -597,6 +604,8 @@ def init_db(custom_url: str = None):
                     conn.execute(text("ALTER TABLE jobs ADD COLUMN match_strengths_json TEXT;"))
                 if "match_gaps_json" not in col_names:
                     conn.execute(text("ALTER TABLE jobs ADD COLUMN match_gaps_json TEXT;"))
+                if "match_partials_json" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN match_partials_json TEXT;"))
 
         if "companies" in existing_tables:
             col_names = {c["name"] for c in inspector.get_columns("companies")}
@@ -619,6 +628,8 @@ def init_db(custom_url: str = None):
                     conn.execute(text("ALTER TABLE user_preferences ADD COLUMN scoring_config_json TEXT DEFAULT '{}';"))
                 if "skip_topics" not in col_names:
                     conn.execute(text("ALTER TABLE user_preferences ADD COLUMN skip_topics TEXT DEFAULT '';"))
+                if "extra_skills_json" not in col_names:
+                    conn.execute(text("ALTER TABLE user_preferences ADD COLUMN extra_skills_json TEXT DEFAULT '[]';"))
 
         if "dismissed_job_patterns" in existing_tables:
             col_names = {c["name"] for c in inspector.get_columns("dismissed_job_patterns")}

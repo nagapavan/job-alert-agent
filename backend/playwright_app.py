@@ -468,20 +468,29 @@ def scan_linkedin_job_recommendations(
                 raw_url = title_el.get_attribute("href") or ""
                 clean_url = urllib.parse.urljoin("https://www.linkedin.com", raw_url).split("?")[0] if raw_url else ""
 
-                # Extract company, location
-                comp_el = card.query_selector(".job-card-container__company-name, .artdeco-entity-lockup__subtitle") or card.query_selector(".job-card-container__primary-description")
-                loc_el = card.query_selector(".job-card-container__metadata-item, .artdeco-entity-lockup__caption")
+                title_hint = title_el.inner_text().strip() if title_el else ""
+                parsed = _parse_linkedin_job_card_text(card.inner_text(), title_hint)
 
-                text_lines = [l.strip() for l in card.inner_text().split("\n") if l.strip() and not l.strip().startswith("Easy Apply") and not l.strip().startswith("Promoted") and not l.strip().startswith("Actively recruiting") and "verification" not in l.lower()]
+                title = (parsed.get("title") or title_hint or "Untitled Role").split("\n")[0].split(" with verification")[0].strip()
+                company = (parsed.get("company") or "").split("\n")[0].split(" · ")[0].strip()
+                location = (parsed.get("location") or "").split("\n")[0].strip()
 
-                title = title_el.inner_text().strip() if title_el else (text_lines[0] if text_lines else "Untitled Role")
-                company = comp_el.inner_text().strip() if comp_el else (text_lines[1] if len(text_lines) > 1 else "LinkedIn Network")
-                location = loc_el.inner_text().strip() if loc_el else (text_lines[2] if len(text_lines) > 2 else "Remote / Various")
+                # The /jobs/view/ slug encodes the employer canonically even when the rendered
+                # card collapses; prefer it whenever the card-derived employer looks unreliable.
+                slug_title, slug_company = _parse_linkedin_view_slug(clean_url)
+                if slug_company and (
+                    not company
+                    or company.lower() in ("unknown company", "linkedin network")
+                    or company == title
+                    or len(company) > 60
+                    or _looks_like_location(company)
+                ):
+                    company = slug_company
+                if slug_title and (not title or title == "Untitled Role"):
+                    title = slug_title
 
-                # Clean any trailing badge text or nested duplicate lines
-                title = title.split("\n")[0].split(" with verification")[0].strip()
-                company = company.split("\n")[0].split(" · ")[0].strip()
-                location = location.split("\n")[0].strip()
+                if not company:
+                    company = "LinkedIn Network"
 
                 if title and clean_url and not any(j["url"] == clean_url for j in jobs):
                     jobs.append({
@@ -590,14 +599,6 @@ def scan_linkedin_job_alerts(
                             card.query_selector(".job-card-list__title, a.job-card-container__link, .entity-result__title-text a") or
                             card.query_selector("a[href*='/jobs/view/'], strong, a")
                         )
-                        comp_el = (
-                            card.query_selector(".job-card-container__company-name, .entity-result__primary-subtitle") or
-                            card.query_selector(".job-card-container__primary-description")
-                        )
-                        loc_el = (
-                            card.query_selector(".job-card-container__metadata-item, .entity-result__secondary-subtitle") or
-                            card.query_selector(".artdeco-entity-lockup__caption")
-                        )
 
                         if not title_el:
                             continue
@@ -608,23 +609,30 @@ def scan_linkedin_job_alerts(
                         if "/jobs/view/" not in clean_url:
                             continue
 
-                        text_lines = [l.strip() for l in card.inner_text().split("\n") if l.strip() and not l.strip().startswith("Easy Apply") and not l.strip().startswith("Promoted") and not l.strip().startswith("Actively recruiting") and "verification" not in l.lower()]
-                        
-                        title = title_el.inner_text().strip() if title_el else (text_lines[0] if text_lines else "Untitled Role")
-                        company = comp_el.inner_text().strip() if comp_el else (text_lines[1] if len(text_lines) > 1 else "LinkedIn Network")
-                        location = loc_el.inner_text().strip() if loc_el else (text_lines[2] if len(text_lines) > 2 else "Remote / Various")
+                        title_hint = title_el.inner_text().strip() if title_el else ""
+                        parsed = _parse_linkedin_job_card_text(card.inner_text(), title_hint)
 
-                        title = title.split("\n")[0].split(" with verification")[0].strip()
-                        company = company.split("\n")[0].split(" · ")[0].strip()
-                        location = location.split("\n")[0].strip()
+                        title = (parsed.get("title") or title_hint or "Untitled Role").split("\n")[0].split(" with verification")[0].strip()
+                        company = (parsed.get("company") or "").split("\n")[0].split(" · ")[0].strip()
+                        location = (parsed.get("location") or "").split("\n")[0].strip()
 
-                        # Prevent job titles or alert search queries from being treated as company names
-                        c_lower = company.lower()
-                        if (
-                            company == title
+                        # The /jobs/view/ slug encodes the employer canonically, even when the card
+                        # collapses and loses the separator. Only trust it when the split is sane.
+                        slug_title, slug_company = _parse_linkedin_view_slug(clean_url)
+                        comp_lower = company.lower()
+                        company_unreliable = (
+                            not company
+                            or company.lower() in ("unknown company", "linkedin network")
+                            or company == title
                             or len(company) > 60
-                            or any(c_lower.startswith(w) for w in ["senior ", "staff ", "principal ", "lead ", "software ", "technical lead", "back-end", "front-end", "gen ai", "platform engineer"])
-                        ):
+                            or _looks_like_location(company)
+                        )
+                        if slug_company and (company_unreliable or comp_lower != slug_company.lower()):
+                            company = slug_company
+                        if slug_title and (not title or title == "Untitled Role" or (slug_title and slug_title.lower() in title.lower())):
+                            title = slug_title
+
+                        if company_unreliable and not company:
                             company = "LinkedIn Network"
 
                         if title and clean_url and not any(j["url"] == clean_url for j in alert_jobs):
@@ -702,6 +710,70 @@ def _clean_linkedin_card_segments(container_text: str) -> List[str]:
     return segments
 
 
+_LINKEDIN_SLUG_ACRONYMS = {
+    "ai": "AI", "ml": "ML", "ui": "UI", "ux": "UX", "api": "API", "apis": "APIs",
+    "swe": "SWE", "sre": "SRE", "qa": "QA", "ios": "iOS", "devops": "DevOps",
+    "sdk": "SDK", "sql": "SQL", "aws": "AWS", "gcp": "GCP", "seo": "SEO", "crm": "CRM",
+    "ii": "II", "iii": "III", "iv": "IV",
+}
+
+
+def _titleize_linkedin_slug(slug: str) -> str:
+    """Turns a URL slug fragment ("staff-software-engineer-ai") into a readable title."""
+    words: List[str] = []
+    for raw in (slug or "").split("-"):
+        if not raw:
+            continue
+        low = raw.lower()
+        if low in _LINKEDIN_SLUG_ACRONYMS:
+            words.append(_LINKEDIN_SLUG_ACRONYMS[low])
+        elif raw.isdigit():
+            words.append(raw)
+        else:
+            words.append(raw[:1].upper() + raw[1:])
+    return " ".join(words)
+
+
+def _parse_linkedin_view_slug(url: str) -> tuple:
+    """Returns (title, company) from a LinkedIn ``/jobs/view/<title>-at-<company>-<id>`` URL.
+
+    The employer is authoritative here: LinkedIn always encodes it in the canonical slug, even
+    when the rendered card collapses and loses the `` · `` separator. Splits on the LAST ``-at-``
+    so titles that legitimately contain "at" (e.g. "data-at-scale-engineer") survive. Returns
+    ("", "") when the URL does not carry a parseable slug.
+    """
+    m = re.search(r"/jobs/view/([^/?#]+)", url or "")
+    if not m:
+        return "", ""
+    slug = m.group(1)
+    m2 = re.search(r"^(?P<title>.+)-at-(?P<company>.+?)-(\d{6,})$", slug)
+    if not m2:
+        m2 = re.search(r"^(?P<title>.+)-at-(?P<company>.+)$", slug)
+    if not m2:
+        return "", ""
+    return _titleize_linkedin_slug(m2.group("title")), _titleize_linkedin_slug(m2.group("company"))
+
+
+_LINKEDIN_LOCATION_HINTS = (
+    "remote", "hybrid", "on-site", "onsite", "india", "united states", "usa", "uk",
+    "singapore", "canada", "germany", "australia", "global",
+)
+
+
+def _looks_like_location(segment: str) -> bool:
+    """Heuristic: a LinkedIn card segment is a location (not an employer) when it carries
+    a work-mode marker, a country/region hint, or a "City, Region" comma pattern."""
+    low = (segment or "").strip().lower()
+    if not low:
+        return False
+    if any(h in low for h in _LINKEDIN_LOCATION_HINTS):
+        return True
+    if re.search(r"\([^)]*(site|hybrid|remote)[^)]*\)", low):
+        return True
+    # "Bengaluru, Karnataka" style -- a comma without a corporate suffix reads as a place.
+    return "," in low and not any(s in low for s in ("inc", "ltd", "llc", "corp", "gmbh"))
+
+
 def _parse_linkedin_job_card_text(container_text: str, title_hint: str = "") -> Dict[str, str]:
     """
     Best-effort title/company/location extraction from a LinkedIn job card's raw innerText.
@@ -735,8 +807,15 @@ def _parse_linkedin_job_card_text(container_text: str, title_hint: str = "") -> 
             break
 
     if company == "Unknown Company" and len(segments) > 1:
-        company = segments[1].split(" · ")[0].strip() or company
-    if location == "Remote / Various" and len(segments) > 2:
+        second = segments[1].split(" · ")[0].strip()
+        # Only accept the 2nd line as the employer when it is not actually the location row.
+        if second and not _looks_like_location(second):
+            company = second
+            if len(segments) > 2:
+                location = segments[2].strip() or location
+        elif second:
+            location = second
+    elif location == "Remote / Various" and len(segments) > 2:
         location = segments[2].strip() or location
 
     if not title:
@@ -745,7 +824,9 @@ def _parse_linkedin_job_card_text(container_text: str, title_hint: str = "") -> 
 
 def _extract_linkedin_job_from_anchor(anchor) -> Optional[Dict[str, Any]]:
     """
-    Avoids depending on LinkedIn's frequently-changing card class names.
+    Extracts a saved-job card. Reads LinkedIn's semantic children first (title/company/location
+    are rendered as separate elements), then falls back to the collapsed innerText heuristic and
+    the /jobs/view/ slug. The employer is *never* inferred from the role text.
     """
     try:
         raw_url = anchor.get_attribute("href") or ""
@@ -755,6 +836,32 @@ def _extract_linkedin_job_from_anchor(anchor) -> Optional[Dict[str, Any]]:
         return None
 
     clean_url = urllib.parse.urljoin("https://www.linkedin.com", raw_url).split("?")[0]
+
+    # Tier A: LinkedIn's own semantic card nodes. One round-trip returns title/company/location
+    # from the same selectors the (working) alerts scanner relies on, so the employer name is
+    # read from its dedicated element instead of leaking into the title.
+    dom_title = dom_company = dom_location = ""
+    try:
+        parts = anchor.evaluate(
+            "el => {"
+            "  const card = el.closest('li, div[data-occludable-job-id], div.job-card-container, "
+            "    div.entity-result, div[data-view-name]') || el.parentElement || el;"
+            "  const q = (sels) => { for (const s of sels) { const n = card.querySelector(s); "
+            "    if (n && n.innerText && n.innerText.trim()) return n.innerText.trim(); } return ''; };"
+            "  return {"
+            "    title: q(['.job-card-list__title', 'a.job-card-container__link', "
+            "      '.artdeco-entity-lockup__title a', '.job-card-container__link']),"
+            "    company: q(['.job-card-container__primary-description', "
+            "      '.job-card-container__company-name', '.artdeco-entity-lockup__subtitle']),"
+            "    location: q(['.job-card-container__metadata-item', "
+            "      '.artdeco-entity-lockup__caption'])"
+            "  }; }"
+        ) or {}
+        dom_title = (parts.get("title") or "").strip()
+        dom_company = (parts.get("company") or "").strip()
+        dom_location = (parts.get("location") or "").strip()
+    except Exception:
+        pass
 
     container_text = ""
     try:
@@ -771,8 +878,6 @@ def _extract_linkedin_job_from_anchor(anchor) -> Optional[Dict[str, Any]]:
         except Exception:
             container_text = ""
 
-    # The /jobs/view/ anchor usually wraps just the role title — a reliable title source even
-    # when the surrounding card's innerText collapses to a single line.
     anchor_text = ""
     try:
         anchor_text = anchor.inner_text()
@@ -782,14 +887,46 @@ def _extract_linkedin_job_from_anchor(anchor) -> Optional[Dict[str, Any]]:
         anchor_text = ""
 
     parsed = _parse_linkedin_job_card_text(container_text, title_hint=anchor_text)
-    if not parsed.get("title"):
+
+    # The canonical /jobs/view/<title>-at-<company>-<id> slug (when present) is authoritative for
+    # both fields: it survives DOM churn and cleanly separates "TitleCompany" merges.
+    slug_title, slug_company = _parse_linkedin_view_slug(clean_url)
+
+    raw_title = (dom_title or parsed.get("title") or "").strip()
+    if slug_title:
+        norm_title = re.sub(r"[^a-z0-9]", "", raw_title.lower())
+        norm_slug = re.sub(r"[^a-z0-9]", "", slug_title.lower())
+        if not raw_title or (norm_slug and norm_slug in norm_title and norm_title != norm_slug):
+            raw_title = slug_title
+        elif norm_title == norm_slug:
+            raw_title = slug_title
+
+    company = (dom_company or parsed.get("company") or "").strip()
+    if slug_company and (
+        not company
+        or company.lower() in ("unknown company", "linkedin network", "linkedin")
+        or (raw_title and company and company.lower() in raw_title.lower())
+    ):
+        company = slug_company
+
+    # Last-ditch guard: if the title still ends with the employer name (collapsed DOM, no slug),
+    # strip the trailing employer so it is not duplicated in the header.
+    if company and company != "Unknown Company":
+        norm_title = re.sub(r"[^a-z0-9]", "", raw_title.lower())
+        norm_company = re.sub(r"[^a-z0-9]", "", company.lower())
+        if norm_company and norm_title.endswith(norm_company) and norm_title != norm_company:
+            trimmed = raw_title[: len(raw_title) - len(company)].strip(" ·-–—|,")
+            if trimmed:
+                raw_title = trimmed
+
+    if not raw_title:
         return None
 
     low = container_text.lower()
     return {
-        "title": parsed["title"],
-        "company": parsed["company"] or "Unknown Company",
-        "location": parsed["location"] or "Remote / Various",
+        "title": raw_title,
+        "company": company or "Unknown Company",
+        "location": dom_location or parsed["location"] or "Remote / Various",
         "url": clean_url,
         "is_closed": any(m in low for m in _LINKEDIN_CLOSED_MARKERS),
         "unsaved": False,
@@ -910,6 +1047,77 @@ def scan_and_sync_linkedin_saved_jobs(
                 pass
 
     return saved_jobs
+
+
+def fetch_linkedin_job_details(page, url: str) -> Dict[str, str]:
+    """Opens a LinkedIn ``/jobs/view/`` posting and returns its detail-page fields.
+
+    Saved-job cards carry no description, so scoring them requires the detail page. Returns
+    ``{"description", "title", "company", "canonical_url"}``; every field is "" when unavailable.
+    Reads the stable ``[id^="JobDetails_AboutTheJob_"]`` container (the only hook that survived
+    LinkedIn's client-render change — see reasoning/2026-10-15-linkedin-extraction-dom-change.md)
+    with legacy-class fallbacks, plus the top-card title/company (used to repair merged titles and
+    placeholder employers on rows ingested from numeric-only URLs). Never raises.
+    """
+    empty = {"description": "", "title": "", "company": "", "canonical_url": ""}
+    if not url or "/jobs/view/" not in url:
+        return empty
+    try:
+        from backend.config import LINKEDIN_AUTOMATION_PACING_SECONDS
+        settle_ms = int(LINKEDIN_AUTOMATION_PACING_SECONDS * 1000)
+    except Exception:
+        settle_ms = 2500
+    try:
+        page.goto(url, timeout=35000, wait_until="domcontentloaded")
+        page.wait_for_timeout(max(settle_ms, 1500))
+        for _ in range(3):
+            try:
+                page.evaluate("window.scrollBy(0, 800);")
+                page.wait_for_timeout(350)
+            except Exception:
+                pass
+        try:
+            parts = page.evaluate(
+                "() => {"
+                "  const pick = (sels) => { for (const s of sels) { const n = document.querySelector(s); "
+                "    if (n && n.innerText && n.innerText.trim()) return n.innerText.trim(); } return ''; };"
+                "  const docTitle = document.title || '';"
+                "  const docParts = docTitle.split('|').map(s => s.trim()).filter(Boolean);"
+                "  const nonLinkedIn = docParts.filter(s => s.toLowerCase() !== 'linkedin');"
+                "  let titleFromDoc = '';"
+                "  let companyFromDoc = '';"
+                "  if (nonLinkedIn.length >= 2) { titleFromDoc = nonLinkedIn[0]; companyFromDoc = nonLinkedIn[nonLinkedIn.length - 1]; }"
+                "  else if (nonLinkedIn.length === 1) { titleFromDoc = nonLinkedIn[0]; }"
+                "  const companyAnchorEl = document.querySelector('a[href*=\"/company/\"]');"
+                "  const companyAnchor = companyAnchorEl && companyAnchorEl.innerText ? companyAnchorEl.innerText.trim() : '';"
+                "  return {"
+                "    description: pick(['[id^=\"JobDetails_AboutTheJob_\"]', '.jobs-description__content', "
+                "      '.show-more-less-html__markup', '#job-details']),"
+                "    title: pick(['.job-details-jobs-unified-top-card__job-title', "
+                "      '.jobs-unified-top-card__job-title', 'h1.t-24', 'h1']) || titleFromDoc,"
+                "    company: pick(['.job-details-jobs-unified-top-card__company-name', "
+                "      '.jobs-unified-top-card__company-name', '.topcard__org-name-link'])"
+                "      || companyAnchor || companyFromDoc,"
+                "    canonical_url: location.href.split('?')[0]"
+                "  }; }"
+            ) or {}
+        except Exception:
+            parts = {}
+        return {
+            "description": (parts.get("description") or "").strip(),
+            "title": (parts.get("title") or "").strip(),
+            "company": (parts.get("company") or "").strip(),
+            "canonical_url": (parts.get("canonical_url") or "").strip(),
+        }
+    except Exception as e:
+        logger.debug(f"LinkedIn detail fetch failed for {url}: {e}")
+        return empty
+
+
+def fetch_linkedin_job_description(page, url: str) -> str:
+    """Convenience wrapper returning only the detail-page "About the job" text."""
+    return fetch_linkedin_job_details(page, url).get("description", "")
+
 
 # -------------------------------------------------------------
 # Assistant Floating UI Overlay Panel Injection
