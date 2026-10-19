@@ -167,6 +167,7 @@ _ATS_PORTAL_SCRAPERS = {
     "ashby": "scrape_ashby_jobs",
     "smartrecruiters": "scrape_smartrecruiters_jobs",
     "workable": "scrape_workable_jobs",
+    "workday": "scrape_workday_jobs",
 }
 
 

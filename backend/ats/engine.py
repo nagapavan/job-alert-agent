@@ -121,6 +121,8 @@ class PortalConfig:
     location_join: List[str] = field(default_factory=list)
     url_path: str = ""
     alternate_url_path: str = ""
+    url_prefix: str = ""
+    total_path: str = "total"
     description_path: str = ""
     description_html: bool = False
     max_pages: int = 5
@@ -561,6 +563,100 @@ class PaginatedJsonScraper(ShapeScraper):
 
 
 
+class PostJsonScraper(ShapeScraper):
+    """``POST`` a JSON body (with ``limit``/``offset``) and read a list at ``response_path``.
+
+    Used by enterprise boards whose search endpoint is a POST (Workday CXS). Pagination total is
+    read from ``cfg.total_path`` (default ``total``). ``url_path`` holds a path relative to the
+    host (e.g. Workday's ``externalPath``), prefixed by ``url_prefix`` when present.
+    """
+
+    method = "POST"
+
+    def fetch_list(
+        self, cfg: PortalConfig, ctx: Dict[str, Any], *, timeout: int
+    ) -> List[Any]:
+        self._ctx = dict(ctx)  # map_item has no ctx; stash for url_prefix formatting
+        url = _format_template(cfg.list_url, ctx)
+        items: List[Any] = []
+        offset = 0
+        for _ in range(max(1, cfg.max_pages)):
+            body = dict(cfg.body or {})
+            body["limit"] = cfg.page_size
+            body["offset"] = offset
+            res = _http("POST", url, cfg=cfg, json=body, timeout=timeout)
+            if res is None or res.status_code != 200:
+                break
+            data = res.json()
+            page = _resolve_path(data, cfg.response_path) if cfg.response_path else data
+            page = page if isinstance(page, list) else []
+            items.extend(page)
+            total = _resolve_path(data, cfg.total_path) if isinstance(data, dict) else None
+            offset += cfg.page_size
+            if not page or (isinstance(total, int) and offset >= total):
+                break
+        return items
+
+    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item)
+        if mapped is None:
+            return None
+        # Workday exposes a host-relative ``externalPath``; prefix it with the board host.
+        if cfg.url_prefix and mapped["url"] and not mapped["url"].startswith("http"):
+            mapped["url"] = _format_template(cfg.url_prefix, getattr(self, "_ctx", {})) + mapped["url"]
+        return mapped
+
+
+class WorkdayScraper(PostJsonScraper):
+    """Workday CXS: POST list + ``externalPath``-based detail.
+
+    Two parity details vs. the legacy inline code: the public job URL falls back to
+    ``https://{host}/{site}/{path}`` when ``externalPath`` is not slash-prefixed, and the detail
+    payload's ``location`` (a single string) refines the coarse ``locationsText``.
+    """
+
+    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item)
+        if mapped is None:
+            return None
+        # ``super()`` prefixes with url_prefix; keep the legacy fallback for host-relative paths.
+        ctx = getattr(self, "_ctx", {})
+        path = (item.get("externalPath") or "") if isinstance(item, dict) else ""
+        if path and not path.startswith("/"):
+            mapped["url"] = f"https://{ctx.get('host', '')}/{ctx.get('site', '')}/{path}"
+        elif not path:
+            mapped["url"] = f"https://{ctx.get('host', '')}/{ctx.get('site', '')}"
+        mapped["_item_id"] = item.get("id", "") if isinstance(item, dict) else ""
+        return mapped
+
+    def fetch_detail(self, cfg: PortalConfig, item: Any, ctx: Dict[str, Any]) -> Any:
+        detail = cfg.detail or {}
+        url_tmpl = detail.get("url")
+        if not url_tmpl or not isinstance(item, dict):
+            return ""
+        from backend.scraper import _normalize_workday_external_path
+
+        raw_path = item.get("externalPath") or ""
+        norm_path = _normalize_workday_external_path(raw_path, ctx.get("site", ""))
+        if not norm_path:
+            return ""
+        fields = {**ctx, "externalPath": norm_path}
+        url = _format_template(url_tmpl, fields)
+        if not url or "{" in url:
+            return ""
+        res = _http("GET", url, cfg=cfg, timeout=8)
+        if res is None or res.status_code != 200:
+            return ""
+        info = (res.json() or {}).get("jobPostingInfo") or {}
+        description = ""
+        for path in detail.get("desc_paths", []):
+            txt = _resolve_path({"jobPostingInfo": info}, path)
+            if txt:
+                description = _clean_html(str(txt))
+                break
+        return {"description": description, "location": info.get("location") or ""}
+
+
 class SmartRecruitersScraper(PaginatedJsonScraper):
     """SmartRecruiters: list rows omit the apply URL and description, so the detail call is
     mandatory — it supplies both the description sections and the ``applyUrl``/``postingUrl``
@@ -604,6 +700,7 @@ class SmartRecruitersScraper(PaginatedJsonScraper):
 _SHAPE_REGISTRY: Dict[str, ShapeScraper] = {
     "simple_json": SimpleJsonScraper(),
     "paginated_json": PaginatedJsonScraper(),
+    "post_json": PostJsonScraper(),
 }
 
 # Per-portal variants that need behaviour beyond the pure-config path (selected by
@@ -614,6 +711,7 @@ _VARIANT_REGISTRY: Dict[str, ShapeScraper] = {
     "workable": WorkableScraper(),
     "greenhouse": GreenhouseScraper(),
     "smartrecruiters": SmartRecruitersScraper(),
+    "workday": WorkdayScraper(),
 }
 
 
