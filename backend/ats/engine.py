@@ -250,8 +250,15 @@ class ShapeScraper(ABC):
     ) -> List[Any]:  # pragma: no cover - abstract
         raise NotImplementedError
 
-    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
-        """Map a raw row to ``{title, location, url, description}`` (or None to skip)."""
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        """Map a raw row to ``{title, location, url, description}`` (or None to skip).
+
+        ``ctx`` is the resolver context for the current request. It is passed explicitly
+        (never stashed on ``self``) because shape scrapers are shared singleton instances and
+        scraping runs on a background thread.
+        """
         title = _resolve_path(item, cfg.title_path) or "Untitled Role"
         title = str(title).strip()
         location = _coerce_location(cfg, item)
@@ -373,7 +380,7 @@ class ShapeScraper(ABC):
 
         jobs: List[Dict[str, str]] = []
         for item in raw_items:
-            mapped = self.map_item(cfg, item)
+            mapped = self.map_item(cfg, item, ctx)
             if not mapped:
                 continue
             title = mapped["title"]
@@ -459,8 +466,10 @@ class AshbyScraper(SimpleJsonScraper):
     """Ashby: multi-location rows where location OR work-mode eligibility may match any of the
     primary/secondary locations (differs from the base AND gate)."""
 
-    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
-        mapped = super().map_item(cfg, item)
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item, ctx)
         if mapped is None:
             return None
         # Stash the secondary locations on the row for the filter override.
@@ -501,8 +510,10 @@ class WorkableScraper(SimpleJsonScraper):
     """Workable: location is a city/state/country join and a remote role gets a ``(Remote)``
     suffix; description falls back to ``full_description`` and is HTML."""
 
-    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
-        mapped = super().map_item(cfg, item)
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item, ctx)
         if mapped is None:
             return None
         is_remote = bool(item.get("telecommuting")) or str(
@@ -523,8 +534,10 @@ class GreenhouseScraper(SimpleJsonScraper):
     """Greenhouse: list rows already carry embedded ``content`` HTML, so the per-posting detail
     call is made ONLY when the embedded description is empty (bandwidth optimisation)."""
 
-    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
-        mapped = super().map_item(cfg, item)
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item, ctx)
         if mapped is not None:
             mapped["_item_id"] = item.get("id", "") if isinstance(item, dict) else ""
         return mapped
@@ -576,7 +589,6 @@ class PostJsonScraper(ShapeScraper):
     def fetch_list(
         self, cfg: PortalConfig, ctx: Dict[str, Any], *, timeout: int
     ) -> List[Any]:
-        self._ctx = dict(ctx)  # map_item has no ctx; stash for url_prefix formatting
         url = _format_template(cfg.list_url, ctx)
         items: List[Any] = []
         offset = 0
@@ -597,13 +609,15 @@ class PostJsonScraper(ShapeScraper):
                 break
         return items
 
-    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
-        mapped = super().map_item(cfg, item)
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item, ctx)
         if mapped is None:
             return None
         # Workday exposes a host-relative ``externalPath``; prefix it with the board host.
         if cfg.url_prefix and mapped["url"] and not mapped["url"].startswith("http"):
-            mapped["url"] = _format_template(cfg.url_prefix, getattr(self, "_ctx", {})) + mapped["url"]
+            mapped["url"] = _format_template(cfg.url_prefix, ctx or {}) + mapped["url"]
         return mapped
 
 
@@ -615,12 +629,14 @@ class WorkdayScraper(PostJsonScraper):
     payload's ``location`` (a single string) refines the coarse ``locationsText``.
     """
 
-    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
-        mapped = super().map_item(cfg, item)
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item, ctx)
         if mapped is None:
             return None
         # ``super()`` prefixes with url_prefix; keep the legacy fallback for host-relative paths.
-        ctx = getattr(self, "_ctx", {})
+        ctx = ctx or {}
         path = (item.get("externalPath") or "") if isinstance(item, dict) else ""
         if path and not path.startswith("/"):
             mapped["url"] = f"https://{ctx.get('host', '')}/{ctx.get('site', '')}/{path}"
@@ -662,8 +678,10 @@ class SmartRecruitersScraper(PaginatedJsonScraper):
     mandatory — it supplies both the description sections and the ``applyUrl``/``postingUrl``
     (hence ``fetch_detail`` returns a dict to override the mapped URL)."""
 
-    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
-        mapped = super().map_item(cfg, item)
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item, ctx)
         if mapped is None:
             return None
         loc = item.get("location") or {} if isinstance(item, dict) else {}
