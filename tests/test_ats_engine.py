@@ -540,3 +540,27 @@ def test_workday_applies_title_filter(mock_post):
         title_filters=["backend engineer"],
     )
     assert [j["title"] for j in jobs] == ["Backend Engineer"]
+
+
+def test_workday_map_item_uses_passed_ctx_not_instance_state():
+    """Regression: map_item must not depend on per-request state stashed on the shared singleton.
+
+    Interleaving two boards must not let one board's host leak into the other's URLs.
+    """
+    from backend.ats.engine import WorkdayScraper
+
+    scraper = WorkdayScraper()
+    cfg = _workday_cfg()
+    item = {"title": "Engineer", "externalPath": "/job/X/Eng_JR1", "locationsText": "India"}
+    ctx_a = {"host": "a.wd1.myworkdayjobs.com", "site": "SiteA"}
+    ctx_b = {"host": "b.wd5.myworkdayjobs.com", "site": "SiteB"}
+
+    url_a = scraper.map_item(cfg, item, ctx_a)["url"]
+    url_b = scraper.map_item(cfg, item, ctx_b)["url"]
+    # Re-map with A again: B's context must not have persisted on the instance.
+    url_a2 = scraper.map_item(cfg, item, ctx_a)["url"]
+
+    assert "a.wd1.myworkdayjobs.com" in url_a
+    assert "b.wd5.myworkdayjobs.com" in url_b
+    assert url_a == url_a2
+    assert not hasattr(scraper, "_ctx")
