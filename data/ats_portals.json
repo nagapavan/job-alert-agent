@@ -1,0 +1,116 @@
+{
+  "_comment": "Config-driven ATS portal feeds. One entry per portal; `shape` selects the scraper class in backend/ats/engine.py. See docs/ATS_GENERIC_ENGINE_PLAN.md.",
+  "portals": [
+    {
+      "id": "lever",
+      "label": "Lever Portal",
+      "shape": "simple_json",
+      "slug_from": "careers_url",
+      "list_url": "https://api.lever.co/v0/postings/{slug}?mode=json",
+      "response_path": "",
+      "title_path": "text",
+      "location_path": "categories.location",
+      "url_path": "applyUrl",
+      "alternate_url_path": "hostedUrl",
+      "description_path": "descriptionPlain",
+      "risk_tier": "public",
+      "default_flag": "ats_lever",
+      "enabled_by_default": true
+    },
+    {
+      "id": "ashby",
+      "label": "Ashby Portal",
+      "shape": "simple_json",
+      "variant": "ashby",
+      "slug_from": "careers_url",
+      "list_url": "https://api.ashbyhq.com/posting-api/job-board/{slug}",
+      "response_path": "jobs",
+      "title_path": "title",
+      "location_path": "location",
+      "url_path": "jobUrl",
+      "alternate_url_path": "applyUrl",
+      "description_path": "descriptionHtml",
+      "description_html": true,
+      "risk_tier": "public",
+      "default_flag": "ats_ashby",
+      "enabled_by_default": true
+    },
+    {
+      "id": "workable",
+      "label": "Workable Portal",
+      "shape": "simple_json",
+      "variant": "workable",
+      "slug_from": "careers_url",
+      "list_url": "https://apply.workable.com/api/v1/widget/accounts/{slug}?details=true",
+      "response_path": "jobs",
+      "title_path": "title",
+      "location_join": [
+        "city",
+        "state",
+        "country"
+      ],
+      "url_path": "url",
+      "alternate_url_path": "application_url",
+      "description_path": "description",
+      "description_html": true,
+      "risk_tier": "opt_in",
+      "default_flag": "ats_workable",
+      "enabled_by_default": false
+    },
+    {
+      "id": "greenhouse",
+      "label": "Greenhouse Portal",
+      "shape": "paginated_json",
+      "variant": "greenhouse",
+      "slug_from": "careers_url",
+      "list_url": "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs",
+      "response_path": "jobs",
+      "title_path": "title",
+      "location_path": "location.name",
+      "url_path": "absolute_url",
+      "description_path": "content",
+      "description_html": true,
+      "max_pages": 1,
+      "detail": {
+        "url": "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs/{id}",
+        "desc_paths": [
+          "content"
+        ]
+      },
+      "risk_tier": "public",
+      "default_flag": "ats_greenhouse",
+      "enabled_by_default": true
+    },
+    {
+      "id": "smartrecruiters",
+      "label": "SmartRecruiters Portal",
+      "shape": "paginated_json",
+      "variant": "smartrecruiters",
+      "slug_from": "careers_url",
+      "list_url": "https://api.smartrecruiters.com/v1/companies/{slug}/postings",
+      "response_path": "content",
+      "title_path": "name",
+      "location_join": [
+        "location.city",
+        "location.region",
+        "location.country"
+      ],
+      "url_path": "ref",
+      "alternate_url_path": "postingUrl",
+      "page_size": 100,
+      "max_pages": 5,
+      "detail": {
+        "url": "{base}/{id}",
+        "desc_paths": [
+          "jobAd.sections.companyDescription.text",
+          "jobAd.sections.jobDescription.text",
+          "jobAd.sections.qualifications.text",
+          "jobAd.sections.additionalInformation.text"
+        ]
+      },
+      "risk_tier": "opt_in",
+      "default_flag": "ats_smartrecruiters",
+      "enabled_by_default": false
+    }
+  ]
+}
