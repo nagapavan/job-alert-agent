@@ -223,6 +223,51 @@ def test_scrape_custom_jobs_respects_robots(mock_fetch, mock_get):
     mock_get.assert_not_called()
 
 
+@patch("backend.scraper._fetch_ai_use_file")
+def test_ai_use_file_explicit_deny_blocks(mock_fetch):
+    """An explicit deny in llms.txt/ai.txt blocks the origin (advisory gate)."""
+    from backend.scraper import ai_use_files_allowed, _ai_use_cache
+
+    _ai_use_cache.clear()
+    mock_fetch.return_value = "User-agent: *\nDisallow: /"
+    assert ai_use_files_allowed("https://example.com/jobs") is False
+
+
+@patch("backend.scraper._fetch_ai_use_file")
+def test_ai_use_file_absent_is_fail_open(mock_fetch):
+    """No AI-use file → allowed (fail-open, the common case)."""
+    from backend.scraper import ai_use_files_allowed, _ai_use_cache
+
+    _ai_use_cache.clear()
+    mock_fetch.return_value = None
+    assert ai_use_files_allowed("https://example.com/jobs") is True
+
+
+@patch("backend.scraper._fetch_ai_use_file")
+def test_ai_use_file_unparseable_is_fail_open(mock_fetch):
+    """A present-but-unparseable file does not block (advisory, conservative)."""
+    from backend.scraper import ai_use_files_allowed, _ai_use_cache
+
+    _ai_use_cache.clear()
+    mock_fetch.return_value = "This site welcomes AI agents."
+    assert ai_use_files_allowed("https://example.com/jobs") is True
+
+
+@patch("backend.scraper._fetch_ai_use_file")
+@patch("backend.scraper._fetch_robots", return_value="")
+def test_may_fetch_requires_both_gates(mock_robots, mock_ai):
+    """may_fetch is the AND of robots.txt and the AI-use-file gate."""
+    from backend.scraper import may_fetch, _robots_cache, _ai_use_cache
+
+    _robots_cache.clear()
+    _ai_use_cache.clear()
+    mock_ai.return_value = "Disallow: /"
+    assert may_fetch("https://example.com/jobs") is False
+    _ai_use_cache.clear()
+    mock_ai.return_value = None
+    assert may_fetch("https://example.com/jobs") is True
+
+
 # -------------------------------------------------------------
 # Unit Tests: Company Intelligence & Talent Partners
 # -------------------------------------------------------------

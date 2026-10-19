@@ -10,7 +10,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from backend.ai_helper import _clean_json_string, generate_text
-from backend.config import AGENT_USER_AGENT, RESPECT_ROBOTS
+from backend.config import AGENT_USER_AGENT, RESPECT_AI_USE_FILES, RESPECT_ROBOTS
 from backend.matchers import check_title_match
 from backend.prompts import company_intelligence_synthesis_system
 
@@ -75,6 +75,58 @@ def robots_allowed(url: str, user_agent: str = AGENT_USER_AGENT) -> bool:
     except Exception as e:
         logger.debug(f"robots.txt check failed for {url}: {e}")
         return True
+
+
+# Candidate machine-readable AI-use files, checked in order (first that exists wins).
+_AI_USE_FILES = ("llms.txt", "ai.txt", ".well-known/ai.txt")
+# Explicit deny signals in an AI-use file. These formats are NOT standardised, so this is a
+# deliberately conservative, advisory check: only a clear deny blocks; anything else allows.
+_AI_USE_DENY_RE = re.compile(
+    r"^\s*(disallow|deny|no[-_]?ai|no[-_]?crawl|do[-_]?not[-_]?(crawl|scrape|train))",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ai_use_cache: Dict[str, Optional[bool]] = {}
+
+
+def _fetch_ai_use_file(origin: str, timeout: int = 5) -> Optional[str]:
+    """Returns the body of the first AI-use file present at ``origin``, else None."""
+    for name in _AI_USE_FILES:
+        try:
+            res = requests.get(f"{origin}/{name}", headers=AGENT_HEADERS, timeout=timeout)
+            if res.status_code == 200 and (res.text or "").strip():
+                return res.text
+        except Exception:  # noqa: BLE001 - absent/unreachable file is not an error
+            continue
+    return None
+
+
+def ai_use_files_allowed(url: str) -> bool:
+    """
+    True when no AI-use file at ``url``'s origin explicitly denies crawling.
+
+    Advisory + fail-open: absent files, unparseable content, or any error → allowed. Only an
+    explicit deny directive blocks. See docs/POLITE_CRAWLING_AND_WORKDAY.md §2.3.
+    """
+    if not RESPECT_AI_USE_FILES:
+        return True
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return True
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if origin not in _ai_use_cache:
+            body = _fetch_ai_use_file(origin)
+            _ai_use_cache[origin] = None if body is None else (not _AI_USE_DENY_RE.search(body))
+        cached = _ai_use_cache[origin]
+        return True if cached is None else cached
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"AI-use-file check failed for {url}: {e}")
+        return True
+
+
+def may_fetch(url: str, user_agent: str = AGENT_USER_AGENT) -> bool:
+    """Single permission gate: robots.txt AND (advisory) AI-use files. Both fail open."""
+    return robots_allowed(url, user_agent) and ai_use_files_allowed(url)
 
 
 # -------------------------------------------------------------
@@ -796,9 +848,9 @@ def scrape_custom_jobs(portal_url: str) -> List[Dict[str, str]]:
     if not portal_url or not portal_url.strip():
         return []
 
-    if not robots_allowed(portal_url):
+    if not may_fetch(portal_url):
         logger.warning(
-            f"robots.txt disallows scraping '{portal_url}'; skipping custom portal scan."
+            f"robots.txt / AI-use files disallow scraping '{portal_url}'; skipping custom portal scan."
         )
         return []
 
@@ -1435,9 +1487,9 @@ def fetch_google_jobs(
     # Primary URL with Google for Jobs intent
     url = f"https://www.google.com/search?q={encoded_query}&ibp=htl;jobs"
 
-    if not robots_allowed(url):
+    if not may_fetch(url):
         logger.warning(
-            "robots.txt disallows Google search scraping; skipping direct Google Jobs fetch."
+            "robots.txt / AI-use files disallow Google search scraping; skipping direct Google Jobs fetch."
         )
         return []
 
