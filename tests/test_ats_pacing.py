@@ -106,3 +106,27 @@ def test_build_pacer_uses_config_defaults():
     assert p.max_requests_per_run == 7
     assert p.jitter == 0.0
     assert p.default_delay == 0.0
+
+
+def test_clear_active_pacer_resets_run_state():
+    """Regression: a finished run must not leak its pacer (counters/cooldowns) into the next one."""
+    from backend.ats import engine
+    from backend.ats.pacing import build_pacer
+
+    # Simulate run 1 exhausting a host's per-run ceiling.
+    run1 = build_pacer(default_delay=0.0, jitter=0.0, max_requests_per_run=1, cooldown_seconds=0.0)
+    engine.set_active_pacer(run1)
+    assert engine._ACTIVE_PACER is run1
+    assert run1.allow("https://a.example.com/1")
+    run1.wait("https://a.example.com/1")
+    assert run1.allow("https://a.example.com/2") is False  # ceiling reached
+
+    # Run 1 ends.
+    engine.clear_active_pacer()
+    assert engine._ACTIVE_PACER is None
+
+    # Run 2 gets a fresh pacer: the same host is fetchable again.
+    run2 = build_pacer(default_delay=0.0, jitter=0.0, max_requests_per_run=1, cooldown_seconds=0.0)
+    engine.set_active_pacer(run2)
+    assert run2.allow("https://a.example.com/1") is True
+    engine.clear_active_pacer()

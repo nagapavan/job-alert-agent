@@ -760,6 +760,16 @@ def set_active_pacer(pacer) -> None:
     _ACTIVE_PACER = pacer
 
 
+def clear_active_pacer() -> None:
+    """Drops the run-level pacer so a finished run cannot leak state into the next one.
+
+    Without this, a later caller that reaches the engine without an explicit ``pacer=`` would
+    inherit the previous run's per-host counters and cooldowns, silently skipping requests.
+    """
+    global _ACTIVE_PACER
+    _ACTIVE_PACER = None
+
+
 def run_portal(
     cfg: PortalConfig,
     *,
