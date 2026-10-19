@@ -24,6 +24,51 @@ Quick-lookup reference for locating where changes should be made.
 - `generate_consolidated_application_package` — returns only score/strengths/gaps and delegates materials to the vetted generators (resume tailoring, cover letter, cold outreach).
 - No-fabrication contract — match/package schemas use an optional (`None`) `match_score`; failures return `None`/`""` + `error`, not invented values.
 
+### `backend/embeddings.py`
+**Responsibility:** Pluggable embedding backends behind a fixed 384-d contract.
+- `resolve_backends(settings)` — ordered local-first chain: `standalone` (in-process ONNX `bge-small-en-v1.5`) → `external` (OpenAI-compatible `/v1/embeddings`) → `hash` (deterministic last resort).
+- `embed_texts` / `embed_text` — the only embedding entry point other modules should use; returns L2-normalized vectors.
+- `active_backend_name` / `local_model_cached` — status reporting for the Settings UI.
+- Backends: `OnnxEmbeddingBackend`, `ExternalEmbeddingBackend`, `HashEmbeddingBackend`, protocol `EmbeddingBackend`.
+- Config `EMBEDDING_BACKEND`/`EMBEDDING_MODEL`/`EMBEDDING_SERVER_URL`/`EMBEDDING_ALLOW_DOWNLOAD`; persisted to `data/embedding_settings.json`.
+
+### `backend/section_intent.py`
+**Responsibility:** Single source of truth for heading/section intent (replaced three duplicated detectors).
+- `classify_heading(line, domain="jd"|"resume"|"must_have")` — intent label or `"unknown"`; word-boundary matching, embeddings only as a JD fallback.
+- `jd_section_spans` / `label_at` / `mask_spans` / `first_preferred_offset` — JD segmentation helpers.
+- `is_must_have_heading` (preference-filter policy) / `starts_with_preference_cue` (line-start-only).
+- `normalize_heading` — shared heading normalization.
+
+### `backend/skill_taxonomy.py`
+**Responsibility:** Data-driven skill taxonomy (canonical name → aliases + concepts).
+- `normalize_skill` / `alias_surfaces` / `concepts_for` — alias-aware matching used by the JD matcher and `parser.COMMON_TECH_SKILLS`.
+- `record_skill_candidate` — appends unmatched phrases to `data/skill_taxonomy_candidates.json` for human review (never scored).
+- `reload()` — re-reads `data/skill_taxonomy.json`; falls back to a built-in core when the file is missing.
+
+### `backend/requirements_extractor.py`
+**Responsibility:** Mine residual JD requirements the taxonomy did not cover.
+- `iter_requirement_units` / `unit_covered_by_taxonomy` — unit splitting and taxonomy de-duplication.
+- `extract_residual_requirements` — credits units the resume evidences (`resume_supports`) and records the rest to the taxonomy review queue.
+- `resume_supports` / `key_phrase` — evidence bridging against resume text/chunks.
+
+### `backend/resume_index.py`
+**Responsibility:** RAG-lite resume chunking and evidence retrieval.
+- `chunk_resume` — splits parsed resume JSON into skills / each role / each project chunks.
+- `index_resume_chunks` — (re)writes a resume's chunks into `resume_chunks` with embeddings.
+- `top_evidence` — returns the chunks most similar to a query; used to ground requirement assessment. Scoring never depends on embeddings.
+
+### `backend/learning_signals.py`
+**Responsibility:** Implicit-outcome labels for classifier training (no thumbs-up UI).
+- `derive_decision` — maps a tracked job to `positive` / `strong_positive` / `negative` / `negative_outcome`.
+- Provenance `user_initiated` vs `system_generated`: auto-filtered discovery rows and dismissals with no user decision event are **excluded** from training.
+- `collect_decisions` / `label_counts` / `learning_readiness` — the last backs `GET /api/learning/readiness`.
+
+### `backend/shutdown.py`
+**Responsibility:** Bounded graceful drain on the ASGI shutdown lifecycle.
+- `run_shutdown` (idempotent) / `is_shutting_down` / `DRAIN_DEADLINE_SECONDS`.
+- Drain order: `scheduler.stop()` → `task_engine.cancel_all()` → `llm_queue.stop()` → `clean_stale_profile_locks()` **last**.
+- **Never register signal handlers** here — uvicorn owns SIGTERM/SIGINT and firing the lifecycle is enough; custom handlers broke `--reload` three ways. See `AGENTS.md` §12.11.
+
 ### `backend/company_catalog.py`
 **Responsibility:** Loads the static company catalog used for discovery/targeting.
 - `load_company_catalog()` — returns list of company dicts; reads `backend/companies_config.json` else falls back to the shipped generic `backend/companies_config.example.json`.
@@ -424,9 +469,11 @@ out = agent.process_message("Shortlist the Stripe role and tailor my resume", hi
 
 ```python
 app = FastAPI(title="Job Alert Agent API", version="1.0.0")
+# allow_credentials=False; the extension origin regex is built from ALLOWED_EXTENSION_IDS
+# and is None when that list is empty (no extension origin trusted by default).
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
-                   allow_origin_regex=r"^chrome-extension://.*$",
-                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+                   allow_origin_regex=_extension_origin_regex,
+                   allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 @app.middleware("http")   # security_firewall_middleware gates all non-public paths
 async def security_firewall_middleware(request, call_next): ...

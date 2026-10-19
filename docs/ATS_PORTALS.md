@@ -237,9 +237,19 @@ Legend: **Auth** = needs a key; **Format** = response body; **Filters** = server
 
 ### 5.2 Next (🔜)
 
-No committed next item — the agreed backlog is the roadmap below, in the order listed.
+**Committed next item: config-driven generic portal engine** — full plan in
+[`ATS_GENERIC_ENGINE_PLAN.md`](ATS_GENERIC_ENGINE_PLAN.md) (and
+`reasoning/2026-10-18-doc-drift-and-backlog-triage.md`, Item 1).
+Rationale: coverage is already broad, so the win is *reducing code volume*, not adding portals —
+one JSON entry + a small per-shape class replaces the per-portal fetch/label/filter/dispatch
+duplication.
 
 ### 5.3 Roadmap (🗺️)
+
+**Only add a roadmap portal when a real target company requires it.** The 7 below are long-tail;
+adding all of them now is not justified (maintenance + ToS surface for marginal coverage). Under
+the generic engine they become JSON entries, so the marginal cost drops substantially when one is
+actually needed.
 
 | Portal | List endpoint | Auth | Format | Key caveats |
 | :--- | :--- | :---: | :--- | :--- |

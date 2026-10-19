@@ -6,7 +6,8 @@ This document outlines the layered security approach: origin firewall → API-ke
 
 ## 1. Origin Firewall & CORS
 
-`backend/main.py` installs `CORSMiddleware` with a strict allowlist:
+`backend/main.py` installs `CORSMiddleware` with a strict localhost allowlist and an
+**empty-by-default** extension allowlist:
 
 ```python
 ALLOWED_ORIGINS = [
@@ -15,17 +16,42 @@ ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]  # + env ALLOWED_ORIGINS
+
+# Extensions are trusted only when their exact ID is allowlisted via ALLOWED_EXTENSION_IDS.
+# By default the list is empty, so no chrome-extension:// origin is accepted.
+_allowed_extension_ids = [
+    eid.strip()
+    for eid in os.environ.get("ALLOWED_EXTENSION_IDS", "").split(",")
+    if eid.strip()
+]
+_extension_origin_regex = (
+    r"^chrome-extension://(" + "|".join(re.escape(eid) for eid in _allowed_extension_ids) + r")$"
+    if _allowed_extension_ids
+    else None
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"^chrome-extension://.*$",
-    allow_credentials=True,
+    allow_origin_regex=_extension_origin_regex,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 ```
 
-**Key principle**: Wildcard origins are deliberately avoided while credentials are enabled.
+**Key principles**:
+
+- **No wildcard extension origin.** A blanket `^chrome-extension://.*$` would trust *any* installed
+  extension. The regex is built from the explicit `ALLOWED_EXTENSION_IDS` allowlist and is `None`
+  when that list is empty, so extension origins are denied by default. The extension is expected to
+  authenticate with the `X-API-Key` header instead.
+- **Credentials are not ambient.** `allow_credentials=False` — the API key travels in a header or
+  `?api_key=` query parameter, never in a cookie, so there is no credentialed-CORS surface to
+  protect.
+
+The local SPA still works because of the loopback/same-origin branch in the auth middleware (§2),
+not because of CORS.
 
 ---
 

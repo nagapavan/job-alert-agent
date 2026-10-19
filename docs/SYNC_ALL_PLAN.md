@@ -32,12 +32,17 @@ LinkedIn alerts / Gmail opportunities ingest out-of-scope roles (US, Pakistan, e
 
 | # | Task | Status |
 |---|------|--------|
-| P1 | Add reusable `backend/preference_filter.py` (`PreferenceCriteria` + `PreferenceFilter`) | Pending |
-| P2 | Centralize location/work-mode matchers + region-aware foreign restriction | Pending |
-| P3 | Adopt in Google Jobs runner (filter before insert) | Pending |
-| P4 | Adopt in LinkedIn alerts/recommendations (saved jobs bypass) | Pending |
-| P5 | Adopt in Gmail opportunity ingestion (per policy) | Pending |
-| P6 | Filter telemetry (skipped counts in OperationLog) + tests | Pending |
+| P1 | Add reusable `backend/preference_filter.py` (`PreferenceCriteria` + `PreferenceFilter`) | Done |
+| P2 | Centralize location/work-mode matchers + region-aware foreign restriction | Done |
+| P3 | Adopt in Google Jobs runner (filter before insert) | Done |
+| P4 | Adopt in LinkedIn alerts/recommendations (saved jobs bypass) | Done |
+| P5 | Adopt in Gmail opportunity ingestion (per policy) | Done |
+| P6 | Filter telemetry (skipped counts in OperationLog) + tests | Done |
+
+> Status corrected 2026-10-18: all six tasks shipped. `backend/preference_filter.py` exists and
+> `PreferenceFilter.from_db(db)` is wired into the ATS scrape, Google Jobs, LinkedIn, and Gmail
+> ingestion paths in `backend/main.py`, with per-run filtered-out counts logged
+> (e.g. `[PreferenceFilter] Gmail opportunities: … filtered out of preference`).
 
 ## Log rotation & retention (sustainability)
 | # | Task | Status |

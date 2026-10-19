@@ -61,7 +61,7 @@ graph TD
 | **Level 2** | **Workflow Chain**         | Multi-step deterministic pipelines with chained LLM prompts.                    |            ✅ **Core Base**            |
 | **Level 3** | **Interactive Copilot**    | Human-in-the-loop agent with tools, state memory, and guided actuation.         |           ✅ **Implemented**           |
 | **Level 4** | **Autonomous Agent**       | Autonomous multi-turn ReAct loop with dynamic tool selection & self-correction. | ✅ **Implemented (`CareerChatAgent`)** |
-| **Level 5** | **Fully Autonomous Swarm** | Unsupervised multi-agent swarms operating without human intervention.           |               🔮 Backlog               |
+| **Level 5** | **Fully Autonomous Swarm** | Unsupervised multi-agent swarms operating without human intervention.           |        🚫 Out of scope (by design)     |
 
 ---
 
@@ -198,14 +198,19 @@ TASK_PROFILES = {
 | **STANDARD**       | Resume parsing, match scoring, cold outreach, company due diligence, application essay, grounded pitch         | `temperature=0.1–0.3` (0.8 for grounded pitch), `max_tokens=350–1500` | Local 8B, balanced slot                              |
 | **DEEP_REASONING** | Cover letters, tailored resume points, STAR interview coaching, consolidated packages, company-intel synthesis | `temperature=0.3–0.8`, `max_tokens=1800–2500`                         | Local 70B/14B, GPT-4o, Gemini Pro, Claude Sonnet     |
 
-> **Note on `top_p`**: each profile also declares a `top_p` value (0.80–0.95) for
-> documentation/design intent, but the current `resolve_task_routing` return contract and the
-> provider clients forward only `temperature` and `max_tokens`. Treat `top_p` as a planned knob,
-> not an active one.
+> **Note on `top_p`**: each profile declares a `top_p` value (0.80–0.95) and it **is** an active
+> knob. `resolve_task_routing` returns `eff_top_p` as the last element of its routing tuple, and
+> `_execute_generate_text` forwards it on both the direct-provider and fallback-cascade paths
+> (`call_kwargs`/`fallback_kwargs`). All five provider clients accept it and map it to their wire
+> format (`top_p` for OpenAI-compatible/Ollama/Anthropic; `topP` for Gemini). Regression coverage:
+> `tests/test_ai_helper.py::test_generate_text_forwards_profile_top_p`,
+> `test_generate_text_fallback_forwards_top_p`,
+> `test_resolve_task_routing_returns_profile_top_p`.
 >
 > **Explicit overrides win**: callers may pass `temperature=`/`max_tokens=` directly (e.g.
 > `generate_cold_outreach_message` passes `temperature=0.6`; `batch_analyze_job_matches` passes
-> `temperature=0.2`), which override the profile.
+> `temperature=0.2`), which override the profile. `top_p` currently has no per-call override
+> parameter; it always comes from the task profile.
 
 ### 5.3 The Reasoning Architecture: Deterministic Scaffold + LLM Reasoning + Verifier
 
