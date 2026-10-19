@@ -458,6 +458,13 @@ AGENT_USER_AGENT = os.environ.get(
 # if you understand and accept the ToS implications.
 RESPECT_ROBOTS = os.environ.get("JOB_ALERT_AGENT_RESPECT_ROBOTS", "true").lower() in ("true", "1", "yes")
 
+# Machine-readable AI-use files (llms.txt / ai.txt / .well-known/ai.txt), checked (fail-open) in
+# addition to robots.txt for HTML scraping. Absent files are simply skipped. Advisory: an explicit
+# deny is honoured; anything unparseable or missing is treated as allowed.
+RESPECT_AI_USE_FILES = os.environ.get(
+    "JOB_ALERT_AGENT_RESPECT_AI_FILES", "true"
+).lower() in ("true", "1", "yes")
+
 # Inter-request pacing for discovery scrapers (ATS + HTML). Seconds between requests to the SAME
 # host; 0 disables. Applied with 0-SCRAPE_PACING_JITTER fractional jitter so bursts don't align.
 # A per-portal `pacing_seconds` in data/ats_portals.json overrides this default. Intended to become
