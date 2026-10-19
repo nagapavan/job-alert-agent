@@ -588,7 +588,24 @@ class TrainedClassifier:
         return True
 ```
 
-**Training:** Run `python scripts/train_match_classifier.py` after 10+ historical judgments.
+**Training:** Run `./.venv/bin/python scripts/train_match_classifier.py` once you have **≥50
+trainable outcomes with ≥15 per class**. Check first with `--status` or
+`GET /api/learning/readiness`.
+
+> **Correction (the implementation moved on).** The snippet above is a Phase-4 illustration and no
+> longer reflects the trainer. Two things changed:
+>
+> 1. **Training data is implicit user outcomes, not `match_scored=True` rows.** Labels are derived
+>    from behaviour (applying / progressing = positive, deliberate dismissal = negative), and
+>    system-generated rows (discovery auto-filters, dismissals with no user event) are excluded.
+> 2. **The label is no longer `job.match_score`.** Fitting on the previous score trained the model
+>    on its own output — a tautology. Features are now re-derived per row via
+>    `build_deterministic_assessment` (necessary anyway, since `match_*_json` is `NULL` on
+>    progressed rows).
+>
+> Current floors: `MIN_TRAINING_SAMPLES = 50`, `MIN_PER_CLASS_SAMPLES = 15`
+> (`backend/match_classifier.py`). See [`LESSONS_LEARNED.md`](LESSONS_LEARNED.md) for the
+> "don't train on your own output" lesson and `AGENTS.md` §10.2 for the pipeline.
 
 **Why logistic regression?**
 

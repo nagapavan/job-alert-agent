@@ -35,10 +35,15 @@ Where to look for the deep-dive topics:
 | Developer onboarding & code editing rules | [`README.md`](../README.md) Quick Start; [`CONTRIBUTING.md`](../CONTRIBUTING.md); [`EngineeringAgentRules.md`](../EngineeringAgentRules.md) |
 | Agentic reasoning / autonomy / harness | [`AGENTIC_ARCHITECTURE.md`](../AGENTIC_ARCHITECTURE.md) §1–5 |
 | ATS portals, filters & requisition probing | [`ATS_PORTALS.md`](ATS_PORTALS.md) |
+| Polite crawling (robots/AI files + pacing) & Workday | [`POLITE_CRAWLING_AND_WORKDAY.md`](POLITE_CRAWLING_AND_WORKDAY.md); [`ATS_GENERIC_ENGINE_PLAN.md`](ATS_GENERIC_ENGINE_PLAN.md) |
 | Structured match analysis & interview prep | [`PROJECT_INDEX.md`](../PROJECT_INDEX.md); [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §20 |
 | One-shot "Sync All" orchestration | [`SYNC_ALL_PLAN.md`](SYNC_ALL_PLAN.md) |
 | Log rotation & operation-log retention | [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §1; [`README.md`](../README.md) §Observability |
 | No-fabrication guarantees / "not AI-scored" | [`AGENTIC_ARCHITECTURE.md`](../AGENTIC_ARCHITECTURE.md) §5.5 |
+| Embedding backends (pluggable, 384-d) | [`docs/README.md`](README.md) §Scoring & matching internals; `backend/embeddings.py` |
+| Section-intent / skill taxonomy / residual requirements | [`docs/README.md`](README.md) §Scoring & matching internals; `backend/section_intent.py` |
+| Self-learning labels & training readiness | [`docs/README.md`](README.md) §Scoring & matching internals; `GET /api/learning/readiness` |
+| Graceful shutdown / drain order | [`AGENTS.md`](../AGENTS.md) §12.11; [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §19.3 |
 | Security implementation & encryption | [`SECURITY_IMPLEMENTATION.md`](SECURITY_IMPLEMENTATION.md) (CORS, auth, secrets, encryption, browser isolation, prompt injection, opt-in guardrails, Gmail privacy) |
 
 ## Feature / design plans (`docs/`)
@@ -48,6 +53,29 @@ Where to look for the deep-dive topics:
 | Gmail API Flow (opt-in, BYOK) | [`GMAIL_API.md`](GMAIL_API.md) | Implemented design: loopback OAuth, encrypted token storage, narrow-query metadata-only fetch, dedup, endpoints, UI. |
 | ATS Portal Support & Probing | [`ATS_PORTALS.md`](ATS_PORTALS.md) | Design spec: supported portals (Greenhouse/Lever/Ashby/Uber/custom), scraper + filter contracts, requisition-active probing subsystem, and the SmartRecruiters/Workable/Workday roadmap with verified endpoints. |
 | One-Shot "Sync All" Orchestrator | [`SYNC_ALL_PLAN.md`](SYNC_ALL_PLAN.md) | Implemented plan: single `POST /api/tasks/sync/all` orchestrating ATS portals, Google Jobs, LinkedIn, and application-status sync with per-stage skip/fail handling. |
+
+## Scoring & matching internals (deterministic path)
+
+The bulk scorer is split across several modules that are not obvious from the endpoint names. This
+table says which file owns which concern; `AGENTS.md` §1 and §10.2 describe the surrounding design.
+
+| Module | Responsibility |
+| :--- | :--- |
+| [`backend/embeddings.py`](../backend/embeddings.py) | Pluggable embedding backends behind one 384-d contract: in-process ONNX `standalone` → OpenAI-compatible `external` server → deterministic `hash` last resort. `resolve_backends` / `embed_texts` / `active_backend_name` / `local_model_cached`. |
+| [`backend/section_intent.py`](../backend/section_intent.py) | Single heading/section classifier. `classify_heading(line, domain=jd\|resume\|must_have)`, `jd_section_spans` / `label_at` / `mask_spans`, `is_must_have_heading`, `starts_with_preference_cue`. Replaced three duplicated detectors. |
+| [`backend/skill_taxonomy.py`](../backend/skill_taxonomy.py) + [`data/skill_taxonomy.json`](../data/skill_taxonomy.json) | Data-driven skill taxonomy: canonical name → aliases + concepts. `normalize_skill` / `alias_surfaces` / `concepts_for`; unmatched phrases land in `data/skill_taxonomy_candidates.json` via `record_skill_candidate`. |
+| [`backend/requirements_extractor.py`](../backend/requirements_extractor.py) | Mines residual JD requirement units the taxonomy did not cover and credits the ones the resume evidences (`extract_residual_requirements`). Unsupported residuals go to the review queue, never into a score. |
+| [`backend/resume_index.py`](../backend/resume_index.py) | RAG-lite resume chunking. `chunk_resume` splits parsed JSON into skills/role/project chunks; `index_resume_chunks` persists them into `resume_chunks`; `top_evidence` returns the chunks most similar to a query. |
+| [`backend/learning_signals.py`](../backend/learning_signals.py) | Implicit-signal labelling for classifier training. `derive_decision` maps tracked outcomes to `positive`/`strong_positive`/`negative`/`negative_outcome` with `user_initiated` vs `system_generated` provenance; `learning_readiness` reports the trainable counts. |
+| [`backend/shutdown.py`](../backend/shutdown.py) | Bounded graceful drain (`run_shutdown`, `is_shutting_down`) invoked from the ASGI shutdown lifecycle. Order: scheduler → task engine → LLM queue → browser-profile locks. See `AGENTS.md` §12.11. |
+
+Supporting data/config:
+
+- `data/embedding_settings.json` — persisted backend/model choice (env vars override).
+  Endpoints: `GET/PUT /api/settings/embeddings`, `POST /api/settings/embeddings/download`.
+- `data/skill_taxonomy_candidates.json` — review queue for unmatched skill phrases (never scored).
+- Changing the embedding **model** does not change the 384-d dimension, but existing rows must be
+  re-embedded before similarity comparisons stay meaningful.
 
 ## Location filtering & aliases
 

@@ -17,7 +17,7 @@ This document serves as the master architectural reference and design blueprint 
 10. [The 5 Pillars of the Agentic Execution Harness](#10-the-5-pillars-of-the-agentic-execution-harness)
 11. [Strict Structured Outputs & Schema Enforcement (Task 8.2)](#11-strict-structured-outputs--schema-enforcement-task-82)
 12. [Semantic Prompt & Response Caching Engine (Task 8.5)](#12-semantic-prompt--response-caching-engine-task-85)
-13. [Resume-Driven Company Discovery & STAR Project Coach (Phase 9 Blueprint)](#13-resume-driven-company-discovery--star-project-coach-phase-9-blueprint)
+13. [Resume-Driven Company Discovery & STAR Project Coach (Phase 9 Blueprint — SKIPPED)](#13-resume-driven-company-discovery--star-project-coach-phase-9-blueprint--skipped)
 14. [Zero-Trust Application Security & Encryption Architecture](#14-zero-trust-application-security--encryption-architecture)
 15. [Opportunity Radar (Structured Hiring-Intent Ranking)](#15-opportunity-radar-structured-hiring-intent-ranking)
 16. [C4 Architectural Model Suite (Levels 1 to 4)](#16-c4-architectural-model-suite-levels-1-to-4)
@@ -349,7 +349,18 @@ flowchart TD
 
 ---
 
-## 13. Resume-Driven Company Discovery & STAR Project Coach (Phase 9 Blueprint)
+## 13. Resume-Driven Company Discovery & STAR Project Coach (Phase 9 Blueprint — SKIPPED)
+
+> **Status (2026-10-18): SKIPPED — not being built.** See
+> `reasoning/2026-10-18-doc-drift-and-backlog-triage.md` (Item 2). Kept here only as a record of
+> the original idea; no work is scheduled.
+> - **Task 9.1** (resume-driven company discovery) is counter-intuitive with the current flow:
+>   discovery scans a curated `Company` catalog filtered by `PreferenceFilter` and scored
+>   deterministically (no LLM / no live search). Resume-driven company *suggestion* would
+>   reintroduce both, so it is dropped.
+> - **Task 9.2** (interactive STAR quizzer + auto-resume-write-back) is dropped. The valuable half
+>   already ships (`generate_interview_questions` emits resume-grounded STAR scaffolds); the
+>   remaining interactive probing loop + automatic master-resume mutation is unwanted.
 
 ```mermaid
 flowchart TD
@@ -382,7 +393,7 @@ flowchart TD
         SPAClient["Local SPA Dashboard\n(http://localhost:8000)"]
         ExtClient["Chrome Extension\n(chrome-extension://<ID>)"]
         
-        CORSFirewall{"CORS Origin Policy\n• allow_origins: [localhost:8000, 127.0.0.1:8000]\n• allow_origin_regex: ^chrome-extension://.*$\n• Disallow wildcard * with credentials"}
+        CORSFirewall{"CORS Origin Policy\n• allow_origins: [localhost:8000, 127.0.0.1:8000]\n• allow_origin_regex: built from ALLOWED_EXTENSION_IDS\n  (None when unset → no extension origin trusted)\n• allow_credentials: False (key travels in header, not cookie)"}
         
         BrowserClient -->|❌ Blocked by CORS| CORSFirewall
         SPAClient & ExtClient -->|✅ Allowed Origin| CORSFirewall
@@ -1179,6 +1190,11 @@ Single Python process (default), with several daemon threads. No external broker
 **Scaling notes:** the app is single-owner. To scale, run behind a reverse proxy only for a
 single user, move to PostgreSQL + `pgvector` for vectors, and keep concurrency low for local
 GPU inference (the queue enforces this).
+
+**Shutdown:** uvicorn owns `SIGTERM`/`SIGINT`; the drain runs from the ASGI shutdown lifecycle
+(`backend/shutdown.py::run_shutdown`) — scheduler → task engine → LLM queue → browser-profile locks
+last, bounded to 10 s and idempotent. Do not register custom signal handlers (they break
+`--reload`). `GET /api/health` reports `shutting_down: true` mid-drain. See `AGENTS.md` §12.11.
 
 ### 19.4 Storage & Persistence Layout
 

@@ -97,8 +97,8 @@ X-API-Key: <your-api-key>
 
 **Fields:**
 - `match_score`: 0-100 percentile
-- `band`: "Strong", "Good", "Moderate", "Weak", "Poor"
-- `apply_recommendation`: "apply", "apply_with_caution", "skip"
+- `band`: "Strong", "Good", "Moderate", "Weak", "Poor" (or "Unknown" when no score could be produced)
+- `apply_recommendation`: "apply", "apply_with_caution", "skip" (or "unknown" when unscored)
 - `analysis_source`: "classifier" (fast), "llm" (full extraction), or "error"
 - `match_method`: "classifier_v1" or "requirement_coverage_v1"
 - `job_id`: Database ID if this is a saved job; null for ad-hoc analyses
@@ -191,12 +191,14 @@ X-API-Key: <your-api-key>
                              ↓
          ┌─────────────────────────────────────────┐
          │ Determine band + recommendation from    │
-         │ score (same logic as LLM scoring)       │
-         │ - ≥85: "Strong" → "apply"              │
-         │ - 70-85: "Good" → "apply"              │
-         │ - 55-70: "Moderate" → "apply_w_caution"│
-         │ - 40-55: "Weak" → "apply_w_caution"    │
-         │ - <40: "Poor" → "skip"                 │
+         │ score (shared ScoringConfig, same       │
+         │ logic as the LLM path)                  │
+         │ - ≥85:  "Strong"  → "apply"            │
+         │ - ≥70:  "Good"    → "apply"            │
+         │ - ≥55:  "Moderate"→ "apply_with_caution"│
+         │ - ≥40:  "Weak"    → "skip"             │
+         │ - <40:  "Poor"    → "skip"             │
+         │ - None: "Unknown" → "unknown"          │
          └─────────────────────────────────────────┘
                              ↓
          ┌─────────────────────────────────────────┐
@@ -325,16 +327,25 @@ score = (
 
 ### 2. TrainedClassifier (Optional, Requires Training)
 
-Logistic regression trained on historical assessments:
+Logistic regression trained on **implicit user outcomes** (never on the model's own output):
 
 ```bash
 python scripts/train_match_classifier.py
 ```
 
 **Training requirements:**
-- >10 jobs in DB with `match_scored=True`
+- **≥50 trainable decisions** (`MIN_TRAINING_SAMPLES`) overall, **and ≥15 in each class**
+  (`MIN_PER_CLASS_SAMPLES`). The trainer refuses otherwise rather than fitting a near-tautological model.
+- Labels come from behaviour, not from a thumbs-up UI: applying / progressing → positive;
+  deliberate dismissal → negative. Rows the *system* generated (discovery auto-filters, dismissals
+  with no user decision event) are **excluded** as training data.
+- Feature values are re-derived via `build_deterministic_assessment` — never read back from
+  `match_*_json`, which is `NULL` on progressed rows.
 - Saves to `data/match_classifier.pkl`
 - Automatically loaded on app restart
+
+Check readiness without training: `GET /api/learning/readiness` returns trainable/positive/negative
+counts, excluded rows, and a `ready_to_train` verdict with the configured floor.
 
 **When used:**
 - Model file exists + sklearn installed
@@ -344,18 +355,44 @@ python scripts/train_match_classifier.py
 
 **Typical accuracy:** 70-85% agreement with LLM scoring on historical assessments
 
+### Band thresholds & recommendation (`ScoringConfig`)
+
+Band and apply-recommendation are **not hardcoded** in the classifier. Both paths call
+`band_and_recommendation` (`backend/match_scoring.py`), which reads the shared `ScoringConfig`
+dataclass. Defaults — overridable per user via `scoring_config_json` in `GET/PUT /api/preferences`:
+
+| Field | Default | Meaning |
+| :--- | :--- | :--- |
+| `strong` | `85.0` | ≥ this → "Strong" |
+| `good` | `70.0` | ≥ this → "Good" |
+| `moderate` | `55.0` | ≥ this → "Moderate" |
+| `weak` | `40.0` | ≥ this → "Weak"; below → "Poor" |
+
+Two rules the band table alone does not capture:
+
+- `score is None` → band `"Unknown"`, recommendation `"unknown"` (no fabrication on failure).
+- `gated=True` (a must-have floor failure) → `"skip"` **regardless of band**, and
+  `over_qualified=True` → `"apply_with_caution"` even in the Strong/Good bands.
+
+A must-have floor (`must_floor=0.5`) caps the score at `cap_when_below_floor=55.0`, so passing the
+floor gates the upper bands.
+
 ---
 
 ## Configuration
 
-### Environment Variables
+### Real knobs
 
-```bash
-# Not required; classifier works out of the box
-# These control classifier behavior (if extended)
-CLASSIFIER_MIN_MUST_COVERAGE=0.5  # Skip if <50% must-haves
-CLASSIFIER_SENIORITY_PENALTY=0.1  # Penalty per year delta
-```
+The classifier itself has **no environment variables**. What is tunable:
+
+| Knob | Where | Effect |
+| :--- | :--- | :--- |
+| Band cutoffs (`strong`/`good`/`moderate`/`weak`) & coverage weights | `UserPreference.scoring_config_json` via `GET/PUT /api/preferences` → `scoring_config` | Changes band/recommendation boundaries and must/nice weighting for both scoring paths |
+| Training floors | `MIN_TRAINING_SAMPLES` / `MIN_PER_CLASS_SAMPLES` in `backend/match_classifier.py` | How much signal is required before training is allowed |
+| Embedding backend | `EMBEDDING_*` env vars, or `GET/PUT /api/settings/embeddings` | Semantics only — does not change the score thresholds |
+
+`ScoringConfig` is the single source of truth: `ScoringConfig.from_mapping(get_scoring_config(db))`
+is how every scorer reads it, so editing preferences changes bands without a code change.
 
 ### Feature Flags
 
@@ -484,21 +521,25 @@ print(f"Method: {response.match_method}")    # "classifier_v1" or "requirement_c
 
 ### Train Custom Classifier
 
-When you have >10 historically scored jobs:
+Once you have ≥50 trainable outcomes with ≥15 per class (check `GET /api/learning/readiness` first):
 
 ```bash
-cd /Users/nagapavank/work/personal-projects/job-alert-agent
-python scripts/train_match_classifier.py
+./.venv/bin/python scripts/train_match_classifier.py
 ```
 
-**Output:**
+Use `--status` to print the readiness breakdown without training.
+
+**Output (sufficient data):**
 ```
-Loaded 42 jobs with match_scored=True
-Training logistic regression classifier...
+Training classifier on 78 user decisions (19 positive, 59 negative); 99 system-generated rows excluded
 Features: must_coverage, nice_coverage, seniority_fit, education_match, over_qualified_flag
-Trained on 42 samples
-Model saved to data/match_classifier.pkl (2.3 KB)
+Model saved to data/match_classifier.pkl
 Restart the app to use the trained model
+```
+
+**Output (insufficient data) — training is refused, not attempted:**
+```
+Insufficient training signal: 34 trainable decisions (need >= 50). 99 rows excluded as system-generated. Not training.
 ```
 
 ### Verify Classifier is Active
