@@ -31,13 +31,35 @@ _HEADERS = {
     )
 }
 
-def _http(method: str, url: str, *, cfg: Optional[PortalConfig] = None, **kwargs):
-    """HTTP call shared by all shape scrapers.
+# Per-run shared pacer; set by the scrape dispatcher and read here so every engine request is
+# rate-paced. None -> no pacing (unit-test / direct use).
+_ACTIVE_PACER = None
+_RATE_LIMIT_STATUSES = {429, 503}
 
-    Returns the ``requests`` response, or ``None`` on a network error. Callers treat ``None`` like
-    a failed fetch. Centralising this keeps every shape on one request surface (and gives later
-    layers — pacing, permission gating — a single place to hook in).
+
+def _parse_retry_after(res) -> Optional[float]:
+    """Parses a numeric ``Retry-After`` header (seconds) if present."""
+    raw = (getattr(res, "headers", None) or {}).get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _http(method: str, url: str, *, cfg: Optional[PortalConfig] = None, **kwargs):
+    """Rate-paced HTTP call shared by all shape scrapers.
+
+    Returns the ``requests`` response, or ``None`` when the host has exhausted its per-run request
+    budget. Callers treat ``None`` like a failed fetch.
     """
+    pacer = _ACTIVE_PACER
+    if pacer is not None:
+        if not pacer.allow(url, delay=getattr(cfg, "pacing_seconds", None)):
+            return None
+        pacer.wait(url, delay=getattr(cfg, "pacing_seconds", None))
+
     try:
         if method == "GET":
             res = requests.get(url, headers=_HEADERS, **kwargs)
@@ -46,8 +68,13 @@ def _http(method: str, url: str, *, cfg: Optional[PortalConfig] = None, **kwargs
         else:
             res = requests.request(method, url, headers=_HEADERS, **kwargs)
     except Exception as e:  # noqa: BLE001 - network errors are non-fatal per request
+        if pacer is not None:
+            pacer.note_failure(url)
         logger.debug(f"HTTP {method} {url} failed: {e}")
         return None
+
+    if pacer is not None and res.status_code in _RATE_LIMIT_STATUSES:
+        pacer.note_failure(url, retry_after=_parse_retry_after(res))
     return res
 
 _SLUG_RESOLVERS: Dict[str, Callable[[str, str], str]] = {}
@@ -98,6 +125,7 @@ class PortalConfig:
     default_flag: Optional[str] = None
     enabled_by_default: bool = False
     timeout: int = 15
+    pacing_seconds: Optional[float] = None
 
 
 def _resolve_path(obj: Any, path: str) -> Any:
@@ -602,6 +630,12 @@ def _ensure_default_resolvers() -> None:
     register_slug_resolver("careers_url")(extract_slug_from_careers_url)
 
 
+def set_active_pacer(pacer) -> None:
+    """Sets the run-level pacer shared across portals (called by the scrape dispatcher)."""
+    global _ACTIVE_PACER
+    _ACTIVE_PACER = pacer
+
+
 def run_portal(
     cfg: PortalConfig,
     *,
@@ -612,9 +646,27 @@ def run_portal(
     work_mode: Optional[str] = None,
     max_matches: int = 35,
     careers_url: Optional[str] = None,
+    pacer=None,
 ) -> List[Dict[str, str]]:
-    """Executes a portal config through the shape scraper for its ``shape``/``variant``."""
+    """Executes a portal config through the shape scraper for its ``shape``/``variant``.
+
+    ``pacer`` is an optional shared :class:`backend.ats.pacing.HostPacer`; when omitted a fresh one
+    is built from config so direct callers still get pacing + per-host ceilings.
+    """
     _ensure_default_resolvers()
+    global _ACTIVE_PACER
+    if pacer is None:
+        # Reuse a run-level pacer if the caller set one (shared delay + ceilings across portals);
+        # otherwise build a fresh one so direct callers still get pacing.
+        pacer = _ACTIVE_PACER
+        if pacer is None:
+            try:
+                from backend.ats.pacing import build_pacer
+
+                pacer = build_pacer()
+            except Exception:  # noqa: BLE001 - pacing is best-effort, never fatal
+                pacer = None
+    _ACTIVE_PACER = pacer
     scraper = get_shape_scraper(cfg.shape, cfg.variant)
     if scraper is None:
         logger.warning(f"Unknown ATS portal shape '{cfg.shape}' for '{cfg.id}'")
