@@ -17,6 +17,7 @@ backend/companies_config.json
 data/*
 !data/location_aliases.json
 !data/company_aliases.example.json
+!data/ats_portals.json
 !data/skill_taxonomy.json
 data/resumes/
 *.pdf
