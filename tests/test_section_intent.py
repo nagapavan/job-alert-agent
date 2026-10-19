@@ -19,6 +19,9 @@ class TestJdHeadingIntent:
             ("Nice to have", "preferred"),
             ("About Us", "intro"),
             ("Who we are", "intro"),
+            ("What We Can Offer You", "boilerplate"),
+            ("Health & Wellbeing", "boilerplate"),
+            ("Benefits", "boilerplate"),
             ("Key Responsibilities", "responsibilities"),
         ],
     )

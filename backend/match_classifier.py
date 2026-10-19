@@ -287,11 +287,12 @@ def build_deterministic_assessment(
     ).lower()
 
     # Section-aware: split the JD into required / preferred / intro spans using the
-    # shared section-intent primitive, then blank out company-intro prose so marketing
-    # sentences (e.g. "40-year old C++ code") are not read as requirements. Offsets are
-    # preserved by masking, so category lookups stay aligned with the original text.
+    # shared section-intent primitive, then blank out company-intro and perks/offer
+    # prose so marketing sentences (e.g. "40-year old C++ code") and benefits
+    # paragraphs are not read as requirements. Offsets are preserved by masking, so
+    # category lookups stay aligned with the original text.
     spans = section_intent.jd_section_spans(jd)
-    intro_spans = [s for s in spans if s.label == "intro"]
+    intro_spans = [s for s in spans if s.label in ("intro", "boilerplate")]
     jd_scan = section_intent.mask_spans(jd, intro_spans)
     jd_scan_lower = jd_scan.lower()
 
