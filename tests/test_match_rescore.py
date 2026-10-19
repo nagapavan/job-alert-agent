@@ -18,7 +18,7 @@ def _result(items):
 @patch("backend.main.assess_job_requirements")
 def test_score_job_with_engine_deterministic(mock_assess, db_session):
     # Signal-rich JD -> deterministic classifier, no LLM call.
-    score, analysis, scored, method, at, band, rec, strengths, gaps = _score_job_with_engine(
+    score, analysis, scored, method, at, band, rec, strengths, gaps, partials = _score_job_with_engine(
         db_session, "resume text", "We need a Python engineer to build distributed APIs."
     )
     assert scored is True
@@ -32,7 +32,7 @@ def test_score_job_with_engine_deterministic(mock_assess, db_session):
     # Too-short description -> unscored, and neither engine is called.
     mock_assess.reset_mock()
     assert _score_job_with_engine(db_session, "resume", "short") == (
-        0, "", False, None, None, None, None, [], []
+        0, "", False, None, None, None, None, [], [], []
     )
     mock_assess.assert_not_called()
 
@@ -43,7 +43,7 @@ def test_score_job_with_engine_llm_fallback(mock_assess, db_session):
         [RequirementItem(text="Python", status="met")]
     )
     # JD-like but signal-less -> deterministic yields nothing -> bounded LLM fallback.
-    score, analysis, scored, method, at, band, rec, strengths, gaps = _score_job_with_engine(
+    score, analysis, scored, method, at, band, rec, strengths, gaps, partials = _score_job_with_engine(
         db_session,
         "resume text",
         "We are looking for a motivated individual with strong communication skills to join our team.",
@@ -60,7 +60,7 @@ def test_score_job_with_engine_llm_fallback(mock_assess, db_session):
 @patch("backend.main.assess_job_requirements")
 def test_score_job_with_engine_llm_failure_unscored(mock_assess, db_session):
     mock_assess.side_effect = RuntimeError("llm offline")
-    score, analysis, scored, method, at, band, rec, strengths, gaps = _score_job_with_engine(
+    score, analysis, scored, method, at, band, rec, strengths, gaps, partials = _score_job_with_engine(
         db_session,
         "resume text",
         "We are looking for a motivated individual with strong communication skills to join our team.",
@@ -80,7 +80,7 @@ def test_score_job_with_engine_skips_non_jd_snippet(mock_assess, db_session):
         "resume text",
         "LinkedIn Alert opening for Software Engineer | Remote at LinkedIn Network",
     )
-    assert result == (0, "", False, None, None, None, None, [], [])
+    assert result == (0, "", False, None, None, None, None, [], [], [])
     mock_assess.assert_not_called()
 
 
@@ -139,7 +139,7 @@ def test_score_job_with_engine_falls_back_on_deterministic_error(
     mock_assess.side_effect = lambda *a, **k: _result(
         [RequirementItem(text="Python", status="met")]
     )
-    _, _, scored, method, _, _, _, _, _ = _score_job_with_engine(
+    _, _, scored, method, _, _, _, _, _, _ = _score_job_with_engine(
         db_session, "resume text", "We need a Python engineer to build distributed APIs."
     )
     assert scored is True
@@ -153,7 +153,7 @@ def test_score_job_with_engine_flag_disables_deterministic(mock_assess, db_sessi
     mock_assess.side_effect = lambda *a, **k: _result(
         [RequirementItem(text="Python", status="met")]
     )
-    _, _, scored, method, _, _, _, _, _ = _score_job_with_engine(
+    _, _, scored, method, _, _, _, _, _, _ = _score_job_with_engine(
         db_session, "resume text", "We need a Python engineer to build distributed APIs."
     )
     assert scored is True
