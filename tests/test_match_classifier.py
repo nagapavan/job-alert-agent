@@ -288,6 +288,23 @@ class TestDeterministicAssessment:
         assert "Python" in skill_texts
         assert "C++" not in skill_texts
 
+    def test_benefits_perks_prose_not_scored_as_skill(self):
+        """Regression: a perks/offer paragraph mentioning "benefits" must not surface the
+        HR skill "Benefits Administration" — the word is ordinary prose, not a requirement."""
+        jd = (
+            "Required Skills & Experience\n"
+            "Deep expertise in C/C++, Linux internals, and RDMA.\n"
+            "What We Can Offer You\n"
+            "Health & Wellbeing\n"
+            "We provide a comprehensive suite of benefits that supports your wellbeing.\n"
+        )
+        a = build_deterministic_assessment(
+            jd, {"skills": ["C++", "Linux"]}, job_title="Engineer"
+        )
+        skill_texts = {r.text for r in a.requirements if r.kind == "skill"}
+        assert "Benefits Administration" not in skill_texts
+        assert {"C++", "Linux"} <= skill_texts
+
     def test_skills_before_requirements_heading_are_captured(self):
         """A skill list before a later "Requirements" heading must not be dropped."""
         jd = "We need Python and Go engineers.\n\nRequirements: strong communication."
