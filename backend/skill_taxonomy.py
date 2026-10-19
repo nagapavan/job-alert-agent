@@ -49,6 +49,15 @@ _FALLBACK_SKILLS: List[dict] = [
 
 _FALLBACK_CLOUD = {"aws", "gcp", "azure"}
 
+# Single generic-English surfaces are rejected as aliases: they match ordinary JD prose
+# (e.g. a perks paragraph mentioning "benefits") and surface false requirements. Canonical
+# display names are unaffected — only the ambiguous short alias is dropped. This is a
+# review-time guard so a future hand-edit of the data file cannot silently re-introduce
+# the class of bug that made "benefits" score as "Benefits Administration".
+_AMBIGUOUS_ALIASES = {
+    "benefits", "case management", "leave management",
+}
+
 
 def _normalize(name: str) -> str:
     return (name or "").strip().lower()
@@ -85,7 +94,13 @@ def _load() -> _TaxonomyData:
         if not name:
             continue
         canonical = _normalize(name)
-        aliases = [str(a).strip().lower() for a in (entry.get("aliases") or []) if str(a).strip()]
+        raw_aliases = [str(a).strip().lower() for a in (entry.get("aliases") or []) if str(a).strip()]
+        dropped = [a for a in raw_aliases if a in _AMBIGUOUS_ALIASES]
+        if dropped:
+            logger.warning(
+                "Ignoring ambiguous taxonomy alias(es) for %s: %s", name, ", ".join(dropped)
+            )
+        aliases = [a for a in raw_aliases if a not in _AMBIGUOUS_ALIASES]
         concepts = {str(c).strip().lower() for c in (entry.get("concepts") or []) if str(c).strip()}
         data.skills.append({"name": name, "canonical": canonical, "aliases": aliases, "concepts": concepts})
         data.display_skills.append(name)

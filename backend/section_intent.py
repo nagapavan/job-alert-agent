@@ -70,6 +70,22 @@ JD_HEADINGS: Dict[str, Tuple[str, ...]] = {
         "who we are", "company overview", "our story", "our mission", "our vision",
         "why join us", "life at", "welcome to",
     ),
+    # Company perks / offer prose. These headings introduce no candidate requirements,
+    # so they are masked before the JD skill scan (see match_classifier). Without this,
+    # ordinary words in a perks paragraph (e.g. "benefits") match HR-domain taxonomy
+    # aliases and surface as false requirements.
+    "boilerplate": (
+        "what we offer", "what we can offer", "what we can offer you",
+        "what we offer you", "what you can expect", "what you can expect from us",
+        "benefits", "benefits & perks", "benefits and perks", "our benefits",
+        "perks", "compensation", "compensation & benefits",
+        "compensation and benefits", "total rewards",
+        "health & wellbeing", "health and wellbeing", "wellbeing",
+        "personal & professional development", "personal and professional development",
+        "professional development", "unconditional inclusion", "inclusion",
+        "accessibility", "let's stay connected", "let us stay connected",
+        "stay connected",
+    ),
 }
 
 # Resume section intents (superset of the legacy parser.ALL_SECTION_HEADERS).
@@ -126,6 +142,10 @@ _EMBED_EXEMPLARS: Dict[str, Dict[str, Tuple[str, ...]]] = {
             "what you will be doing in this role", "your day to day responsibilities",
         ),
         "intro": ("about our company and team", "who we are as a company"),
+        "boilerplate": (
+            "what we offer you as an employee", "our benefits and perks",
+            "compensation and total rewards",
+        ),
     },
     "resume": {
         "experience": ("professional work experience",),
