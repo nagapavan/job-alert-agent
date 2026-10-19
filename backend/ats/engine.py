@@ -31,13 +31,42 @@ _HEADERS = {
     )
 }
 
-def _http(method: str, url: str, *, cfg: Optional[PortalConfig] = None, **kwargs):
-    """HTTP call shared by all shape scrapers.
+# Per-run shared pacer; set by the scrape dispatcher and read here so every engine request is
+# rate-paced. None -> no pacing (unit-test / direct use).
+_ACTIVE_PACER = None
+_RATE_LIMIT_STATUSES = {429, 503}
 
-    Returns the ``requests`` response, or ``None`` on a network error. Callers treat ``None`` like
-    a failed fetch. Centralising this keeps every shape on one request surface (and gives later
-    layers — pacing, permission gating — a single place to hook in).
+
+def _parse_retry_after(res) -> Optional[float]:
+    """Parses a numeric ``Retry-After`` header (seconds) if present."""
+    raw = (getattr(res, "headers", None) or {}).get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _http(method: str, url: str, *, cfg: Optional[PortalConfig] = None, **kwargs):
+    """Paced, permission-gated HTTP call shared by all shape scrapers.
+
+    Returns the ``requests`` response, or ``None`` when the host is disallowed (robots/AI files)
+    or has exhausted its per-run request budget. Callers treat ``None`` like a failed fetch.
     """
+    from backend.scraper import may_fetch
+
+    if cfg is not None and getattr(cfg, "respect_robots", True):
+        if not may_fetch(url):
+            logger.info(f"Permission gate: skipping '{url}' (robots/AI-use files).")
+            return None
+
+    pacer = _ACTIVE_PACER
+    if pacer is not None:
+        if not pacer.allow(url, delay=getattr(cfg, "pacing_seconds", None)):
+            return None
+        pacer.wait(url, delay=getattr(cfg, "pacing_seconds", None))
+
     try:
         if method == "GET":
             res = requests.get(url, headers=_HEADERS, **kwargs)
@@ -46,8 +75,13 @@ def _http(method: str, url: str, *, cfg: Optional[PortalConfig] = None, **kwargs
         else:
             res = requests.request(method, url, headers=_HEADERS, **kwargs)
     except Exception as e:  # noqa: BLE001 - network errors are non-fatal per request
+        if pacer is not None:
+            pacer.note_failure(url)
         logger.debug(f"HTTP {method} {url} failed: {e}")
         return None
+
+    if pacer is not None and res.status_code in _RATE_LIMIT_STATUSES:
+        pacer.note_failure(url, retry_after=_parse_retry_after(res))
     return res
 
 _SLUG_RESOLVERS: Dict[str, Callable[[str, str], str]] = {}
@@ -87,6 +121,8 @@ class PortalConfig:
     location_join: List[str] = field(default_factory=list)
     url_path: str = ""
     alternate_url_path: str = ""
+    url_prefix: str = ""
+    total_path: str = "total"
     description_path: str = ""
     description_html: bool = False
     max_pages: int = 5
@@ -98,6 +134,8 @@ class PortalConfig:
     default_flag: Optional[str] = None
     enabled_by_default: bool = False
     timeout: int = 15
+    pacing_seconds: Optional[float] = None
+    respect_robots: bool = True
 
 
 def _resolve_path(obj: Any, path: str) -> Any:
@@ -212,8 +250,15 @@ class ShapeScraper(ABC):
     ) -> List[Any]:  # pragma: no cover - abstract
         raise NotImplementedError
 
-    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
-        """Map a raw row to ``{title, location, url, description}`` (or None to skip)."""
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        """Map a raw row to ``{title, location, url, description}`` (or None to skip).
+
+        ``ctx`` is the resolver context for the current request. It is passed explicitly
+        (never stashed on ``self``) because shape scrapers are shared singleton instances and
+        scraping runs on a background thread.
+        """
         title = _resolve_path(item, cfg.title_path) or "Untitled Role"
         title = str(title).strip()
         location = _coerce_location(cfg, item)
@@ -335,7 +380,7 @@ class ShapeScraper(ABC):
 
         jobs: List[Dict[str, str]] = []
         for item in raw_items:
-            mapped = self.map_item(cfg, item)
+            mapped = self.map_item(cfg, item, ctx)
             if not mapped:
                 continue
             title = mapped["title"]
@@ -421,8 +466,10 @@ class AshbyScraper(SimpleJsonScraper):
     """Ashby: multi-location rows where location OR work-mode eligibility may match any of the
     primary/secondary locations (differs from the base AND gate)."""
 
-    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
-        mapped = super().map_item(cfg, item)
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item, ctx)
         if mapped is None:
             return None
         # Stash the secondary locations on the row for the filter override.
@@ -463,8 +510,10 @@ class WorkableScraper(SimpleJsonScraper):
     """Workable: location is a city/state/country join and a remote role gets a ``(Remote)``
     suffix; description falls back to ``full_description`` and is HTML."""
 
-    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
-        mapped = super().map_item(cfg, item)
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item, ctx)
         if mapped is None:
             return None
         is_remote = bool(item.get("telecommuting")) or str(
@@ -485,8 +534,10 @@ class GreenhouseScraper(SimpleJsonScraper):
     """Greenhouse: list rows already carry embedded ``content`` HTML, so the per-posting detail
     call is made ONLY when the embedded description is empty (bandwidth optimisation)."""
 
-    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
-        mapped = super().map_item(cfg, item)
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item, ctx)
         if mapped is not None:
             mapped["_item_id"] = item.get("id", "") if isinstance(item, dict) else ""
         return mapped
@@ -525,13 +576,112 @@ class PaginatedJsonScraper(ShapeScraper):
 
 
 
+class PostJsonScraper(ShapeScraper):
+    """``POST`` a JSON body (with ``limit``/``offset``) and read a list at ``response_path``.
+
+    Used by enterprise boards whose search endpoint is a POST (Workday CXS). Pagination total is
+    read from ``cfg.total_path`` (default ``total``). ``url_path`` holds a path relative to the
+    host (e.g. Workday's ``externalPath``), prefixed by ``url_prefix`` when present.
+    """
+
+    method = "POST"
+
+    def fetch_list(
+        self, cfg: PortalConfig, ctx: Dict[str, Any], *, timeout: int
+    ) -> List[Any]:
+        url = _format_template(cfg.list_url, ctx)
+        items: List[Any] = []
+        offset = 0
+        for _ in range(max(1, cfg.max_pages)):
+            body = dict(cfg.body or {})
+            body["limit"] = cfg.page_size
+            body["offset"] = offset
+            res = _http("POST", url, cfg=cfg, json=body, timeout=timeout)
+            if res is None or res.status_code != 200:
+                break
+            data = res.json()
+            page = _resolve_path(data, cfg.response_path) if cfg.response_path else data
+            page = page if isinstance(page, list) else []
+            items.extend(page)
+            total = _resolve_path(data, cfg.total_path) if isinstance(data, dict) else None
+            offset += cfg.page_size
+            if not page or (isinstance(total, int) and offset >= total):
+                break
+        return items
+
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item, ctx)
+        if mapped is None:
+            return None
+        # Workday exposes a host-relative ``externalPath``; prefix it with the board host.
+        if cfg.url_prefix and mapped["url"] and not mapped["url"].startswith("http"):
+            mapped["url"] = _format_template(cfg.url_prefix, ctx or {}) + mapped["url"]
+        return mapped
+
+
+class WorkdayScraper(PostJsonScraper):
+    """Workday CXS: POST list + ``externalPath``-based detail.
+
+    Two parity details vs. the legacy inline code: the public job URL falls back to
+    ``https://{host}/{site}/{path}`` when ``externalPath`` is not slash-prefixed, and the detail
+    payload's ``location`` (a single string) refines the coarse ``locationsText``.
+    """
+
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item, ctx)
+        if mapped is None:
+            return None
+        # ``super()`` prefixes with url_prefix; keep the legacy fallback for host-relative paths.
+        ctx = ctx or {}
+        path = (item.get("externalPath") or "") if isinstance(item, dict) else ""
+        if path and not path.startswith("/"):
+            mapped["url"] = f"https://{ctx.get('host', '')}/{ctx.get('site', '')}/{path}"
+        elif not path:
+            mapped["url"] = f"https://{ctx.get('host', '')}/{ctx.get('site', '')}"
+        mapped["_item_id"] = item.get("id", "") if isinstance(item, dict) else ""
+        return mapped
+
+    def fetch_detail(self, cfg: PortalConfig, item: Any, ctx: Dict[str, Any]) -> Any:
+        detail = cfg.detail or {}
+        url_tmpl = detail.get("url")
+        if not url_tmpl or not isinstance(item, dict):
+            return ""
+        from backend.scraper import _normalize_workday_external_path
+
+        raw_path = item.get("externalPath") or ""
+        norm_path = _normalize_workday_external_path(raw_path, ctx.get("site", ""))
+        if not norm_path:
+            return ""
+        fields = {**ctx, "externalPath": norm_path}
+        url = _format_template(url_tmpl, fields)
+        if not url or "{" in url:
+            return ""
+        res = _http("GET", url, cfg=cfg, timeout=8)
+        if res is None or res.status_code != 200:
+            return ""
+        info = (res.json() or {}).get("jobPostingInfo") or {}
+        description = ""
+        for path in detail.get("desc_paths", []):
+            txt = _resolve_path({"jobPostingInfo": info}, path)
+            if txt:
+                description = _clean_html(str(txt))
+                break
+        return {"description": description, "location": info.get("location") or ""}
+
+
 class SmartRecruitersScraper(PaginatedJsonScraper):
     """SmartRecruiters: list rows omit the apply URL and description, so the detail call is
     mandatory — it supplies both the description sections and the ``applyUrl``/``postingUrl``
     (hence ``fetch_detail`` returns a dict to override the mapped URL)."""
 
-    def map_item(self, cfg: PortalConfig, item: Any) -> Optional[Dict[str, str]]:
-        mapped = super().map_item(cfg, item)
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        mapped = super().map_item(cfg, item, ctx)
         if mapped is None:
             return None
         loc = item.get("location") or {} if isinstance(item, dict) else {}
@@ -568,6 +718,7 @@ class SmartRecruitersScraper(PaginatedJsonScraper):
 _SHAPE_REGISTRY: Dict[str, ShapeScraper] = {
     "simple_json": SimpleJsonScraper(),
     "paginated_json": PaginatedJsonScraper(),
+    "post_json": PostJsonScraper(),
 }
 
 # Per-portal variants that need behaviour beyond the pure-config path (selected by
@@ -578,6 +729,7 @@ _VARIANT_REGISTRY: Dict[str, ShapeScraper] = {
     "workable": WorkableScraper(),
     "greenhouse": GreenhouseScraper(),
     "smartrecruiters": SmartRecruitersScraper(),
+    "workday": WorkdayScraper(),
 }
 
 
@@ -602,6 +754,22 @@ def _ensure_default_resolvers() -> None:
     register_slug_resolver("careers_url")(extract_slug_from_careers_url)
 
 
+def set_active_pacer(pacer) -> None:
+    """Sets the run-level pacer shared across portals (called by the scrape dispatcher)."""
+    global _ACTIVE_PACER
+    _ACTIVE_PACER = pacer
+
+
+def clear_active_pacer() -> None:
+    """Drops the run-level pacer so a finished run cannot leak state into the next one.
+
+    Without this, a later caller that reaches the engine without an explicit ``pacer=`` would
+    inherit the previous run's per-host counters and cooldowns, silently skipping requests.
+    """
+    global _ACTIVE_PACER
+    _ACTIVE_PACER = None
+
+
 def run_portal(
     cfg: PortalConfig,
     *,
@@ -612,9 +780,27 @@ def run_portal(
     work_mode: Optional[str] = None,
     max_matches: int = 35,
     careers_url: Optional[str] = None,
+    pacer=None,
 ) -> List[Dict[str, str]]:
-    """Executes a portal config through the shape scraper for its ``shape``/``variant``."""
+    """Executes a portal config through the shape scraper for its ``shape``/``variant``.
+
+    ``pacer`` is an optional shared :class:`backend.ats.pacing.HostPacer`; when omitted a fresh one
+    is built from config so direct callers still get pacing + per-host ceilings.
+    """
     _ensure_default_resolvers()
+    global _ACTIVE_PACER
+    if pacer is None:
+        # Reuse a run-level pacer if the caller set one (shared delay + ceilings across portals);
+        # otherwise build a fresh one so direct callers still get pacing.
+        pacer = _ACTIVE_PACER
+        if pacer is None:
+            try:
+                from backend.ats.pacing import build_pacer
+
+                pacer = build_pacer()
+            except Exception:  # noqa: BLE001 - pacing is best-effort, never fatal
+                pacer = None
+    _ACTIVE_PACER = pacer
     scraper = get_shape_scraper(cfg.shape, cfg.variant)
     if scraper is None:
         logger.warning(f"Unknown ATS portal shape '{cfg.shape}' for '{cfg.id}'")

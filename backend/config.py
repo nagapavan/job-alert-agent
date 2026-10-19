@@ -458,6 +458,27 @@ AGENT_USER_AGENT = os.environ.get(
 # if you understand and accept the ToS implications.
 RESPECT_ROBOTS = os.environ.get("JOB_ALERT_AGENT_RESPECT_ROBOTS", "true").lower() in ("true", "1", "yes")
 
+# Machine-readable AI-use files (llms.txt / ai.txt / .well-known/ai.txt), checked (fail-open) in
+# addition to robots.txt for HTML scraping. Absent files are simply skipped. Advisory: an explicit
+# deny is honoured; anything unparseable or missing is treated as allowed.
+RESPECT_AI_USE_FILES = os.environ.get(
+    "JOB_ALERT_AGENT_RESPECT_AI_FILES", "true"
+).lower() in ("true", "1", "yes")
+
+# Inter-request pacing for discovery scrapers (ATS + HTML). Seconds between requests to the SAME
+# host; 0 disables. Applied with 0-SCRAPE_PACING_JITTER fractional jitter so bursts don't align.
+# A per-portal `pacing_seconds` in data/ats_portals.json overrides this default. Intended to become
+# a UI-tunable "request delay" knob (see docs/POLITE_CRAWLING_AND_WORKDAY.md §2.6).
+SCRAPE_PACING_SECONDS = float(os.environ.get("SCRAPE_PACING_SECONDS", "0.5"))
+SCRAPE_PACING_JITTER = float(os.environ.get("SCRAPE_PACING_JITTER", "0.5"))  # fraction, 0..1
+# Hard ceiling on requests to a single host per scrape run, independent of pacing, so a
+# pathological board (thousands of postings) can never become an accidental flood.
+SCRAPE_MAX_REQUESTS_PER_HOST_PER_RUN = int(
+    os.environ.get("SCRAPE_MAX_REQUESTS_PER_HOST_PER_RUN", "60")
+)
+# Cooldown applied to a host after a 429/503 (or an explicit Retry-After). Bounded below.
+SCRAPE_HOST_COOLDOWN_SECONDS = float(os.environ.get("SCRAPE_HOST_COOLDOWN_SECONDS", "30"))
+
 # Concurrency & Pacing Limits (Local single-worker vs Cloud parallel dispatch)
 LLM_LOCAL_MAX_CONCURRENCY = int(os.environ.get("LLM_LOCAL_MAX_CONCURRENCY", "1"))
 LLM_CLOUD_MAX_CONCURRENCY = int(os.environ.get("LLM_CLOUD_MAX_CONCURRENCY", "8"))

@@ -157,6 +157,45 @@ from backend.scraper import (
 )
 from backend.task_engine import CancellationToken, TaskProgress, task_engine
 
+# Config-driven ATS portals wired to their scraper wrappers, in dispatch order.
+# Each entry's ``default_flag`` is the opt-in feature flag that gates it; the portal id matches
+# data/ats_portals.json. Adding a new portal = one config entry + (usually) one registry line here.
+# Values are *attribute names* on this module (resolved at dispatch time so tests can patch them).
+_ATS_PORTAL_SCRAPERS = {
+    "greenhouse": "scrape_greenhouse_jobs",
+    "lever": "scrape_lever_jobs",
+    "ashby": "scrape_ashby_jobs",
+    "smartrecruiters": "scrape_smartrecruiters_jobs",
+    "workable": "scrape_workable_jobs",
+    "workday": "scrape_workday_jobs",
+}
+
+
+_AtsPortal = namedtuple("_AtsPortal", "id label default_flag scraper_attr")
+
+
+def _load_ats_portals():
+    """Returns the configured ATS portals (id, label, default_flag, scraper attr) for dispatch."""
+    from backend.ats.engine import load_portal_configs
+
+    portals = []
+    for cfg in load_portal_configs():
+        attr = _ATS_PORTAL_SCRAPERS.get(cfg.id)
+        if attr is None:
+            continue
+        portals.append(
+            _AtsPortal(
+                id=cfg.id,
+                label=cfg.label,
+                default_flag=cfg.default_flag,
+                scraper_attr=attr,
+            )
+        )
+    return portals
+
+
+_ATS_PORTALS = _load_ats_portals()
+
 # Initialize Observability, DB tables, and Periodic Scheduler on startup
 setup_observability()
 init_db()
@@ -3687,6 +3726,16 @@ def _execute_ats_scrape(
     total_added = 0
     companies_updated = 0
 
+    # One shared pacer for the whole run: same-host requests across portals stay spaced and share
+    # the per-run request ceiling. See docs/POLITE_CRAWLING_AND_WORKDAY.md §2.
+    try:
+        from backend.ats.engine import set_active_pacer
+        from backend.ats.pacing import build_pacer
+
+        set_active_pacer(build_pacer())
+    except Exception as _pacing_err:  # noqa: BLE001 - pacing is best-effort
+        logger.warning(f"Could not initialise scrape pacing: {_pacing_err}")
+
     global LATEST_SCRAPE_AUDIT
     audit_records = []
 
@@ -3730,9 +3779,14 @@ def _execute_ats_scrape(
         if _ats_on and _flags.get("ats_uber") and "uber" in comp_lower:
             discovered_jobs.extend(scrape_uber_jobs()[:35])
 
-        # B. Greenhouse ATS (Lightweight metadata fetch + early filtering + on-demand detail)
-        if _ats_on and _flags.get("ats_greenhouse"):
-            gh_jobs = scrape_greenhouse_jobs(
+        # B–C. Config-driven ATS portals (Greenhouse/Lever/Ashby/SmartRecruiters/Workable).
+        # One loop over data/ats_portals.json; each portal is gated by its own opt-in feature flag.
+        # Uber (A), Workday (D) and Custom HTML (E) stay bespoke.
+        for _portal in _ATS_PORTALS:
+            if not (_ats_on and _flags.get(_portal.default_flag)):
+                continue
+            _portal_fn = globals()[_portal.scraper_attr]
+            _portal_jobs = _portal_fn(
                 comp.name,
                 title_filters=title_filters,
                 city_filters=city_filters,
@@ -3741,66 +3795,12 @@ def _execute_ats_scrape(
                 max_matches=35,
                 careers_url=comp.careers_url,
             )
-            if gh_jobs:
-                discovered_jobs.extend(gh_jobs)
+            if _portal_jobs:
+                discovered_jobs.extend(_portal_jobs)
 
-        # C. Lever ATS
-        if _ats_on and _flags.get("ats_lever"):
-            lev_jobs = scrape_lever_jobs(
-                comp.name,
-                title_filters=title_filters,
-                city_filters=city_filters,
-                location_filters=loc_filters,
-                work_mode=wm_filter,
-                max_matches=35,
-                careers_url=comp.careers_url,
-            )
-            if lev_jobs:
-                discovered_jobs.extend(lev_jobs)
-
-        # D. Ashby ATS (companies hosting their job boards on Ashby)
-        if _ats_on and _flags.get("ats_ashby"):
-            ashby_jobs = scrape_ashby_jobs(
-                comp.name,
-                title_filters=title_filters,
-                city_filters=city_filters,
-                location_filters=loc_filters,
-                work_mode=wm_filter,
-                max_matches=35,
-                careers_url=comp.careers_url,
-            )
-            if ashby_jobs:
-                discovered_jobs.extend(ashby_jobs)
-
-        # D2. SmartRecruiters ATS — opt-in (ambiguous ToS; see docs/ATS_PORTALS.md)
-        if _ats_on and _flags.get("ats_smartrecruiters"):
-            sr_jobs = scrape_smartrecruiters_jobs(
-                comp.name,
-                title_filters=title_filters,
-                city_filters=city_filters,
-                location_filters=loc_filters,
-                work_mode=wm_filter,
-                max_matches=35,
-                careers_url=comp.careers_url,
-            )
-            if sr_jobs:
-                discovered_jobs.extend(sr_jobs)
-
-        # D3. Workable ATS — opt-in (unofficial widget endpoint)
-        if _ats_on and _flags.get("ats_workable"):
-            wk_jobs = scrape_workable_jobs(
-                comp.name,
-                title_filters=title_filters,
-                city_filters=city_filters,
-                location_filters=loc_filters,
-                work_mode=wm_filter,
-                max_matches=35,
-                careers_url=comp.careers_url,
-            )
-            if wk_jobs:
-                discovered_jobs.extend(wk_jobs)
-
-        # D4. Workday ATS (requires a Workday board URL) — opt-in (unofficial CXS API)
+        # D. Workday — still dispatched by its own block here: the engine's `post_json` shape and
+        # `workday_board` resolver land in a follow-up change, after which this block is removed and
+        # Workday joins the config-driven loop above.
         if _ats_on and _flags.get("ats_workday"):
             wd_jobs = scrape_workday_jobs(
                 comp.name,
@@ -4000,6 +4000,15 @@ def _execute_ats_scrape(
 
     if progress_cb:
         progress_cb(step=1, label=msg, items_found=total_added, total_steps=1)
+
+    # Drop the run-level pacer: its per-host counters/cooldowns are run-scoped and must not leak
+    # into the next run. See backend/ats/engine.py::clear_active_pacer.
+    try:
+        from backend.ats.engine import clear_active_pacer
+
+        clear_active_pacer()
+    except Exception:  # noqa: BLE001 - best-effort cleanup
+        pass
 
     return ScrapeResponse(
         jobs_found=total_found,

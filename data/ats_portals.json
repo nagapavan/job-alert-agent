@@ -111,6 +111,38 @@
       "risk_tier": "opt_in",
       "default_flag": "ats_smartrecruiters",
       "enabled_by_default": false
+    },
+    {
+      "id": "workday",
+      "label": "Workday Portal",
+      "shape": "post_json",
+      "variant": "workday",
+      "slug_from": "workday_board",
+      "list_url": "https://{host}/wday/cxs/{tenant}/{site}/jobs",
+      "method": "POST",
+      "body": {
+        "appliedFacets": {},
+        "searchText": ""
+      },
+      "response_path": "jobPostings",
+      "total_path": "total",
+      "title_path": "title",
+      "location_path": "locationsText",
+      "url_path": "externalPath",
+      "url_prefix": "https://{host}",
+      "page_size": 20,
+      "max_pages": 5,
+      "detail": {
+        "url": "https://{host}/wday/cxs/{tenant}/{site}{externalPath}",
+        "desc_paths": [
+          "jobPostingInfo.jobDescription"
+        ],
+        "html": true
+      },
+      "pacing_seconds": 1.0,
+      "risk_tier": "opt_in",
+      "default_flag": "ats_workday",
+      "enabled_by_default": false
     }
   ]
 }

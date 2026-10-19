@@ -2,12 +2,23 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from backend.ats.engine import (
     PortalConfig,
     _resolve_path,
     load_portal_configs,
     run_portal,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_permission_gate(monkeypatch):
+    """Neutralise the robots/AI-use permission gate so these tests are offline + deterministic.
+
+    The gate itself is covered by tests/test_ats_pacing.py and tests/test_scraper.py.
+    """
+    monkeypatch.setattr("backend.scraper.may_fetch", lambda url, *a, **k: True)
 
 
 # -------------------------------------------------------------
@@ -428,3 +439,128 @@ def test_smartrecruiters_detail_overrides_description_and_url(mock_get):
     list_params = list_calls[0].kwargs.get("params") or {}
     assert list_params.get("limit") == 100
     assert list_params.get("offset") == 0
+
+
+# -------------------------------------------------------------
+# Workday variant: post_json list + externalPath detail
+# -------------------------------------------------------------
+def _workday_cfg():
+    return next(c for c in load_portal_configs() if c.id == "workday")
+
+
+_WORKDAY_BOARD = "https://acme.wd5.myworkdayjobs.com/en-US/AcmeExternal"
+
+
+def _workday_fake_post(list_payload):
+    def _fake_post(url, headers=None, timeout=None, json=None):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = list_payload
+        return resp
+
+    return _fake_post
+
+
+def _workday_fake_get(detail_payload):
+    def _fake_get(url, headers=None, timeout=None):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = detail_payload
+        return resp
+
+    return _fake_get
+
+
+@patch("backend.ats.engine.requests.get")
+@patch("backend.ats.engine.requests.post")
+def test_workday_list_maps_fields_and_detail(mock_post, mock_get):
+    """Workday POSTs a JSON body and maps title/locationsText/externalPath; detail fills desc."""
+    list_payload = {
+        "total": 1,
+        "jobPostings": [
+            {
+                "title": "Staff Platform Engineer",
+                "externalPath": "/job/Bengaluru/Staff-Platform-Engineer_JR123",
+                "locationsText": "2 Locations",
+                "bulletFields": ["JR123"],
+            }
+        ],
+    }
+    detail_payload = {
+        "jobPostingInfo": {
+            "title": "Staff Platform Engineer",
+            "location": "Bengaluru, India",
+            "jobDescription": "<p>Own the platform at scale.</p>",
+        }
+    }
+    mock_post.side_effect = _workday_fake_post(list_payload)
+    mock_get.side_effect = _workday_fake_get(detail_payload)
+
+    jobs = run_portal(_workday_cfg(), company_name="Acme", careers_url=_WORKDAY_BOARD)
+    assert len(jobs) == 1
+    j = jobs[0]
+    assert j["title"] == "Staff Platform Engineer"
+    # Host-relative externalPath is prefixed with the board host.
+    assert j["url"] == (
+        "https://acme.wd5.myworkdayjobs.com/job/Bengaluru/Staff-Platform-Engineer_JR123"
+    )
+    assert "platform at scale" in j["description"]
+    assert "<" not in j["description"]
+    assert j["source"] == "Workday Portal"
+    assert j["source_type"] == "Direct"
+
+    # The list call is a POST carrying the paginated JSON body.
+    body = mock_post.call_args_list[0].kwargs.get("json") or {}
+    assert body.get("limit") == 20
+    assert body.get("offset") == 0
+
+
+@patch("backend.ats.engine.requests.post")
+def test_workday_without_board_url_is_skipped(mock_post):
+    """A non-Workday careers_url yields no board context → no request at all."""
+    jobs = run_portal(_workday_cfg(), company_name="Acme", careers_url="https://acme.com/careers")
+    assert jobs == []
+    mock_post.assert_not_called()
+
+
+@patch("backend.ats.engine.requests.post")
+def test_workday_applies_title_filter(mock_post):
+    list_payload = {
+        "total": 2,
+        "jobPostings": [
+            {"title": "Backend Engineer", "externalPath": "/job/x/Backend_JR1", "locationsText": "India"},
+            {"title": "Product Designer", "externalPath": "/job/y/Designer_JR2", "locationsText": "India"},
+        ],
+    }
+    mock_post.side_effect = _workday_fake_post(list_payload)
+    jobs = run_portal(
+        _workday_cfg(),
+        company_name="Acme",
+        careers_url=_WORKDAY_BOARD,
+        title_filters=["backend engineer"],
+    )
+    assert [j["title"] for j in jobs] == ["Backend Engineer"]
+
+
+def test_workday_map_item_uses_passed_ctx_not_instance_state():
+    """Regression: map_item must not depend on per-request state stashed on the shared singleton.
+
+    Interleaving two boards must not let one board's host leak into the other's URLs.
+    """
+    from backend.ats.engine import WorkdayScraper
+
+    scraper = WorkdayScraper()
+    cfg = _workday_cfg()
+    item = {"title": "Engineer", "externalPath": "/job/X/Eng_JR1", "locationsText": "India"}
+    ctx_a = {"host": "a.wd1.myworkdayjobs.com", "site": "SiteA"}
+    ctx_b = {"host": "b.wd5.myworkdayjobs.com", "site": "SiteB"}
+
+    url_a = scraper.map_item(cfg, item, ctx_a)["url"]
+    url_b = scraper.map_item(cfg, item, ctx_b)["url"]
+    # Re-map with A again: B's context must not have persisted on the instance.
+    url_a2 = scraper.map_item(cfg, item, ctx_a)["url"]
+
+    assert "a.wd1.myworkdayjobs.com" in url_a
+    assert "b.wd5.myworkdayjobs.com" in url_b
+    assert url_a == url_a2
+    assert not hasattr(scraper, "_ctx")

@@ -10,7 +10,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from backend.ai_helper import _clean_json_string, generate_text
-from backend.config import AGENT_USER_AGENT, RESPECT_ROBOTS
+from backend.config import AGENT_USER_AGENT, RESPECT_AI_USE_FILES, RESPECT_ROBOTS
 from backend.matchers import check_title_match
 from backend.prompts import company_intelligence_synthesis_system
 
@@ -75,6 +75,58 @@ def robots_allowed(url: str, user_agent: str = AGENT_USER_AGENT) -> bool:
     except Exception as e:
         logger.debug(f"robots.txt check failed for {url}: {e}")
         return True
+
+
+# Candidate machine-readable AI-use files, checked in order (first that exists wins).
+_AI_USE_FILES = ("llms.txt", "ai.txt", ".well-known/ai.txt")
+# Explicit deny signals in an AI-use file. These formats are NOT standardised, so this is a
+# deliberately conservative, advisory check: only a clear deny blocks; anything else allows.
+_AI_USE_DENY_RE = re.compile(
+    r"^\s*(disallow|deny|no[-_]?ai|no[-_]?crawl|do[-_]?not[-_]?(crawl|scrape|train))",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ai_use_cache: Dict[str, Optional[bool]] = {}
+
+
+def _fetch_ai_use_file(origin: str, timeout: int = 5) -> Optional[str]:
+    """Returns the body of the first AI-use file present at ``origin``, else None."""
+    for name in _AI_USE_FILES:
+        try:
+            res = requests.get(f"{origin}/{name}", headers=AGENT_HEADERS, timeout=timeout)
+            if res.status_code == 200 and (res.text or "").strip():
+                return res.text
+        except Exception:  # noqa: BLE001 - absent/unreachable file is not an error
+            continue
+    return None
+
+
+def ai_use_files_allowed(url: str) -> bool:
+    """
+    True when no AI-use file at ``url``'s origin explicitly denies crawling.
+
+    Advisory + fail-open: absent files, unparseable content, or any error → allowed. Only an
+    explicit deny directive blocks. See docs/POLITE_CRAWLING_AND_WORKDAY.md §2.3.
+    """
+    if not RESPECT_AI_USE_FILES:
+        return True
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return True
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if origin not in _ai_use_cache:
+            body = _fetch_ai_use_file(origin)
+            _ai_use_cache[origin] = None if body is None else (not _AI_USE_DENY_RE.search(body))
+        cached = _ai_use_cache[origin]
+        return True if cached is None else cached
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"AI-use-file check failed for {url}: {e}")
+        return True
+
+
+def may_fetch(url: str, user_agent: str = AGENT_USER_AGENT) -> bool:
+    """Single permission gate: robots.txt AND (advisory) AI-use files. Both fail open."""
+    return robots_allowed(url, user_agent) and ai_use_files_allowed(url)
 
 
 # -------------------------------------------------------------
@@ -213,6 +265,33 @@ def extract_slug_from_careers_url(url_or_name: str, ats: str) -> str:
         except Exception:
             pass
     return val.lower().replace(" ", "")
+
+
+def _register_ats_slug_resolvers() -> None:
+    """Registers the config-driven engine's slug resolvers (see backend/ats/engine.py).
+
+    Kept here so the engine reuses the exact same slug rules as the hand-written scrapers.
+    """
+    from backend.ats.engine import register_slug_resolver
+
+    register_slug_resolver("careers_url")(extract_slug_from_careers_url)
+
+    def _workday_board_resolver(url_or_name: str, ats: str) -> Dict[str, str]:
+        """Returns the {tenant, shard, site, host} context for a Workday board URL, else {}.
+
+        Tenants cannot be inferred from a company name, so a non-Workday value yields {} and the
+        engine short-circuits. See docs/POLITE_CRAWLING_AND_WORKDAY.md §3.
+        """
+        board = _parse_workday_board(url_or_name or "")
+        if not board:
+            return {}
+        # ``slug`` keeps the generic short-circuit working (empty → skip portal).
+        return {**board, "slug": f"{board['tenant']}/{board['site']}"}
+
+    register_slug_resolver("workday_board")(_workday_board_resolver)
+
+
+_register_ats_slug_resolvers()
 
 
 SHORT_DOMAINS = {
@@ -406,126 +485,24 @@ def scrape_greenhouse_jobs(
     careers_url: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """
-    Fetches job listings from Greenhouse Public Board API with high-efficiency early filtering.
-    - Fetches lightweight metadata without heavy HTML content (~95% less bandwidth, sub-second response).
+    Fetches job listings from the Greenhouse Public Board API with early filtering.
     - Applies title, location, and work-mode filters early on lightweight payloads.
-    - Fetches full HTML descriptions on-demand ONLY for candidate-matching positions.
+    - Fetches full HTML descriptions on-demand ONLY for candidate-matching positions (the board
+      list already embeds ``content``, so the detail call fires only when that content is empty).
+
+    Delegates to the config-driven engine (``data/ats_portals.json`` → ``paginated_json`` /
+    ``greenhouse`` variant); see ``docs/ATS_GENERIC_ENGINE_PLAN.md``.
     """
-    if not company_name or not company_name.strip():
-        return []
-
-    # Derive board slug from careers_url or company name
-    slug = extract_slug_from_careers_url(careers_url or company_name, "greenhouse")
-    if not slug:
-        return []
-
-    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
-
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=15)
-        if res.status_code != 200:
-            return []
-
-        data = res.json()
-        raw_jobs = data.get("jobs", [])
-        jobs = []
-
-        has_filters = bool(
-            title_filters
-            or city_filters
-            or location_filters
-            or (work_mode and work_mode != "all")
-        )
-
-        for item in raw_jobs:
-            title = item.get("title", "Untitled Role").strip()
-            loc_str = (item.get("location") or {}).get("name", "Remote / Various")
-            job_id = item.get("id")
-            abs_url = item.get("absolute_url", "")
-
-            # Early filter before fetching description
-            if has_filters:
-                # Title filter (shared semantics with the final matcher)
-                if title_filters and not check_title_match(title, title_filters):
-                    continue
-
-                from backend.preference_filter import (
-                    check_location_match,
-                    check_workmode_match,
-                )
-
-                # Location & Work Mode eligibility check
-                location_check = check_location_match(
-                    f"{title} {loc_str}", location_filters, city_filters
-                )
-                workmode_check = check_workmode_match(title, loc_str, work_mode)
-                if not location_check or not workmode_check:
-                    continue
-
-            raw_content = item.get("content", "")
-            embedded_desc = (
-                BeautifulSoup(raw_content, "html.parser")
-                .get_text(separator="\n")
-                .strip()
-                if raw_content
-                else ""
-            )
-
-            jobs.append(
-                {
-                    "id": job_id,
-                    "title": title,
-                    "url": abs_url,
-                    "description": embedded_desc,
-                    "location": loc_str,
-                    "source": "Greenhouse Portal",
-                    "source_type": "Direct",
-                }
-            )
-
-            if len(jobs) >= max_matches:
-                break
-
-        # Fetch detailed content only for matched positions if not already present
-        final_jobs = []
-        for j in jobs:
-            clean_desc = (
-                j.get("description")
-                or f"{j['title']} opening at {company_name} ({j['location']})."
-            )
-            if not j.get("description") and j.get("id"):
-                try:
-                    detail_res = requests.get(
-                        f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs/{j['id']}",
-                        headers=HEADERS,
-                        timeout=8,
-                    )
-                    if detail_res.status_code == 200:
-                        raw_content = detail_res.json().get("content", "")
-                        if raw_content:
-                            clean_desc = (
-                                BeautifulSoup(raw_content, "html.parser")
-                                .get_text(separator="\n")
-                                .strip()
-                            )
-                except Exception:
-                    pass
-
-            final_jobs.append(
-                {
-                    "title": j["title"],
-                    "url": j["url"],
-                    "description": clean_desc,
-                    "location": j["location"],
-                    "source": j["source"],
-                    "source_type": j["source_type"],
-                }
-            )
-
-        return final_jobs
-    except Exception as e:
-        logger.warning(f"Greenhouse scraping failed for '{company_name}': {e}")
-        return []
+    return _scrape_portal_via_engine(
+        "greenhouse",
+        company_name=company_name,
+        title_filters=title_filters,
+        city_filters=city_filters,
+        location_filters=location_filters,
+        work_mode=work_mode,
+        max_matches=max_matches,
+        careers_url=careers_url,
+    )
 
 
 # -------------------------------------------------------------
@@ -544,78 +521,30 @@ def scrape_lever_jobs(
 ) -> List[Dict[str, str]]:
     """
     Fetches job listings from Lever Public Postings API with early filtering.
-    Endpoint: https://api.lever.co/v0/postings/{slug}?mode=json
+
+    Delegates to the config-driven engine (``data/ats_portals.json`` → ``simple_json`` shape);
+    see ``docs/ATS_GENERIC_ENGINE_PLAN.md``. Endpoint: https://api.lever.co/v0/postings/{slug}?mode=json
     """
-    if not company_name or not company_name.strip():
+    return _scrape_portal_via_engine(
+        "lever",
+        company_name=company_name,
+        title_filters=title_filters,
+        city_filters=city_filters,
+        location_filters=location_filters,
+        work_mode=work_mode,
+        max_matches=max_matches,
+        careers_url=careers_url,
+    )
+
+
+def _scrape_portal_via_engine(portal_id: str, **kwargs) -> List[Dict[str, str]]:
+    """Runs a portal through the config-driven engine (see backend/ats/engine.py)."""
+    from backend.ats.engine import load_portal_configs, run_portal
+
+    cfg = next((c for c in load_portal_configs() if c.id == portal_id), None)
+    if cfg is None:
         return []
-
-    slug = extract_slug_from_careers_url(careers_url or company_name, "lever")
-    if not slug:
-        return []
-
-    url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
-
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=15)
-        if res.status_code != 200:
-            return []
-
-        data = res.json()
-        if not isinstance(data, list):
-            return []
-
-        jobs = []
-        has_filters = bool(
-            title_filters
-            or city_filters
-            or location_filters
-            or (work_mode and work_mode != "all")
-        )
-
-        for item in data:
-            title = item.get("text", "Untitled Role").strip()
-            loc_str = (item.get("categories") or {}).get("location", "Remote / Various")
-
-            if has_filters:
-                if title_filters and not check_title_match(title, title_filters):
-                    continue
-                from backend.preference_filter import (
-                    check_location_match,
-                    check_workmode_match,
-                )
-
-                location_check = check_location_match(
-                    f"{title} {loc_str}", location_filters, city_filters
-                )
-                workmode_check = check_workmode_match(title, loc_str, work_mode)
-                if not location_check or not workmode_check:
-                    continue
-
-            desc = item.get("descriptionPlain") or item.get("description") or ""
-            clean_desc = (
-                BeautifulSoup(desc, "html.parser").get_text(separator="\n").strip()
-                if desc
-                else ""
-            )
-
-            jobs.append(
-                {
-                    "title": title,
-                    "url": item.get("applyUrl") or item.get("hostedUrl", ""),
-                    "description": clean_desc,
-                    "location": loc_str,
-                    "source": "Lever Portal",
-                    "source_type": "Direct",
-                }
-            )
-
-            if len(jobs) >= max_matches:
-                break
-
-        return jobs
-    except Exception as e:
-        logger.warning(f"Lever scraping failed for '{company_name}': {e}")
-        return []
+    return run_portal(cfg, **kwargs)
 
 
 def scrape_ashby_jobs(
@@ -630,86 +559,20 @@ def scrape_ashby_jobs(
     """
     Fetches job listings from Ashby Public Board API with early filtering.
     Endpoint: https://api.ashbyhq.com/posting-api/job-board/{board_slug}
+
+    Delegates to the config-driven engine (``data/ats_portals.json`` → ``simple_json`` /
+    ``ashby`` variant); see ``docs/ATS_GENERIC_ENGINE_PLAN.md``.
     """
-    if not company_name or not company_name.strip():
-        return []
-
-    slug = extract_slug_from_careers_url(careers_url or company_name, "ashby")
-    if not slug:
-        return []
-
-    url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
-
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=15)
-        if res.status_code != 200:
-            return []
-
-        data = res.json()
-        raw_jobs = data.get("jobs", [])
-        jobs = []
-        has_filters = bool(
-            title_filters
-            or city_filters
-            or location_filters
-            or (work_mode and work_mode != "all")
-        )
-
-        for item in raw_jobs:
-            title = item.get("title", "Untitled Role").strip()
-            loc_str = item.get("location") or "Remote / Various"
-            secondary_locs = item.get("secondaryLocations") or []
-            all_loc_strs = [loc_str]
-            for sec in secondary_locs:
-                if isinstance(sec, dict) and sec.get("location"):
-                    all_loc_strs.append(sec.get("location"))
-                elif isinstance(sec, str) and sec:
-                    all_loc_strs.append(sec)
-
-            if has_filters:
-                if title_filters and not check_title_match(title, title_filters):
-                    continue
-                from backend.preference_filter import (
-                    check_location_match,
-                    check_workmode_match,
-                )
-
-                if not any(
-                    check_location_match(
-                        job_location=l,
-                        city_filters=city_filters,
-                        loc_filters=location_filters,
-                    )
-                    or check_workmode_match(title, l, work_mode)
-                    for l in all_loc_strs
-                ):
-                    continue
-
-            desc_html = item.get("descriptionHtml") or ""
-            clean_desc = (
-                BeautifulSoup(desc_html, "html.parser").get_text(separator="\n").strip()
-                if desc_html
-                else ""
-            )
-
-            jobs.append(
-                {
-                    "title": title,
-                    "url": item.get("jobUrl") or item.get("applyUrl", ""),
-                    "description": clean_desc,
-                    "location": loc_str,
-                    "source": "Ashby Portal",
-                    "source_type": "Direct",
-                }
-            )
-
-            if len(jobs) >= max_matches:
-                break
-
-        return jobs
-    except Exception as e:
-        logger.warning(f"Ashby scraping failed for '{company_name}': {e}")
-        return []
+    return _scrape_portal_via_engine(
+        "ashby",
+        company_name=company_name,
+        title_filters=title_filters,
+        city_filters=city_filters,
+        location_filters=location_filters,
+        work_mode=work_mode,
+        max_matches=max_matches,
+        careers_url=careers_url,
+    )
 
 
 def scrape_smartrecruiters_jobs(
@@ -725,134 +588,24 @@ def scrape_smartrecruiters_jobs(
     Fetches job postings from the SmartRecruiters public Posting API.
 
     Endpoint: GET https://api.smartrecruiters.com/v1/companies/{companyIdentifier}/postings
-    List rows omit the apply URL and description; a per-posting detail call supplies them on
-    demand (mirrors the Greenhouse detail fetch). Pagination uses the API's `limit`/`offset`
+    List rows omit the apply URL and description; a per-posting detail call supplies them
+    (mirrors the Greenhouse detail fetch). Pagination uses the API's `limit`/`offset`
     parameters. The shared client-side title/location matchers remain authoritative so server
     behaviour can never starve the final match (see docs/ATS_PORTALS.md §3.3).
+
+    Delegates to the config-driven engine (``data/ats_portals.json`` → ``paginated_json`` /
+    ``smartrecruiters`` variant); see ``docs/ATS_GENERIC_ENGINE_PLAN.md``.
     """
-    if not company_name or not company_name.strip():
-        return []
-
-    slug = extract_slug_from_careers_url(careers_url or company_name, "smartrecruiters")
-    if not slug:
-        return []
-
-    base = f"https://api.smartrecruiters.com/v1/companies/{slug}/postings"
-    has_filters = bool(
-        title_filters
-        or city_filters
-        or location_filters
-        or (work_mode and work_mode != "all")
+    return _scrape_portal_via_engine(
+        "smartrecruiters",
+        company_name=company_name,
+        title_filters=title_filters,
+        city_filters=city_filters,
+        location_filters=location_filters,
+        work_mode=work_mode,
+        max_matches=max_matches,
+        careers_url=careers_url,
     )
-
-    raw_items: List[Dict[str, Any]] = []
-    try:
-        offset = 0
-        page_size = 100
-        max_pages = 5  # bound list requests for large enterprise boards
-        for _ in range(max_pages):
-            res = requests.get(
-                base,
-                headers=HEADERS,
-                params={"limit": page_size, "offset": offset},
-                timeout=15,
-            )
-            if res.status_code != 200:
-                break
-            data = res.json()
-            content = data.get("content") or []
-            raw_items.extend(content)
-            total = data.get("totalFound")
-            offset += data.get("limit") or page_size
-            if not content or (isinstance(total, int) and offset >= total):
-                break
-    except Exception as e:
-        logger.warning(f"SmartRecruiters scraping failed for '{company_name}': {e}")
-        return []
-
-    jobs = []
-    for item in raw_items:
-        title = (item.get("name") or "Untitled Role").strip()
-        loc = item.get("location") or {}
-        loc_str = (
-            ", ".join(
-                [
-                    p
-                    for p in (loc.get("city"), loc.get("region"), loc.get("country"))
-                    if p
-                ]
-            )
-            or "Remote / Various"
-        )
-        if loc.get("remote") and "remote" not in loc_str.lower():
-            loc_str = f"{loc_str} (Remote)"
-
-        if has_filters:
-            if title_filters and not check_title_match(title, title_filters):
-                continue
-            from backend.preference_filter import (
-                check_location_match,
-                check_workmode_match,
-            )
-
-            location_check = check_location_match(
-                f"{title} {loc_str}", location_filters, city_filters
-            )
-            workmode_check = check_workmode_match(title, loc_str, work_mode)
-            if not location_check or not workmode_check:
-                continue
-
-        apply_url = (
-            item.get("applyUrl") or item.get("postingUrl") or item.get("ref") or ""
-        )
-        description = ""
-        detail_url = item.get("ref") or (
-            f"{base}/{item.get('id')}" if item.get("id") else ""
-        )
-        if detail_url:
-            try:
-                dres = requests.get(detail_url, headers=HEADERS, timeout=8)
-                if dres.status_code == 200:
-                    detail = dres.json()
-                    apply_url = (
-                        detail.get("applyUrl") or detail.get("postingUrl") or apply_url
-                    )
-                    sections = (detail.get("jobAd") or {}).get("sections") or {}
-                    parts = []
-                    for key in (
-                        "companyDescription",
-                        "jobDescription",
-                        "qualifications",
-                        "additionalInformation",
-                    ):
-                        sec = sections.get(key) or {}
-                        txt = sec.get("text") if isinstance(sec, dict) else None
-                        if txt:
-                            parts.append(
-                                BeautifulSoup(txt, "html.parser")
-                                .get_text(separator="\n")
-                                .strip()
-                            )
-                    description = "\n\n".join([p for p in parts if p]).strip()
-            except Exception:
-                pass
-
-        jobs.append(
-            {
-                "title": title,
-                "url": apply_url,
-                "description": description
-                or f"{title} opening at {company_name} ({loc_str}).",
-                "location": loc_str,
-                "source": "SmartRecruiters Portal",
-                "source_type": "Direct",
-            }
-        )
-
-        if len(jobs) >= max_matches:
-            break
-
-    return jobs
 
 
 def scrape_workable_jobs(
@@ -871,98 +624,20 @@ def scrape_workable_jobs(
     (Workable redirects www.workable.com/api/accounts/{slug} to this widget URL.) The public
     feed exposes only published roles and has no server-side filters, so the shared client-side
     title/location matchers are applied here (see docs/ATS_PORTALS.md §3.3).
+
+    Delegates to the config-driven engine (``data/ats_portals.json`` → ``simple_json`` /
+    ``workable`` variant); see ``docs/ATS_GENERIC_ENGINE_PLAN.md``.
     """
-    if not company_name or not company_name.strip():
-        return []
-
-    slug = extract_slug_from_careers_url(careers_url or company_name, "workable")
-    if not slug:
-        return []
-
-    url = f"https://apply.workable.com/api/v1/widget/accounts/{slug}?details=true"
-
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=15)
-        if res.status_code != 200:
-            return []
-
-        data = res.json()
-        raw_jobs = data.get("jobs") or []
-        has_filters = bool(
-            title_filters
-            or city_filters
-            or location_filters
-            or (work_mode and work_mode != "all")
-        )
-        jobs = []
-
-        for item in raw_jobs:
-            title = (item.get("title") or "Untitled Role").strip()
-            loc_str = (
-                ", ".join(
-                    [
-                        p
-                        for p in (
-                            item.get("city"),
-                            item.get("state"),
-                            item.get("country"),
-                        )
-                        if p
-                    ]
-                )
-                or "Remote / Various"
-            )
-            is_remote = (
-                bool(item.get("telecommuting"))
-                or str(item.get("workplace_type") or "").lower() == "remote"
-            )
-            if is_remote and "remote" not in loc_str.lower():
-                loc_str = f"{loc_str} (Remote)"
-
-            if has_filters:
-                if title_filters and not check_title_match(title, title_filters):
-                    continue
-                from backend.preference_filter import (
-                    check_location_match,
-                    check_workmode_match,
-                )
-
-                location_check = check_location_match(
-                    f"{title} {loc_str}", location_filters, city_filters
-                )
-                workmode_check = check_workmode_match(title, loc_str, work_mode)
-                if not location_check or not workmode_check:
-                    continue
-
-            desc = item.get("description") or item.get("full_description") or ""
-            clean_desc = (
-                BeautifulSoup(desc, "html.parser").get_text(separator="\n").strip()
-                if desc
-                else ""
-            )
-
-            jobs.append(
-                {
-                    "title": title,
-                    "url": item.get("url")
-                    or item.get("application_url")
-                    or item.get("shortlink")
-                    or "",
-                    "description": clean_desc
-                    or f"{title} opening at {company_name} ({loc_str}).",
-                    "location": loc_str,
-                    "source": "Workable Portal",
-                    "source_type": "Direct",
-                }
-            )
-
-            if len(jobs) >= max_matches:
-                break
-
-        return jobs
-    except Exception as e:
-        logger.warning(f"Workable scraping failed for '{company_name}': {e}")
-        return []
+    return _scrape_portal_via_engine(
+        "workable",
+        company_name=company_name,
+        title_filters=title_filters,
+        city_filters=city_filters,
+        location_filters=location_filters,
+        work_mode=work_mode,
+        max_matches=max_matches,
+        careers_url=careers_url,
+    )
 
 
 def _parse_workday_board(url: str) -> Optional[Dict[str, str]]:
@@ -1019,125 +694,20 @@ def scrape_workday_jobs(
     Tenant/shard/site cannot be guessed from a bare company name, so this scraper requires a
     Workday board URL (usually Company.careers_url). The shared client-side title/location
     matchers remain authoritative (see docs/ATS_PORTALS.md §3.3).
+
+    Delegates to the config-driven engine (``data/ats_portals.json`` → ``post_json`` /
+    ``workday`` variant); see docs/POLITE_CRAWLING_AND_WORKDAY.md.
     """
-    board = _parse_workday_board(careers_url or company_name or "")
-    if not board:
-        return []
-
-    host, tenant, site = board["host"], board["tenant"], board["site"]
-    api_url = f"https://{host}/wday/cxs/{tenant}/{site}/jobs"
-    list_headers = {
-        **HEADERS,
-        "content-type": "application/json",
-        "accept": "application/json",
-    }
-    has_filters = bool(
-        title_filters
-        or city_filters
-        or location_filters
-        or (work_mode and work_mode != "all")
+    return _scrape_portal_via_engine(
+        "workday",
+        company_name=company_name,
+        title_filters=title_filters,
+        city_filters=city_filters,
+        location_filters=location_filters,
+        work_mode=work_mode,
+        max_matches=max_matches,
+        careers_url=careers_url,
     )
-
-    postings: List[Dict[str, Any]] = []
-    try:
-        offset = 0
-        page_size = 20
-        max_pages = 5  # bound requests (~100 postings)
-        for _ in range(max_pages):
-            res = requests.post(
-                api_url,
-                headers=list_headers,
-                json={
-                    "appliedFacets": {},
-                    "limit": page_size,
-                    "offset": offset,
-                    "searchText": "",
-                },
-                timeout=15,
-            )
-            if res.status_code != 200:
-                break
-            data = res.json() or {}
-            page = data.get("jobPostings") or []
-            postings.extend(page)
-            total = data.get("total")
-            offset += page_size
-            if not page or (isinstance(total, int) and offset >= total):
-                break
-    except Exception as e:
-        logger.warning(f"Workday scraping failed for '{company_name}': {e}")
-        return []
-
-    jobs = []
-    for item in postings:
-        title = (item.get("title") or "Untitled Role").strip()
-        loc_str = (item.get("locationsText") or "Remote / Various").strip()
-        external_path = item.get("externalPath") or ""
-
-        if has_filters:
-            if title_filters and not check_title_match(title, title_filters):
-                continue
-            from backend.preference_filter import (
-                check_location_match,
-                check_workmode_match,
-            )
-
-            location_check = check_location_match(
-                f"{title} {loc_str}", location_filters, city_filters
-            )
-            workmode_check = check_workmode_match(title, loc_str, work_mode)
-            if not location_check or not workmode_check:
-                continue
-
-        public_url = (
-            f"https://{host}{external_path}"
-            if external_path.startswith("/")
-            else (
-                f"https://{host}/{site}/{external_path}"
-                if external_path
-                else f"https://{host}/{site}"
-            )
-        )
-
-        description = ""
-        detail_path = _normalize_workday_external_path(external_path, site)
-        if detail_path:
-            try:
-                dres = requests.get(
-                    f"https://{host}/wday/cxs/{tenant}/{site}{detail_path}",
-                    headers=HEADERS,
-                    timeout=8,
-                )
-                if dres.status_code == 200:
-                    info = (dres.json() or {}).get("jobPostingInfo") or {}
-                    if info.get("location"):
-                        loc_str = info["location"] or loc_str
-                    desc_html = info.get("jobDescription") or ""
-                    if desc_html:
-                        description = (
-                            BeautifulSoup(desc_html, "html.parser")
-                            .get_text(separator="\n")
-                            .strip()
-                        )
-            except Exception:
-                pass
-
-        jobs.append(
-            {
-                "title": title,
-                "url": public_url,
-                "description": description
-                or f"{title} opening at {company_name} ({loc_str}).",
-                "location": loc_str,
-                "source": "Workday Portal",
-                "source_type": "Direct",
-            }
-        )
-
-        if len(jobs) >= max_matches:
-            break
-
-    return jobs
 
 
 def scrape_uber_jobs() -> List[Dict[str, str]]:
@@ -1187,9 +757,9 @@ def scrape_custom_jobs(portal_url: str) -> List[Dict[str, str]]:
     if not portal_url or not portal_url.strip():
         return []
 
-    if not robots_allowed(portal_url):
+    if not may_fetch(portal_url):
         logger.warning(
-            f"robots.txt disallows scraping '{portal_url}'; skipping custom portal scan."
+            f"robots.txt / AI-use files disallow scraping '{portal_url}'; skipping custom portal scan."
         )
         return []
 
@@ -1826,9 +1396,9 @@ def fetch_google_jobs(
     # Primary URL with Google for Jobs intent
     url = f"https://www.google.com/search?q={encoded_query}&ibp=htl;jobs"
 
-    if not robots_allowed(url):
+    if not may_fetch(url):
         logger.warning(
-            "robots.txt disallows Google search scraping; skipping direct Google Jobs fetch."
+            "robots.txt / AI-use files disallow Google search scraping; skipping direct Google Jobs fetch."
         )
         return []
 
