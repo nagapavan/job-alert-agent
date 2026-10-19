@@ -4001,6 +4001,15 @@ def _execute_ats_scrape(
     if progress_cb:
         progress_cb(step=1, label=msg, items_found=total_added, total_steps=1)
 
+    # Drop the run-level pacer: its per-host counters/cooldowns are run-scoped and must not leak
+    # into the next run. See backend/ats/engine.py::clear_active_pacer.
+    try:
+        from backend.ats.engine import clear_active_pacer
+
+        clear_active_pacer()
+    except Exception:  # noqa: BLE001 - best-effort cleanup
+        pass
+
     return ScrapeResponse(
         jobs_found=total_found,
         jobs_added=total_added,
