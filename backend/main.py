@@ -3725,6 +3725,16 @@ def _execute_ats_scrape(
     total_added = 0
     companies_updated = 0
 
+    # One shared pacer for the whole run: same-host requests across portals stay spaced and share
+    # the per-run request ceiling. See docs/POLITE_CRAWLING_AND_WORKDAY.md §2.
+    try:
+        from backend.ats.engine import set_active_pacer
+        from backend.ats.pacing import build_pacer
+
+        set_active_pacer(build_pacer())
+    except Exception as _pacing_err:  # noqa: BLE001 - pacing is best-effort
+        logger.warning(f"Could not initialise scrape pacing: {_pacing_err}")
+
     global LATEST_SCRAPE_AUDIT
     audit_records = []
 
