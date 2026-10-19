@@ -1,4 +1,6 @@
 """Tests for Tier A/B residual requirement extraction + resume-evidence bridge (Phase 3)."""
+import json
+
 from backend import requirements_extractor as rx
 from backend import section_intent as si
 
@@ -67,3 +69,44 @@ class TestResidualExtraction:
             jd, spans, resume_text="demonstrated mentorship of engineers"
         )
         assert results and all(r["category"] == "nice_to_have" for r in results)
+
+
+class TestMarkupStripping:
+    """Requirement units must never carry HTML (issue #8: queue pollution)."""
+
+    def test_split_units_removes_tags(self):
+        units = rx._split_units('<ul><li>Strong Python experience</li></ul>')
+        joined = " ".join(units)
+        assert "<" not in joined and ">" not in joined
+        assert "Python experience" in joined
+
+    def test_split_units_removes_entities(self):
+        units = rx._split_units("C++&nbsp;and&nbsp;Rust")
+        joined = " ".join(units)
+        assert "&nbsp;" not in joined
+        assert "Rust" in joined
+
+    def test_split_units_removes_style_blocks(self):
+        units = rx._split_units(
+            "<style>.a { color: red }</style><p>Kubernetes at scale</p>"
+        )
+        joined = " ".join(units)
+        assert "color" not in joined
+        assert "Kubernetes at scale" in joined
+
+    def test_html_jd_yields_no_markup_candidates(self, monkeypatch, tmp_path):
+        """End-to-end: an HTML JD must not queue tags as candidates."""
+        from backend import skill_taxonomy as tax
+
+        monkeypatch.setattr(tax, "CANDIDATES_PATH", tmp_path / "candidates.json")
+        jd = (
+            "<h2>Requirements</h2>\n"
+            "<ul><li>Deep experience with Terraform</li>"
+            "<li>Familiarity with gRPC</li></ul>\n"
+            "<style>.x { font-size: 10pt }</style>\n"
+        )
+        spans = si.jd_section_spans(jd)
+        rx.extract_residual_requirements(jd, spans, resume_text="")
+        if (tmp_path / "candidates.json").exists():
+            keys = json.loads((tmp_path / "candidates.json").read_text())["counts"]
+            assert not any("<" in k or ">" in k or "font-size" in k for k in keys)

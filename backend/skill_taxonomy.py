@@ -16,7 +16,7 @@ import logging
 import re
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("skill_taxonomy")
 
@@ -154,17 +154,119 @@ def concepts_for(canonical: str) -> Set[str]:
 
 _candidates_lock = threading.Lock()
 
+# Markup that reached the queue historically because the stored JD text was raw HTML.
+# Note: fragments arrive *split mid-tag* (e.g. "<li style=\"color: rgb(73, 73, 73)"), so a
+# strict "well-formed tag" regex is not enough - any angle bracket disqualifies the phrase.
+_HTML_TAG_RE = re.compile(r"[<>]|&[a-z]+;?|&#\d+;", re.I)
+# CSS declarations / style leftovers ("font-family: helvetica, arial, sans-serif", "font-size: 10pt").
+_CSS_RE = re.compile(
+    r"[a-z-]+\s*:\s*[a-z0-9#(),.%\"' ]+;|\b\d+(pt|px|em|rem|%)\b|"
+    r"\b(font-family|font-size|font-style|color|margin|padding|line-height|"
+    r"background|display|text-align|border|width|height)\b",
+    re.I,
+)
+# Sentence openings that mark prose, not a skill ("we are a small team that values…").
+_PROSE_LEAD_RE = re.compile(
+    r"^(we|our|you|your|they|the team|join|join us|come|help us|as a|this role|"
+    r"this is|you will|you'll|there is|it is|is a|are a|be a|a |an )\b",
+    re.I,
+)
+# Fragments left by truncation/joining ("… more", leading conjunction).
+_FRAGMENT_RE = re.compile(r"^\s*(…|\.\.\.)|^(and|or|for|to|of|with|in|on|at|as|but)\b", re.I)
+# Footer/legal/CTA phrases: never requirements in any JD we care about. Kept deliberately small;
+# the queue is *reviewed by a human*, so a borderline phrase is cheap to ignore, and a long
+# hand-enumerated list would be a maintenance liability.
+_NOISE_PHRASE_RE = re.compile(
+    r"(all rights reserved|equal opportunity|privacy policy|terms of use|cookie|©|"
+    r"apply now|learn more|read more|find out more|get started|sign up|click here|contact us|"
+    r"under license|export control|accommodation|"
+    r"about (us|the company|our)|nice to have'?s?\b|additional details|job category)",
+    re.I,
+)
+# Requisition ids / salary strings: identifiers and numbers, never skills.
+_ID_RE = re.compile(r"^[a-z]{1,4}\d{4,}$|^[₹$€£]\s?\d", re.I)
+# Common English function words. A phrase made only of these (or a single one) carries no
+# skill signal, so it is not worth a reviewer's time.
+_FUNCTION_WORDS = {
+    "a", "an", "and", "as", "at", "be", "but", "by", "for", "from", "here", "if", "in", "is",
+    "it", "more", "no", "not", "of", "on", "or", "our", "so", "that", "the", "their", "there",
+    "these", "this", "those", "to", "us", "we", "with", "yes", "you", "your", "etc", "note",
+    "please", "other", "others", "all", "any", "some", "such", "than", "then", "too", "very",
+}
+
+# Section headings are reviewed centrally in section_intent; reuse them rather than
+# duplicating a second heading vocabulary here (they would drift).
+_HEADING_PHRASES: Optional[Set[str]] = None
+
+
+def _heading_phrases() -> Set[str]:
+    global _HEADING_PHRASES
+    if _HEADING_PHRASES is None:
+        try:
+            from backend import section_intent
+
+            _HEADING_PHRASES = {
+                phrase.replace("\u2019", "'").replace("\u2018", "'")
+                for phrases in section_intent.JD_HEADINGS.values()
+                for phrase in phrases
+            }
+        except Exception:  # noqa: BLE001 - the filter degrades, capture still works
+            _HEADING_PHRASES = set()
+    return _HEADING_PHRASES
+
+
+def is_plausible_skill_phrase(phrase: str) -> bool:
+    """True when ``phrase`` is worth human review as a candidate skill.
+
+    The review queue is only useful if it holds *skills*, so this rejects the four
+    classes of noise that historically flooded it: raw HTML/CSS, section headings,
+    footer/CTA boilerplate, and ordinary prose. Defence in depth for issue #8 — see
+    reasoning/2026-10-19-taxonomy-candidate-queue-pollution.md.
+    """
+    cleaned = re.sub(r"\s+", " ", (phrase or "").strip().lower())
+    # Normalise curly apostrophes so heading/boilerplate lookups match ("what you’ll do").
+    cleaned = cleaned.replace("\u2019", "'").replace("\u2018", "'")
+    if len(cleaned) < 3 or len(cleaned) > 60:
+        return False
+    if not re.search(r"[a-z]", cleaned):
+        return False
+    # 1. Raw markup (tags, split fragments, entities) is never a skill.
+    if _HTML_TAG_RE.search(cleaned):
+        return False
+    # 2. CSS/style leftovers.
+    if _CSS_RE.search(cleaned):
+        return False
+    bare = cleaned.strip(" .:;,-–—?!")
+    # 3. Bare section headings and footer/CTA boilerplate are structure, not requirements.
+    if bare in _heading_phrases():
+        return False
+    if _NOISE_PHRASE_RE.search(bare):
+        return False
+    if _ID_RE.match(bare):
+        return False
+    # 4. Prose, fragments, and lexically empty phrases.
+    if len(cleaned.split()) > 6:
+        return False
+    if _PROSE_LEAD_RE.match(cleaned) or _FRAGMENT_RE.match(cleaned):
+        return False
+    words = bare.split()
+    if not words or all(w in _FUNCTION_WORDS for w in words):
+        return False
+    if len(words) == 1 and len(words[0]) < 3:
+        return False
+    return True
+
 
 def record_skill_candidate(phrase: str) -> None:
     """Record a JD phrase that matched neither the taxonomy nor the resume.
 
     This is a *review queue*, not a scoring input: candidates graduate into the
     taxonomy only when a human approves them (or a future promotion rule fires).
+    Noise (markup, headings, prose) is rejected up front — see
+    :func:`is_plausible_skill_phrase`.
     """
     cleaned = re.sub(r"\s+", " ", (phrase or "").strip().lower())
-    if len(cleaned) < 3 or len(cleaned) > 60:
-        return
-    if not re.search(r"[a-z]", cleaned):
+    if not is_plausible_skill_phrase(cleaned):
         return
     with _candidates_lock:
         try:
@@ -181,3 +283,32 @@ def record_skill_candidate(phrase: str) -> None:
             CANDIDATES_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception as exc:  # noqa: BLE001 - telemetry must never break scoring
             logger.debug("Could not record skill candidate %r: %s", phrase, exc)
+
+
+def purge_candidates(path: Optional[Path] = None) -> "Tuple[int, int]":
+    """Drop entries that no longer pass :func:`is_plausible_skill_phrase`.
+
+    One-off drain for the historical queue, which was written before the capture filter
+    existed (see reasoning/2026-10-19-taxonomy-candidate-queue-pollution.md). Survivors
+    keep their counts, so re-running is safe and loses nothing.
+
+    Returns ``(removed, kept)``; ``(0, 0)`` when there is no queue file.
+    """
+    target = path or CANDIDATES_PATH
+    with _candidates_lock:
+        try:
+            if not target.exists():
+                return (0, 0)
+            data = json.loads(target.read_text("utf-8")) or {}
+            counts = data.get("counts") if isinstance(data.get("counts"), dict) else {}
+            if not counts:
+                return (0, 0)
+            kept = {k: int(v) for k, v in counts.items() if is_plausible_skill_phrase(k)}
+            removed = len(counts) - len(kept)
+            data["version"] = 1
+            data["counts"] = kept
+            target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            return (removed, len(kept))
+        except Exception as exc:  # noqa: BLE001 - maintenance must never raise at import
+            logger.debug("Could not purge skill candidates: %s", exc)
+            return (0, 0)

@@ -72,7 +72,20 @@ def unit_covered_by_taxonomy(unit_text: str) -> bool:
     return any(p.search(text) for p in _surface_patterns())
 
 
+def _strip_markup(text: str) -> str:
+    """Remove HTML tags/entities so requirement units never carry markup.
+
+    Some ATS feeds store the JD as HTML; without this, tags and style fragments become
+    "requirement units" and pollute the taxonomy review queue (issue #8).
+    """
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", text or "", flags=re.I | re.S)
+    text = re.sub(r"<[^>]*>", " ", text)
+    text = re.sub(r"&[a-z]+;|&#\d+;", " ", text, flags=re.I)
+    return text
+
+
 def _split_units(text: str) -> List[str]:
+    text = _strip_markup(text)
     units: List[str] = []
     for raw_line in (text or "").splitlines():
         line = _BULLET_RE.sub("", raw_line).strip()
