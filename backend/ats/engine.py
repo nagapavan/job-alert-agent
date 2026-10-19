@@ -49,11 +49,18 @@ def _parse_retry_after(res) -> Optional[float]:
 
 
 def _http(method: str, url: str, *, cfg: Optional[PortalConfig] = None, **kwargs):
-    """Rate-paced HTTP call shared by all shape scrapers.
+    """Paced, permission-gated HTTP call shared by all shape scrapers.
 
-    Returns the ``requests`` response, or ``None`` when the host has exhausted its per-run request
-    budget. Callers treat ``None`` like a failed fetch.
+    Returns the ``requests`` response, or ``None`` when the host is disallowed (robots/AI files)
+    or has exhausted its per-run request budget. Callers treat ``None`` like a failed fetch.
     """
+    from backend.scraper import may_fetch
+
+    if cfg is not None and getattr(cfg, "respect_robots", True):
+        if not may_fetch(url):
+            logger.info(f"Permission gate: skipping '{url}' (robots/AI-use files).")
+            return None
+
     pacer = _ACTIVE_PACER
     if pacer is not None:
         if not pacer.allow(url, delay=getattr(cfg, "pacing_seconds", None)):
@@ -126,6 +133,7 @@ class PortalConfig:
     enabled_by_default: bool = False
     timeout: int = 15
     pacing_seconds: Optional[float] = None
+    respect_robots: bool = True
 
 
 def _resolve_path(obj: Any, path: str) -> Any:

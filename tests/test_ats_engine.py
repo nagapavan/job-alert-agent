@@ -2,12 +2,23 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from backend.ats.engine import (
     PortalConfig,
     _resolve_path,
     load_portal_configs,
     run_portal,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_permission_gate(monkeypatch):
+    """Neutralise the robots/AI-use permission gate so these tests are offline + deterministic.
+
+    The gate itself is covered by tests/test_ats_pacing.py and tests/test_scraper.py.
+    """
+    monkeypatch.setattr("backend.scraper.may_fetch", lambda url, *a, **k: True)
 
 
 # -------------------------------------------------------------
