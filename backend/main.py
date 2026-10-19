@@ -4768,9 +4768,9 @@ def _score_job_with_engine(
 ) -> ScoringResult:
     """Score a discovered job: deterministic engine first, bounded LLM fallback.
 
-    Returns ``(match_score, match_analysis, match_scored, score_method, match_scored_at,
-    match_band, apply_recommendation)``. Failures degrade to an unscored baseline rather
-    than fabricating a score.
+    Returns a :class:`ScoringResult` namedtuple ``(score, analysis, scored, method, timestamp,
+    band, recommendation, strengths, gaps, partials)``. Failures degrade to an unscored baseline
+    rather than fabricating a score.
     """
     unscored = ScoringResult(0, "", False, None, None, None, None, [], [], [])
     if not (resume_text or "").strip() or not (description or "").strip():
