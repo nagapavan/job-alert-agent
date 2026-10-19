@@ -276,6 +276,20 @@ def _register_ats_slug_resolvers() -> None:
 
     register_slug_resolver("careers_url")(extract_slug_from_careers_url)
 
+    def _workday_board_resolver(url_or_name: str, ats: str) -> Dict[str, str]:
+        """Returns the {tenant, shard, site, host} context for a Workday board URL, else {}.
+
+        Tenants cannot be inferred from a company name, so a non-Workday value yields {} and the
+        engine short-circuits. See docs/POLITE_CRAWLING_AND_WORKDAY.md §3.
+        """
+        board = _parse_workday_board(url_or_name or "")
+        if not board:
+            return {}
+        # ``slug`` keeps the generic short-circuit working (empty → skip portal).
+        return {**board, "slug": f"{board['tenant']}/{board['site']}"}
+
+    register_slug_resolver("workday_board")(_workday_board_resolver)
+
 
 _register_ats_slug_resolvers()
 
@@ -680,125 +694,20 @@ def scrape_workday_jobs(
     Tenant/shard/site cannot be guessed from a bare company name, so this scraper requires a
     Workday board URL (usually Company.careers_url). The shared client-side title/location
     matchers remain authoritative (see docs/ATS_PORTALS.md §3.3).
+
+    Delegates to the config-driven engine (``data/ats_portals.json`` → ``post_json`` /
+    ``workday`` variant); see docs/POLITE_CRAWLING_AND_WORKDAY.md.
     """
-    board = _parse_workday_board(careers_url or company_name or "")
-    if not board:
-        return []
-
-    host, tenant, site = board["host"], board["tenant"], board["site"]
-    api_url = f"https://{host}/wday/cxs/{tenant}/{site}/jobs"
-    list_headers = {
-        **HEADERS,
-        "content-type": "application/json",
-        "accept": "application/json",
-    }
-    has_filters = bool(
-        title_filters
-        or city_filters
-        or location_filters
-        or (work_mode and work_mode != "all")
+    return _scrape_portal_via_engine(
+        "workday",
+        company_name=company_name,
+        title_filters=title_filters,
+        city_filters=city_filters,
+        location_filters=location_filters,
+        work_mode=work_mode,
+        max_matches=max_matches,
+        careers_url=careers_url,
     )
-
-    postings: List[Dict[str, Any]] = []
-    try:
-        offset = 0
-        page_size = 20
-        max_pages = 5  # bound requests (~100 postings)
-        for _ in range(max_pages):
-            res = requests.post(
-                api_url,
-                headers=list_headers,
-                json={
-                    "appliedFacets": {},
-                    "limit": page_size,
-                    "offset": offset,
-                    "searchText": "",
-                },
-                timeout=15,
-            )
-            if res.status_code != 200:
-                break
-            data = res.json() or {}
-            page = data.get("jobPostings") or []
-            postings.extend(page)
-            total = data.get("total")
-            offset += page_size
-            if not page or (isinstance(total, int) and offset >= total):
-                break
-    except Exception as e:
-        logger.warning(f"Workday scraping failed for '{company_name}': {e}")
-        return []
-
-    jobs = []
-    for item in postings:
-        title = (item.get("title") or "Untitled Role").strip()
-        loc_str = (item.get("locationsText") or "Remote / Various").strip()
-        external_path = item.get("externalPath") or ""
-
-        if has_filters:
-            if title_filters and not check_title_match(title, title_filters):
-                continue
-            from backend.preference_filter import (
-                check_location_match,
-                check_workmode_match,
-            )
-
-            location_check = check_location_match(
-                f"{title} {loc_str}", location_filters, city_filters
-            )
-            workmode_check = check_workmode_match(title, loc_str, work_mode)
-            if not location_check or not workmode_check:
-                continue
-
-        public_url = (
-            f"https://{host}{external_path}"
-            if external_path.startswith("/")
-            else (
-                f"https://{host}/{site}/{external_path}"
-                if external_path
-                else f"https://{host}/{site}"
-            )
-        )
-
-        description = ""
-        detail_path = _normalize_workday_external_path(external_path, site)
-        if detail_path:
-            try:
-                dres = requests.get(
-                    f"https://{host}/wday/cxs/{tenant}/{site}{detail_path}",
-                    headers=HEADERS,
-                    timeout=8,
-                )
-                if dres.status_code == 200:
-                    info = (dres.json() or {}).get("jobPostingInfo") or {}
-                    if info.get("location"):
-                        loc_str = info["location"] or loc_str
-                    desc_html = info.get("jobDescription") or ""
-                    if desc_html:
-                        description = (
-                            BeautifulSoup(desc_html, "html.parser")
-                            .get_text(separator="\n")
-                            .strip()
-                        )
-            except Exception:
-                pass
-
-        jobs.append(
-            {
-                "title": title,
-                "url": public_url,
-                "description": description
-                or f"{title} opening at {company_name} ({loc_str}).",
-                "location": loc_str,
-                "source": "Workday Portal",
-                "source_type": "Direct",
-            }
-        )
-
-        if len(jobs) >= max_matches:
-            break
-
-    return jobs
 
 
 def scrape_uber_jobs() -> List[Dict[str, str]]:
