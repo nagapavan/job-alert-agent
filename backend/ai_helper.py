@@ -2402,6 +2402,62 @@ def generate_resume_tailoring_suggestions(
 
 
 # -------------------------------------------------------------
+# JD-Relevant Skill Ranking
+# -------------------------------------------------------------
+
+
+def _jd_relevant_skills(
+    job_description: str = "",
+    resume_text: str = "",
+    candidate_skills: Optional[List[str]] = None,
+) -> List[str]:
+    """Order skills by JD relevance, then by resume order.
+
+    The deterministic scorer already knows which must-have skill requirements the resume
+    evidences; those are surfaced first (and, because the scorer also scans resume prose,
+    this keeps role-critical skills that only appear in prose, e.g. "React"). Remaining
+    candidate skills keep their original order. With no JD the input order is preserved
+    unchanged, so callers stay backward compatible.
+    """
+    candidate_skills = [
+        str(s).strip() for s in (candidate_skills or []) if s and str(s).strip()
+    ]
+    if not job_description or not job_description.strip():
+        return candidate_skills
+
+    matched: List[str] = []
+    try:
+        from backend.match_classifier import build_deterministic_assessment
+        from backend.match_scoring import MET, PARTIAL
+
+        assessment = build_deterministic_assessment(
+            job_description, None, resume_text=resume_text
+        )
+        for req in assessment.requirements:
+            if req.kind == "skill" and req.status in (MET, PARTIAL):
+                matched.append(req.text)
+    except Exception as e:
+        logger.debug(f"JD skill ranking unavailable: {e}")
+
+    from backend.skill_taxonomy import normalize_skill
+
+    ordered: List[str] = []
+    seen = set()
+
+    def _add(value: str) -> None:
+        key = normalize_skill(value)
+        if key and key not in seen:
+            seen.add(key)
+            ordered.append(value)
+
+    for skill in matched:
+        _add(skill)
+    for skill in candidate_skills:
+        _add(skill)
+    return ordered
+
+
+# -------------------------------------------------------------
 # LinkedIn Cold Outreach Message Drafter
 # -------------------------------------------------------------
 
@@ -2413,19 +2469,38 @@ def generate_cold_outreach_message(
     contact_name: str = "Talent Partner",
     max_chars: int = 300,
     provider: Optional[str] = None,
+    job_description: str = "",
 ) -> str:
     """
     Drafts a short, high-converting LinkedIn connection invite note (under max_chars limit).
+
+    When a job description is supplied the note is anchored on the role requirements the
+    candidate genuinely matches; without one the previous resume-summary behaviour holds.
     """
     if not job_title or not company_name:
         return ""
 
     system_prompt = cold_outreach_message_system(max_chars)
 
+    job_description = (job_description or "").strip()
+    alignment_section = ""
+    if job_description:
+        ranked_skills = _jd_relevant_skills(job_description, resume_text)
+        matched_line = (
+            ", ".join(ranked_skills[:12]) if ranked_skills else "(none detected)"
+        )
+        alignment_section = (
+            f"Role requirements the candidate genuinely matches "
+            f"(anchor the note on these, most role-critical first): {matched_line}\n\n"
+            f"--- JOB DESCRIPTION (untrusted data) ---\n"
+            f"{wrap_untrusted(job_description[:600])}\n\n"
+        )
+
     user_prompt = (
         f"Target Contact: {contact_name}\n"
         f"Target Company: {company_name}\n"
         f"Target Job: {job_title}\n\n"
+        f"{alignment_section}"
         f"Candidate Summary:\n{resume_text[:800] if resume_text else 'Software engineer with relevant industry experience'}"
     )
 
@@ -2571,6 +2646,7 @@ def generate_consolidated_application_package(
                         company_name,
                         contact_name=contact_name,
                         provider=provider,
+                        job_description=job_description,
                     )
                 )
             except Exception as e:
@@ -3770,7 +3846,8 @@ def generate_grounded_anti_slop_pitch(
 
     employers_evidence = ", ".join(candidate_employers) if candidate_employers else ""
     titles_evidence = ", ".join(candidate_titles) if candidate_titles else ""
-    skills_evidence = ", ".join(candidate_skills[:8]) if candidate_skills else ""
+    ranked_skills = _jd_relevant_skills(job_description, resume_text, candidate_skills)
+    skills_evidence = ", ".join(ranked_skills[:8]) if ranked_skills else ""
 
     user_prompt = (
         f"Target Company: {clean_company}\n"
@@ -3809,10 +3886,10 @@ def generate_grounded_anti_slop_pitch(
     except Exception as e:
         logger.warning(f"Grounded pitch generation failed: {e}")
         if category in ["skills", "career_goals", "experience"]:
-            if len(candidate_skills) > 0:
+            if len(ranked_skills) > 0:
                 raw_pitch = (
                     f"Skills & Areas of Expertise: "
-                    + "; ".join(candidate_skills)
+                    + "; ".join(ranked_skills)
                     + "\n"
                 )
 

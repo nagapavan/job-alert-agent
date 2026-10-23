@@ -270,3 +270,27 @@ def test_generate_grounded_pitch_normalizes_generic_company_names(mock_gen, db_s
     assert res["answer"] is not None
     assert "Job boards" not in res["answer"]
 
+
+@patch("backend.ai_helper.generate_text")
+def test_grounded_pitch_ranks_evidence_by_jd(mock_gen, db_session):
+    """JD-matched skills must reach the writer's evidence instead of a raw resume dump."""
+    mock_gen.return_value = (
+        "I have shipped React and AWS systems in production for several teams. "
+        "I enjoy frontend architecture and reliable delivery. "
+        "I look forward to contributing to the Frontend Engineer role."
+    )
+
+    generate_grounded_anti_slop_pitch(
+        question="Describe your frontend experience.",
+        company_name="Acme",
+        job_title="Frontend Engineer",
+        job_description="We need strong React, Next.js and AWS experience.",
+        resume_text="Engineer with Python, React and AWS production experience.",
+        db=db_session,
+        auto_cache=False,
+    )
+
+    prompts = [c.kwargs.get("user_prompt", "") for c in mock_gen.call_args_list]
+    pitch_prompt = next(p for p in prompts if "Core Skills:" in p)
+    assert "React" in pitch_prompt
+

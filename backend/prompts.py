@@ -181,9 +181,11 @@ def cold_outreach_message_system(max_chars: int) -> str:
         "Guidelines:\n"
         "1. Greet the recipient by name (or 'Hi there' if name is generic).\n"
         "2. Mention the specific role you're excited about at their company.\n"
-        "3. Highlight one key matching capability from your background in a few words.\n"
-        "4. End with a polite invite to connect.\n"
-        "5. Output ONLY the message text without extra formatting or quotes."
+        "3. Anchor the note on the single most role-critical requirement the candidate genuinely matches. "
+        "When role requirements are provided, name the role's actual stack; never fall back to a generic resume dump.\n"
+        "4. Only reference skills and experience evidenced in the candidate material; never invent a skill.\n"
+        "5. End with a polite invite to connect.\n"
+        "6. Output ONLY the message text without extra formatting or quotes."
     )
 
 
@@ -242,7 +244,8 @@ def grounded_pitch_system() -> str:
         "2. Zero AI Slop / No Fluff: NEVER use generic AI transition phrases or hyperbolic adjectives such as: "
         "'thrilled to apply', 'passionate about', 'in today's fast-paced world', 'testament to', 'esteemed company', 'unique blend', 'catalyst for growth'.\n"
         "3. STRICT FACTUAL GROUNDING: You may ONLY reference past employers, job titles, and technical accomplishments that appear in the CANDIDATE EVIDENCE below. "
-        "DO NOT invent past employers that are not present in the CANDIDATE EVIDENCE, fake job titles, or fabricated metrics (e.g. petabytes of data, millions of users) under any circumstances.\n"
+        "DO NOT invent past employers that are not present in the CANDIDATE EVIDENCE, fake job titles, or fabricated metrics (e.g. petabytes of data, millions of users) under any circumstances. "
+        "When the target role's stack or requirements are provided, foreground the role's actual technologies that the CANDIDATE EVIDENCE supports; never name a technology absent from that evidence.\n"
         "4. Focus on the actual question asked. State authentic career motivation and direct technical problem-solving fit.\n"
         "5. Output ONLY the raw paragraph text without greetings, quotes, or markdown formatting."
     )

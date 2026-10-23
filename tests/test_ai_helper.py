@@ -480,6 +480,64 @@ def test_generate_cold_outreach_message_error_fallback(mock_gen):
 
 
 # -------------------------------------------------------------
+# Unit Tests: JD-Relevant Skill Ranking
+# -------------------------------------------------------------
+def test_jd_relevant_skills_ranks_jd_matches_first():
+    from backend.ai_helper import _jd_relevant_skills
+
+    ranked = _jd_relevant_skills(
+        job_description="We build products with React, Next.js and FastAPI on AWS.",
+        resume_text="Engineer with Python, React and AWS in production. Also Kafka.",
+        candidate_skills=["Python", "Kafka"],
+    )
+    # JD-evidenced skills surface ahead of skills the JD never mentions.
+    assert "React" in ranked
+    assert ranked.index("React") < ranked.index("Kafka")
+
+
+def test_jd_relevant_skills_without_jd_preserves_resume_order():
+    from backend.ai_helper import _jd_relevant_skills
+
+    skills = ["Python", "Go", "Kafka"]
+    assert _jd_relevant_skills("", "irrelevant resume", skills) == skills
+
+
+def test_jd_relevant_skills_does_not_fabricate_missing_requirements():
+    from backend.ai_helper import _jd_relevant_skills
+
+    ranked = _jd_relevant_skills(
+        job_description="Must have React Native, Rust and gRPC experience.",
+        resume_text="Backend engineer with Python and PostgreSQL.",
+        candidate_skills=["Python", "PostgreSQL"],
+    )
+    assert "Rust" not in ranked
+    assert "gRPC" not in ranked
+
+
+@patch("backend.ai_helper.generate_text")
+def test_generate_cold_outreach_message_includes_jd_alignment(mock_gen):
+    mock_gen.return_value = "Hi Sam, saw the Frontend Engineer role at Acme."
+    generate_cold_outreach_message(
+        resume_text="Built React and AWS systems in production.",
+        job_title="Frontend Engineer",
+        company_name="Acme",
+        contact_name="Sam",
+        job_description="We need strong React and AWS engineers.",
+    )
+    prompt = mock_gen.call_args.kwargs.get("user_prompt", "")
+    assert "React" in prompt
+    assert "Role requirements the candidate genuinely matches" in prompt
+
+
+@patch("backend.ai_helper.generate_text")
+def test_generate_cold_outreach_message_without_jd_is_unchanged(mock_gen):
+    mock_gen.return_value = "Hello there, would love to connect."
+    generate_cold_outreach_message("Resume text", "Engineer", "Company")
+    prompt = mock_gen.call_args.kwargs.get("user_prompt", "")
+    assert "Role requirements the candidate genuinely matches" not in prompt
+
+
+# -------------------------------------------------------------
 # Unit Tests: Consolidated 1-Pass Generator
 # -------------------------------------------------------------
 @patch("backend.ai_helper.generate_text")
