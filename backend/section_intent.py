@@ -68,7 +68,8 @@ JD_HEADINGS: Dict[str, Tuple[str, ...]] = {
     "intro": (
         "about us", "about the company", "about the team", "about our company",
         "who we are", "company overview", "our story", "our mission", "our vision",
-        "why join us", "life at", "welcome to",
+        "why join us", "life at", "welcome to", "about the job", "about this role",
+        "about the position",
     ),
     # Company perks / offer prose. These headings introduce no candidate requirements,
     # so they are masked before the JD skill scan (see match_classifier). Without this,

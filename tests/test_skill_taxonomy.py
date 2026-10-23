@@ -47,3 +47,51 @@ class TestCandidateQueue:
         tax.record_skill_candidate("ab")
         tax.record_skill_candidate("12345")
         assert not (tmp_path / "candidates.json").exists()
+
+    def test_rejects_html_markup(self, monkeypatch, tmp_path):
+        """Raw JD HTML must never reach the review queue (issue #8)."""
+        monkeypatch.setattr(tax, "CANDIDATES_PATH", tmp_path / "candidates.json")
+        for phrase in ("<ul>", "<li>solve real business needs</li>", "<p>p-1385</p>", "&nbsp;"):
+            tax.record_skill_candidate(phrase)
+        assert not (tmp_path / "candidates.json").exists()
+
+    def test_rejects_section_headings(self, monkeypatch, tmp_path):
+        """Headings are structure, not candidate skills — reuse section_intent's vocabulary."""
+        monkeypatch.setattr(tax, "CANDIDATES_PATH", tmp_path / "candidates.json")
+        for phrase in ("about the job", "minimum qualifications", "what we offer", "requirements"):
+            tax.record_skill_candidate(phrase)
+        assert not (tmp_path / "candidates.json").exists()
+
+    def test_rejects_prose_sentences(self, monkeypatch, tmp_path):
+        """JD prose is not a skill phrase."""
+        monkeypatch.setattr(tax, "CANDIDATES_PATH", tmp_path / "candidates.json")
+        tax.record_skill_candidate("we are a small team that values curiosity")
+        tax.record_skill_candidate("join our mission to do great things")
+        assert not (tmp_path / "candidates.json").exists()
+
+    def test_accepts_real_skill_phrases(self, monkeypatch, tmp_path):
+        """Positive control: genuine candidates still record, so the filter is not over-broad."""
+        monkeypatch.setattr(tax, "CANDIDATES_PATH", tmp_path / "candidates.json")
+        for phrase in ("stakeholder wrangling", "event-driven architecture", "terraform"):
+            tax.record_skill_candidate(phrase)
+        counts = json.loads((tmp_path / "candidates.json").read_text())["counts"]
+        assert set(counts) == {"stakeholder wrangling", "event-driven architecture", "terraform"}
+
+    def test_purge_removes_existing_pollution(self, monkeypatch, tmp_path):
+        """purge_candidates drops historical noise while preserving real candidates + counts."""
+        path = tmp_path / "candidates.json"
+        path.write_text(
+            json.dumps({
+                "version": 1,
+                "counts": {
+                    "<ul>": 12, "about the job": 9,
+                    "we are a small team that values curiosity": 4,
+                    "stakeholder wrangling": 7, "terraform": 3,
+                },
+            })
+        )
+        monkeypatch.setattr(tax, "CANDIDATES_PATH", path)
+        removed, kept = tax.purge_candidates()
+        assert removed == 3 and kept == 2
+        counts = json.loads(path.read_text())["counts"]
+        assert counts == {"stakeholder wrangling": 7, "terraform": 3}
