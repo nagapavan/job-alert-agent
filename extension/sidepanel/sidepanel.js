@@ -31,16 +31,73 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   async function refreshConnectionStatus() {
     await window.jobAgentRuntime.init();
+    renderNanoStatus();
     if (window.jobAgentRuntime.isConnected) {
       statusIndicator.className = "sp-status-indicator connected";
       statusLabel.innerText = "Connected (API)";
-    } else {
-      statusIndicator.className = "sp-status-indicator standalone";
-      statusLabel.innerText = "Standalone (Nano)";
+      return;
+    }
+    // Backend offline: report the TRUE on-device capability instead of asserting "Nano" — the
+    // badge previously claimed Standalone (Nano) even when Gemini Nano was unavailable.
+    statusIndicator.className = "sp-status-indicator standalone";
+    switch (window.jobAgentRuntime.nanoState) {
+      case "available":
+        statusLabel.innerText = "Standalone (Nano ready)";
+        break;
+      case "downloading":
+        statusLabel.innerText = "Standalone (Nano downloading)";
+        break;
+      case "downloadable":
+        statusLabel.innerText = "Standalone (Nano — enable)";
+        break;
+      default:
+        statusLabel.innerText = "No AI available";
+    }
+  }
+
+  function renderNanoStatus() {
+    const el = document.getElementById("cfg-nano-status");
+    const btn = document.getElementById("btn-enable-nano");
+    if (!el) return;
+    const labels = {
+      available: "✓ Ready — on-device Gemini Nano is active.",
+      downloading: "⏳ Model is downloading…",
+      downloadable: "Model not downloaded yet — enable it to use Standalone mode offline.",
+      unavailable: "✗ Unavailable — this Chrome/device doesn't meet the built-in AI requirements (macOS 13+, ≥22 GB free disk, sufficient GPU/RAM) or space is low.",
+      unsupported: "✗ This Chrome build doesn't expose the built-in Prompt API (Chrome 138+).",
+      unknown: "Checking availability…"
+    };
+    el.innerText = labels[window.jobAgentRuntime.nanoState] || labels.unknown;
+    if (btn) {
+      btn.style.display =
+        window.jobAgentRuntime.nanoState === "downloadable" ||
+        window.jobAgentRuntime.nanoState === "downloading"
+          ? "inline-flex"
+          : "none";
+      btn.disabled = window.jobAgentRuntime.nanoState === "downloading";
     }
   }
 
   await refreshConnectionStatus();
+
+  // User-gesture path: Chrome only permits create() for a not-yet-downloaded model while the user
+  // has actively interacted, so the download must be triggered by this explicit click.
+  document.getElementById("btn-enable-nano")?.addEventListener("click", async () => {
+    const btn = document.getElementById("btn-enable-nano");
+    const nanoEl = document.getElementById("cfg-nano-status");
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = "<span>⏳ Preparing…</span>";
+    }
+    const ok = await window.jobAgentRuntime.ensureNanoSession((pct) => {
+      const msg = `⏳ Downloading on-device model… ${pct}%`;
+      if (nanoEl) nanoEl.innerText = msg;
+      if (btn) btn.innerHTML = `<span>⏳ Downloading… ${pct}%</span>`;
+    });
+    if (btn) btn.innerHTML = "<span>⬇️ Enable On-Device AI (Nano)</span>";
+    await refreshConnectionStatus();
+    showToast(ok ? "✓ On-device AI enabled" : "⚠️ On-device AI could not be enabled");
+  });
 
   function escapeHtml(str) {
     if (!str) return "";

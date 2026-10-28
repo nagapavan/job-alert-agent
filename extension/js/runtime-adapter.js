@@ -3,6 +3,30 @@
  * Provides a unified API interface for the Side Panel and Extension UI.
  */
 
+// The Chrome Prompt API requires declaring supported modalities/languages for BOTH
+// availability() and create() — passing the same options to each is mandatory.
+const NANO_SESSION_OPTIONS = {
+  expectedInputs: [{ type: "text", languages: ["en"] }],
+  expectedOutputs: [{ type: "text", languages: ["en"] }]
+};
+
+// Maps the current Prompt API enum ("available"|"downloadable"|"downloading"|"unavailable")
+// plus the legacy enum ("readily"|"after-download"|"downloading"|"no") onto one vocabulary.
+function normalizeNanoAvailability(value) {
+  switch (value) {
+    case "available":
+    case "readily":
+      return "available";
+    case "downloadable":
+    case "after-download":
+      return "downloadable";
+    case "downloading":
+      return "downloading";
+    default:
+      return "unavailable";
+  }
+}
+
 class JobAgentRuntimeAdapter {
   constructor() {
     this.backendUrl = "http://localhost:8000";
@@ -10,6 +34,7 @@ class JobAgentRuntimeAdapter {
     this.mode = "connected"; // "connected" or "standalone"
     this.isConnected = false;
     this.geminiNanoSession = null;
+    this.nanoState = "unknown"; // available | downloadable | downloading | unavailable | unsupported | unknown
   }
 
   getAuthHeaders(customHeaders = {}) {
@@ -56,14 +81,57 @@ class JobAgentRuntimeAdapter {
 
   async initGeminiNano() {
     try {
-      if (typeof window !== "undefined" && window.ai && window.ai.languageModel) {
-        const capabilities = await window.ai.languageModel.capabilities();
-        if (capabilities.available === "readily") {
-          this.geminiNanoSession = await window.ai.languageModel.create();
-        }
+      // Chrome's built-in Prompt API is exposed as a global `LanguageModel`. The old
+      // `window.ai.languageModel` namespace (with `.capabilities()` / `"readily"`) was removed
+      // from Chrome, so probing it silently disabled on-device AI entirely.
+      const LM = typeof globalThis !== "undefined" ? globalThis.LanguageModel : null;
+      if (!LM) {
+        this.nanoState = "unsupported";
+        console.log("Chrome built-in Prompt API (LanguageModel) is not available in this Chrome build.");
+        return this.nanoState;
+      }
+      const availability = await LM.availability(NANO_SESSION_OPTIONS);
+      this.nanoState = normalizeNanoAvailability(availability);
+      if (this.nanoState === "available") {
+        this.geminiNanoSession = await LM.create(NANO_SESSION_OPTIONS);
       }
     } catch (e) {
-      console.log("Gemini Nano not readily available in this Chrome environment:", e.message);
+      this.nanoState = "unavailable";
+      console.log("Gemini Nano availability check failed:", e && e.message);
+    }
+    return this.nanoState;
+  }
+
+  // Creates the on-device session, downloading the model if needed. MUST be invoked from a user
+  // gesture: Chrome only lets a page call create() for a not-yet-downloaded model while the user
+  // has actively interacted (sticky activation).
+  async ensureNanoSession(onProgress) {
+    if (this.geminiNanoSession) return true;
+    const LM = typeof globalThis !== "undefined" ? globalThis.LanguageModel : null;
+    if (!LM) {
+      this.nanoState = "unsupported";
+      return false;
+    }
+    try {
+      const availability = await LM.availability(NANO_SESSION_OPTIONS);
+      this.nanoState = normalizeNanoAvailability(availability);
+      if (this.nanoState === "unavailable") return false;
+      this.geminiNanoSession = await LM.create({
+        ...NANO_SESSION_OPTIONS,
+        monitor(m) {
+          m.addEventListener("downloadprogress", (e) => {
+            if (typeof onProgress === "function") {
+              onProgress(Math.round((e.loaded || 0) * 100));
+            }
+          });
+        }
+      });
+      this.nanoState = "available";
+      return !!this.geminiNanoSession;
+    } catch (e) {
+      console.warn("Enabling on-device Gemini Nano failed:", e && e.message);
+      this.nanoState = "unavailable";
+      return false;
     }
   }
 

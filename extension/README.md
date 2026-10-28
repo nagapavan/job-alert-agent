@@ -34,7 +34,7 @@ A **Single Unified Hybrid Chrome Extension** that gives candidates an in-browser
 
 ### 3. Hybrid Dual-Mode Runtime
 - **Mode A: Connected Agent Mode**: Connects to the local FastAPI backend (`http://localhost:8000`), leveraging PostgreSQL/SQLite, dynamic model routing, and the semantic cache.
-- **Mode B: Standalone Zero-Backend Mode**: Runs 100% on-device inside Chrome using built-in Gemini Nano (`window.ai.languageModel`) and `chrome.storage.local` without needing the backend server running.
+- **Mode B: Standalone Zero-Backend Mode**: Runs 100% on-device inside Chrome using the built-in Chrome Prompt API (global `LanguageModel`, powered by Gemini Nano) and `chrome.storage.local`, without needing the backend server running. On first use the model may need a one-time download, triggered from **Profile → Runtime & Agent Mode → Enable On-Device AI (Nano)**.
 
 ---
 
