@@ -74,7 +74,7 @@
     {"name": "Airflow", "aliases": ["apache airflow"], "concepts": ["data pipeline"]},
     {"name": "gRPC", "aliases": [], "concepts": ["distributed systems", "rest api"]},
     {"name": "Payroll", "aliases": ["payroll systems", "payroll processing"], "concepts": ["hris", "hr domain"]},
-    {"name": "Benefits Administration", "aliases": ["benefits administration", "employee benefits", "benefits systems"], "concepts": ["hris", "hr domain"]},
+    {"name": "Benefits Administration", "aliases": ["benefits administration"], "concepts": ["hris", "hr domain"]},
     {"name": "HCM", "aliases": ["human capital management"], "concepts": ["hris", "hr domain"]},
     {"name": "HRIS", "aliases": ["hr information system", "hr systems", "core hr"], "concepts": ["hr domain"]},
     {"name": "Workday", "aliases": [], "concepts": ["hris", "hcm"]},

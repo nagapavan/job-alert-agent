@@ -55,7 +55,8 @@ _FALLBACK_CLOUD = {"aws", "gcp", "azure"}
 # review-time guard so a future hand-edit of the data file cannot silently re-introduce
 # the class of bug that made "benefits" score as "Benefits Administration".
 _AMBIGUOUS_ALIASES = {
-    "benefits", "case management", "leave management",
+    "benefits", "employee benefits", "benefits systems",
+    "case management", "leave management",
 }
 
 
