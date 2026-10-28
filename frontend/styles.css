@@ -3924,7 +3924,7 @@ body {
 }
 .insights-gaps {
     display: flex;
-    flex-direction: column;
+    flex-wrap: wrap;
     gap: 8px;
     margin-top: 12px;
 }
@@ -3933,33 +3933,21 @@ body {
     color: var(--text-dim);
     font-style: italic;
 }
-.insights-gap-row {
-    display: grid;
-    grid-template-columns: 140px 1fr auto;
+.insight-pill {
+    display: inline-flex;
     align-items: center;
-    gap: 12px;
+    gap: 6px;
+    padding: 4px 10px;
+    border: 1px solid transparent;
+    border-radius: 999px;
     font-size: 12px;
-}
-.gap-skill {
     font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    color: var(--text-main);
+    cursor: default;
     white-space: nowrap;
 }
-.gap-bar {
-    display: block;
-    height: 6px;
-    border-radius: 4px;
-    background: rgba(255, 255, 255, 0.06);
-    overflow: hidden;
-}
-.gap-bar-fill {
-    display: block;
-    height: 100%;
-    border-radius: 4px;
-    background: linear-gradient(90deg, var(--primary), var(--accent));
-}
-.gap-num {
+.insight-pill-count {
+    font-size: 11px;
+    font-weight: 500;
     color: var(--text-dim);
-    white-space: nowrap;
 }

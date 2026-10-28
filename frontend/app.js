@@ -1702,12 +1702,10 @@ async function updateSkillsInsights(force = false) {
         }
         gapsEl.innerHTML = data.gaps.map(g => {
             const pct = Math.round((g.share || 0) * 100);
-            return `
-                <div class="insights-gap-row" title="Click to open job #${g.sample_job_ids[0] || ''}">
-                    <span class="gap-skill">${escapeHTML(g.skill)}</span>
-                    <span class="gap-bar"><span class="gap-bar-fill" style="width:${pct}%"></span></span>
-                    <span class="gap-num">${pct}% · ${g.count} job${g.count === 1 ? '' : 's'}</span>
-                </div>`;
+            const alpha = (0.08 + (g.share || 0) * 0.45).toFixed(2);
+            const border = Math.min(0.9, 0.08 + (g.share || 0) * 0.45 + 0.15).toFixed(2);
+            const sample = (g.sample_job_ids && g.sample_job_ids[0]) || '';
+            return `<span class="insight-pill" style="background:rgba(99,102,241,${alpha});border-color:rgba(99,102,241,${border})" title="${pct}% of scored jobs · ${g.count} job${g.count === 1 ? '' : 's'}${sample ? ` · sample job #${sample}` : ''}">${escapeHTML(g.skill)}<span class="insight-pill-count">${g.count}</span></span>`;
         }).join("");
     } catch {
         if (gapsEl) gapsEl.innerHTML = `<span class="insights-empty">Skills insights unavailable.</span>`;
