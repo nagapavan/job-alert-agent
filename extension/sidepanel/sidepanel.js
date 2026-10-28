@@ -29,18 +29,120 @@ document.addEventListener("DOMContentLoaded", async () => {
   const statusIndicator = document.getElementById("sp-connection-status");
   const statusLabel = document.getElementById("sp-status-label");
 
-  async function refreshConnectionStatus() {
-    await window.jobAgentRuntime.init();
-    if (window.jobAgentRuntime.isConnected) {
-      statusIndicator.className = "sp-status-indicator connected";
-      statusLabel.innerText = "Connected (API)";
-    } else {
-      statusIndicator.className = "sp-status-indicator standalone";
-      statusLabel.innerText = "Standalone (Nano)";
+  function nanoBadgeLabel(state) {
+    switch (state) {
+      case "available":
+        return "Standalone (Nano ready)";
+      case "downloading":
+        return "Standalone (Nano downloading)";
+      case "downloadable":
+        return "Standalone (Nano — enable)";
+      case "unknown":
+        return "Standalone (checking AI…)";
+      default:
+        return "No AI available";
     }
   }
 
+  function renderRuntimeBadge() {
+    const rt = window.jobAgentRuntime;
+    if (rt.mode === "standalone") {
+      // Explicit on-device mode: describe Nano regardless of backend reachability.
+      statusIndicator.className = "sp-status-indicator standalone";
+      statusLabel.innerText = nanoBadgeLabel(rt.nanoState);
+      return;
+    }
+    if (rt.isConnected) {
+      statusIndicator.className = "sp-status-indicator connected";
+      statusLabel.innerText = "Connected (API)";
+      return;
+    }
+    // Connected mode with the backend down: the adapter transparently falls back to on-device.
+    statusIndicator.className = "sp-status-indicator standalone";
+    statusLabel.innerText = rt.nanoState === "available" ? "API offline → Nano" : "API offline";
+  }
+
+  function updateModeSwitchUi() {
+    const mode = window.jobAgentRuntime.mode || "connected";
+    document.querySelectorAll(".sp-mode-btn").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.mode === mode);
+    });
+    const select = document.getElementById("cfg-mode");
+    if (select) select.value = mode;
+  }
+
+  async function refreshConnectionStatus() {
+    // init() returns once the backend check completes; the on-device probe runs in the background
+    // and updates the badge via onNanoStateChange, so a stuck model broker can never freeze the
+    // header on "Checking…".
+    await window.jobAgentRuntime.init();
+    renderNanoStatus();
+    updateModeSwitchUi();
+    renderRuntimeBadge();
+  }
+
+  function renderNanoStatus() {
+    const el = document.getElementById("cfg-nano-status");
+    const btn = document.getElementById("btn-enable-nano");
+    if (!el) return;
+    const labels = {
+      available: "✓ Ready — on-device Gemini Nano is active.",
+      downloading: "⏳ Model is downloading…",
+      downloadable: "Model not downloaded yet — enable it to use Standalone mode offline.",
+      unavailable: "✗ Unavailable — this Chrome/device doesn't meet the built-in AI requirements (macOS 13+, ≥22 GB free disk, sufficient GPU/RAM) or space is low.",
+      unsupported: "✗ This Chrome build doesn't expose the built-in Prompt API (Chrome 138+).",
+      timeout: "✗ On-device AI did not respond. Try restarting Chrome; Connected mode still works.",
+      unknown: "Checking availability…"
+    };
+    el.innerText = labels[window.jobAgentRuntime.nanoState] || labels.unknown;
+    if (btn) {
+      btn.style.display =
+        window.jobAgentRuntime.nanoState === "downloadable" ||
+        window.jobAgentRuntime.nanoState === "downloading"
+          ? "inline-flex"
+          : "none";
+      btn.disabled = window.jobAgentRuntime.nanoState === "downloading";
+    }
+  }
+
+  // Re-render the badge/status whenever the background on-device probe advances.
+  window.jobAgentRuntime.onNanoStateChange(() => {
+    renderNanoStatus();
+    renderRuntimeBadge();
+  });
+
+  // Explicit switch between the local API backend and on-device Gemini Nano.
+  document.querySelectorAll(".sp-mode-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const mode = btn.dataset.mode;
+      if (!mode || mode === window.jobAgentRuntime.mode) return;
+      await window.jobAgentRuntime.setMode(mode);
+      updateModeSwitchUi();
+      await refreshConnectionStatus();
+      showToast(mode === "standalone" ? "Switched to On-Device (Nano)" : "Switched to Local API");
+    });
+  });
+
   await refreshConnectionStatus();
+
+  // User-gesture path: Chrome only permits create() for a not-yet-downloaded model while the user
+  // has actively interacted, so the download must be triggered by this explicit click.
+  document.getElementById("btn-enable-nano")?.addEventListener("click", async () => {
+    const btn = document.getElementById("btn-enable-nano");
+    const nanoEl = document.getElementById("cfg-nano-status");
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = "<span>⏳ Preparing…</span>";
+    }
+    const ok = await window.jobAgentRuntime.ensureNanoSession((pct) => {
+      const msg = `⏳ Downloading on-device model… ${pct}%`;
+      if (nanoEl) nanoEl.innerText = msg;
+      if (btn) btn.innerHTML = `<span>⏳ Downloading… ${pct}%</span>`;
+    });
+    if (btn) btn.innerHTML = "<span>⬇️ Enable On-Device AI (Nano)</span>";
+    await refreshConnectionStatus();
+    showToast(ok ? "✓ On-device AI enabled" : "⚠️ On-device AI could not be enabled");
+  });
 
   function escapeHtml(str) {
     if (!str) return "";

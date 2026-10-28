@@ -22,6 +22,16 @@
     </div>
   </header>
 
+  <!-- Execution Mode Switch -->
+  <div class="sp-mode-switch" id="sp-mode-switch" role="group" aria-label="AI execution mode">
+    <button type="button" class="sp-mode-btn" data-mode="connected">
+      <span>🔌</span> Local API
+    </button>
+    <button type="button" class="sp-mode-btn" data-mode="standalone">
+      <span>📴</span> On-Device (Nano)
+    </button>
+  </div>
+
   <!-- Navigation Tabs -->
   <nav class="sp-nav">
     <button class="sp-tab-btn active" data-tab="tab-analyzer">
@@ -274,6 +284,14 @@
             <option value="connected">Connected Mode (FastAPI + Local Database)</option>
             <option value="standalone">Standalone Mode (100% On-Device in Chrome)</option>
           </select>
+        </div>
+
+        <div class="sp-form-group">
+          <label>On-Device AI (Chrome Gemini Nano)</label>
+          <p class="sp-hint" id="cfg-nano-status">Checking availability…</p>
+          <button class="sp-btn-secondary" id="btn-enable-nano" style="display: none;">
+            <span>⬇️ Enable On-Device AI (Nano)</span>
+          </button>
         </div>
 
         <button class="sp-btn-primary" id="btn-save-profile" style="margin-top: 15px;">
