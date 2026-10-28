@@ -10,6 +10,39 @@ const NANO_SESSION_OPTIONS = {
   expectedOutputs: [{ type: "text", languages: ["en"] }]
 };
 
+// `LanguageModel.availability()` can stall indefinitely when Chrome's on-device model broker is
+// unhealthy (or while the device is being assessed). The UI must never hang on it, so every probe
+// is raced against this deadline.
+const NANO_PROBE_TIMEOUT_MS = 10000;
+const NANO_PROBE_TIMEOUT = "__nano_probe_timeout__";
+
+// Resolves with the promise's value, or with `fallback` when the deadline is hit. Rejections are
+// propagated so callers can report a real error (rather than masking it as a timeout).
+function withTimeout(promise, ms, fallback) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(fallback);
+    }, ms);
+    Promise.resolve(promise).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 // Maps the current Prompt API enum ("available"|"downloadable"|"downloading"|"unavailable")
 // plus the legacy enum ("readily"|"after-download"|"downloading"|"no") onto one vocabulary.
 function normalizeNanoAvailability(value) {
@@ -34,7 +67,29 @@ class JobAgentRuntimeAdapter {
     this.mode = "connected"; // "connected" or "standalone"
     this.isConnected = false;
     this.geminiNanoSession = null;
-    this.nanoState = "unknown"; // available | downloadable | downloading | unavailable | unsupported | unknown
+    this.nanoState = "unknown"; // available | downloadable | downloading | unavailable | unsupported | timeout | unknown
+    this.nanoReady = Promise.resolve(); // settles once the initial on-device probe finishes
+    this._nanoListeners = [];
+  }
+
+  // Subscribe to `nanoState` changes (fires as the background probe progresses).
+  onNanoStateChange(callback) {
+    if (typeof callback !== "function") return () => {};
+    this._nanoListeners.push(callback);
+    return () => {
+      this._nanoListeners = this._nanoListeners.filter((cb) => cb !== callback);
+    };
+  }
+
+  _setNanoState(state) {
+    this.nanoState = state;
+    for (const cb of this._nanoListeners) {
+      try {
+        cb(state);
+      } catch (e) {
+        // A listener must never interrupt a state transition.
+      }
+    }
   }
 
   getAuthHeaders(customHeaders = {}) {
@@ -57,8 +112,12 @@ class JobAgentRuntimeAdapter {
     // Check backend health
     await this.checkBackendStatus();
 
-    // Check Chrome Built-in Gemini Nano availability
-    await this.initGeminiNano();
+    // Probe on-device AI WITHOUT blocking init(): availability() can stall on a stuck model
+    // broker, and that must never freeze the status badge (it previously left the panel stuck on
+    // "Checking…"). State changes are broadcast via onNanoStateChange; `nanoReady` is kept so
+    // callers that need the session can await the bounded probe.
+    this.nanoReady = this.initGeminiNano();
+    return this.isConnected;
   }
 
   async checkBackendStatus() {
@@ -86,17 +145,32 @@ class JobAgentRuntimeAdapter {
       // from Chrome, so probing it silently disabled on-device AI entirely.
       const LM = typeof globalThis !== "undefined" ? globalThis.LanguageModel : null;
       if (!LM) {
-        this.nanoState = "unsupported";
+        this._setNanoState("unsupported");
         console.log("Chrome built-in Prompt API (LanguageModel) is not available in this Chrome build.");
         return this.nanoState;
       }
-      const availability = await LM.availability(NANO_SESSION_OPTIONS);
-      this.nanoState = normalizeNanoAvailability(availability);
+      const availability = await withTimeout(
+        LM.availability(NANO_SESSION_OPTIONS),
+        NANO_PROBE_TIMEOUT_MS,
+        NANO_PROBE_TIMEOUT
+      );
+      if (availability === NANO_PROBE_TIMEOUT) {
+        this._setNanoState("timeout");
+        console.warn("LanguageModel.availability() did not respond in time; skipping on-device AI.");
+        return this.nanoState;
+      }
+      this._setNanoState(normalizeNanoAvailability(availability));
       if (this.nanoState === "available") {
-        this.geminiNanoSession = await LM.create(NANO_SESSION_OPTIONS);
+        const session = await withTimeout(LM.create(NANO_SESSION_OPTIONS), NANO_PROBE_TIMEOUT_MS, null);
+        if (session) {
+          this.geminiNanoSession = session;
+        } else {
+          this._setNanoState("timeout");
+          console.warn("LanguageModel.create() did not respond in time; on-device AI is unavailable.");
+        }
       }
     } catch (e) {
-      this.nanoState = "unavailable";
+      this._setNanoState("unavailable");
       console.log("Gemini Nano availability check failed:", e && e.message);
     }
     return this.nanoState;
@@ -109,13 +183,22 @@ class JobAgentRuntimeAdapter {
     if (this.geminiNanoSession) return true;
     const LM = typeof globalThis !== "undefined" ? globalThis.LanguageModel : null;
     if (!LM) {
-      this.nanoState = "unsupported";
+      this._setNanoState("unsupported");
       return false;
     }
     try {
-      const availability = await LM.availability(NANO_SESSION_OPTIONS);
-      this.nanoState = normalizeNanoAvailability(availability);
+      const availability = await withTimeout(
+        LM.availability(NANO_SESSION_OPTIONS),
+        NANO_PROBE_TIMEOUT_MS,
+        NANO_PROBE_TIMEOUT
+      );
+      if (availability === NANO_PROBE_TIMEOUT) {
+        this._setNanoState("timeout");
+        return false;
+      }
+      this._setNanoState(normalizeNanoAvailability(availability));
       if (this.nanoState === "unavailable") return false;
+      // No deadline here: the initial model download legitimately takes minutes.
       this.geminiNanoSession = await LM.create({
         ...NANO_SESSION_OPTIONS,
         monitor(m) {
@@ -126,11 +209,11 @@ class JobAgentRuntimeAdapter {
           });
         }
       });
-      this.nanoState = "available";
+      this._setNanoState("available");
       return !!this.geminiNanoSession;
     } catch (e) {
       console.warn("Enabling on-device Gemini Nano failed:", e && e.message);
-      this.nanoState = "unavailable";
+      this._setNanoState("unavailable");
       return false;
     }
   }
