@@ -10,7 +10,7 @@ import random
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel, ConfigDict
 
 from backend.config import BASE_DIR
@@ -87,6 +87,10 @@ class PeriodicScheduler:
                     data = json.load(f)
                     for item in data:
                         job = ScheduledJobConfig.model_validate(item)
+                        # A persisted RUNNING status means the previous process died mid-run:
+                        # status is finalized only by the in-process task wrapper on completion.
+                        if job.last_status == "RUNNING":
+                            job.last_status = "INTERRUPTED"
                         # Re-calculate next_run_at if in the past
                         if job.is_enabled and (not job.next_run_at or job.next_run_at < datetime.now(timezone.utc)):
                             jitter = random.uniform(0.1, 0.5)
@@ -197,6 +201,24 @@ class PeriodicScheduler:
         """Reason the most recent run_job_now() declined to run (None when it ran or wasn't found)."""
         return self._last_skip_reason
 
+    def _status_from_result(self, result: Any) -> Tuple[str, int]:
+        """Map a task runner's return value to a terminal (status, items_count)."""
+        if isinstance(result, dict):
+            items = int(result.get("jobs_found") or 0)
+            if result.get("skipped"):
+                return "SKIPPED", items
+            return "COMPLETED", items
+        return "COMPLETED", 0
+
+    def _finalize_job(self, job_id: str, status: str, items: int = 0):
+        """Record the terminal status of a scheduled run (called from the task worker thread)."""
+        job = self._jobs.get(job_id)
+        if not job:
+            return
+        job.last_status = status
+        job.last_items_count = items
+        self._save_config()
+
     def run_job_now(self, job_id: str, force: bool = False) -> Optional[str]:
         """
         Triggers immediate execution of a scheduled job in the background.
@@ -258,21 +280,41 @@ class PeriodicScheduler:
             return None
 
         name_prefix, runner_fn = runner_map[job.task_type]
-        task_id = task_engine.submit_task(
-            task_type=job.task_type,
-            task_name=f"{name_prefix} (Auto)",
-            fn=runner_fn,
-            total_steps=6 if job.task_type == "google_jobs_scan" else 3
-        )
+
+        def _tracked_runner(*args, **kwargs):
+            """Run the task and finalize the schedule status once it settles."""
+            try:
+                result = runner_fn(*args, **kwargs)
+            except InterruptedError:
+                self._finalize_job(job.id, "CANCELLED")
+                raise
+            except Exception:
+                self._finalize_job(job.id, "FAILED")
+                raise
+            status, items = self._status_from_result(result)
+            self._finalize_job(job.id, status, items)
+            return result
 
         now = datetime.now(timezone.utc)
         # Add slight jitter to next run to prevent predictable burst traffic
         jitter_minutes = random.uniform(-10, 10)
         next_run = now + timedelta(hours=job.interval_hours, minutes=jitter_minutes)
 
+        # Mark RUNNING *before* submitting: the worker thread finalizes the status the
+        # moment it settles, so a late write here would clobber a fast task's outcome
+        # back to RUNNING (the exact "stuck on RUNNING" symptom).
         job.last_run_at = now
         job.next_run_at = next_run
         job.last_status = "RUNNING"
+        self._save_config()
+
+        task_id = task_engine.submit_task(
+            task_type=job.task_type,
+            task_name=f"{name_prefix} (Auto)",
+            fn=_tracked_runner,
+            total_steps=6 if job.task_type == "google_jobs_scan" else 3
+        )
+
         job.last_task_id = task_id
         self._save_config()
 

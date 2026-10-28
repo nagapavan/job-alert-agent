@@ -124,3 +124,86 @@ def test_scheduler_forced_run_proceeds_with_consent(monkeypatch):
     monkeypatch.setattr(dbmod, "has_consent", lambda db, key: True)
     with patch("backend.main._run_linkedin_sync_task_runner", return_value={"jobs_found": 0}):
         assert scheduler.run_job_now("sched_linkedin_sync", force=True) is not None
+
+
+# -------------------------------------------------------------
+# Run-status finalization (a completed run must leave RUNNING)
+# -------------------------------------------------------------
+def _wait_for_terminal_status(job, timeout: float = 3.0):
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline and job.last_status == "RUNNING":
+        time.sleep(0.02)
+    return job
+
+
+def test_status_from_result_mapping():
+    assert scheduler._status_from_result({"jobs_found": 3}) == ("COMPLETED", 3)
+    assert scheduler._status_from_result({"jobs_found": 2, "skipped": "consent_required"}) == (
+        "SKIPPED",
+        2,
+    )
+    assert scheduler._status_from_result(None) == ("COMPLETED", 0)
+
+
+@patch("backend.main._run_google_jobs_task_runner")
+def test_scheduled_run_finalizes_completed_status(mock_runner, monkeypatch, tmp_path):
+    """Completion replaces RUNNING with COMPLETED and records the item count."""
+    import backend.scheduler as sched_mod
+
+    monkeypatch.setattr(sched_mod, "SCHEDULER_CONFIG_FILE", tmp_path / "sched.json")
+    mock_runner.return_value = {"jobs_found": 7}
+    scheduler.run_job_now("sched_google_jobs")
+    job = _wait_for_terminal_status(scheduler._jobs["sched_google_jobs"])
+    assert job.last_status == "COMPLETED"
+    assert job.last_items_count == 7
+
+
+@patch("backend.main._run_google_jobs_task_runner")
+def test_scheduled_run_finalizes_failed_status(mock_runner, monkeypatch, tmp_path):
+    import backend.scheduler as sched_mod
+
+    monkeypatch.setattr(sched_mod, "SCHEDULER_CONFIG_FILE", tmp_path / "sched.json")
+    mock_runner.side_effect = RuntimeError("boom")
+    scheduler.run_job_now("sched_google_jobs")
+    job = _wait_for_terminal_status(scheduler._jobs["sched_google_jobs"])
+    assert job.last_status == "FAILED"
+
+
+@patch("backend.main._run_google_jobs_task_runner")
+def test_scheduled_run_finalizes_skipped_status(mock_runner, monkeypatch, tmp_path):
+    """A runner that declines (e.g. browser profile busy) must not be reported as COMPLETED."""
+    import backend.scheduler as sched_mod
+
+    monkeypatch.setattr(sched_mod, "SCHEDULER_CONFIG_FILE", tmp_path / "sched.json")
+    mock_runner.return_value = {"jobs_found": 0, "skipped": "browser_profile_busy"}
+    scheduler.run_job_now("sched_google_jobs")
+    job = _wait_for_terminal_status(scheduler._jobs["sched_google_jobs"])
+    assert job.last_status == "SKIPPED"
+
+
+def test_stale_running_status_reconciled_on_load(tmp_path, monkeypatch):
+    """A RUNNING status persisted by a dead process must not show as permanently running."""
+    import json
+    import backend.scheduler as sched_mod
+
+    cfg = tmp_path / "scheduler_config.json"
+    cfg.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "sched_google_jobs",
+                    "name": "Google",
+                    "task_type": "google_jobs_scan",
+                    "description": "kept",
+                    "interval_hours": 6.0,
+                    "is_enabled": True,
+                    "last_status": "RUNNING",
+                }
+            ]
+        )
+    )
+    monkeypatch.setattr(sched_mod, "SCHEDULER_CONFIG_FILE", cfg)
+    fresh = sched_mod.PeriodicScheduler(check_interval_seconds=9999)
+    assert fresh._jobs["sched_google_jobs"].last_status == "INTERRUPTED"
