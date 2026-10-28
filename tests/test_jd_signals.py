@@ -52,6 +52,29 @@ def test_parse_experience_hyphenated_technology():
     assert tech[0]["min_years"] == 3
 
 
+def test_parse_experience_badge_does_not_capture_ui_word():
+    """A portal "N+ years" badge must not become a technology from following UI chrome."""
+    for text in ("3+ years View", "... ₹1 INR • 3+ Years View job"):
+        hints = parse_experience(text)
+        assert len(hints) == 1
+        assert hints[0]["scope"] == "total"
+        assert hints[0]["technology"] is None
+
+
+def test_parse_experience_badge_does_not_cross_newline():
+    """A standalone badge on its own line must not reach the next line's word."""
+    hints = parse_experience("Full-time\n3+ years\nApply\nSave\nAbout us")
+    assert len(hints) == 1
+    assert hints[0]["scope"] == "total"
+    assert hints[0]["technology"] is None
+
+
+def test_parse_experience_inline_technology_still_captured():
+    """The inline cases must keep working after the badge fix."""
+    assert parse_experience("3+ years React")[0]["technology"] == "React"
+    assert parse_experience("3 years experience in Python")[0]["technology"] == "Python"
+
+
 def test_parse_education_abbreviations():
     assert parse_education("B.Tech in Computer Science") == ["bachelor"]
     assert parse_education("M.Tech / M.E. preferred") == ["master"]

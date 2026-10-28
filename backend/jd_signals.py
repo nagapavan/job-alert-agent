@@ -19,6 +19,10 @@ _NON_TECHNOLOGY = {
     "experience", "professional", "industry", "software", "engineering",
     "related", "work", "hands-on", "handson", "relevant", "technical",
     "development", "product", "commercial", "production", "full", "total",
+    # Portal UI chrome/actions that can trail a standalone "N+ years" badge
+    # (e.g. "... 3+ Years  View job", "3+ years  Apply  Save").
+    "view", "apply", "save", "share", "bookmark", "follow", "login", "sign",
+    "register", "more", "details", "description", "overview", "print", "copy",
 }
 
 _EXPERIENCE_PATTERNS = [
@@ -29,7 +33,10 @@ _EXPERIENCE_PATTERNS = [
     (re.compile(rf"{_YEARS_NUM}\s*-?\s*{_YEARS_UNIT}\s+(?:of\s+)?(?:relevant\s+|professional\s+|industry\s+)?experience", re.I), "min"),
 ]
 
-_SCOPE_FOLLOW = re.compile(r"\s*(?:(?:of|in|with)\s+)?([A-Za-z][\w+#/-]{1,29})")
+# Horizontal whitespace only: a technology reference is inline. A standalone
+# "N+ years" badge lives on its own line, so it must NOT reach across a newline
+# to grab the next capitalized word (e.g. "3+ years\nApply" or "...3+ Years View job").
+_SCOPE_FOLLOW = re.compile(r"[ \t]*(?:(?:of|in|with)[ \t]+)?([A-Za-z][\w+#/-]{1,29})")
 
 # "N years experience in/with <Tech>" — skip the connector and capture the technology.
 _EXPERIENCE_CONNECTOR = re.compile(
