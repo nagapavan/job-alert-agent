@@ -373,4 +373,31 @@ def test_sidepanel_prefers_async_extractor():
     assert "__jobAgentExtractJobInfoAsync" in src
 
 
+def test_workatastartup_uses_meta_description_before_generic_tiers():
+    """workatastartup.com must read the page's clean meta description, not whole-page text.
+
+    The rendered page includes an "Other jobs at <company>" list and Apply/Save/View
+    chrome; the generic tiers would fold those unrelated postings into the JD and
+    pollute match scoring (regression: phantom "3+ Years View job" must-haves).
+    """
+    src = _read("content/ats-autofill.js")
+    assert "workatastartup.com" in src
+    assert 'metaContent("description")' in src
+    assert 'metaContent("og:description")' in src
+    # The site adapter runs before the generic container/text tiers.
+    assert src.index("workatastartup.com") < src.index("// Tier 1: known ATS containers")
+    # It bails out (letting generic tiers run) when no usable meta description exists.
+    assert "if (!description || description.length < 200) return null;" in src
+
+
+def test_workatastartup_extractor_strips_markdown_and_derives_company():
+    """The meta description is markdown-ish and the company comes from the title/breadcrumb."""
+    src = _read("content/ats-autofill.js")
+    helper = src[src.index("function extractWorkAtAStartup"):]
+    helper = helper[: helper.index("\n  function extractJobMetadata")]
+    assert ".replace(/\\*\\*/g, \"\")" in helper
+    assert "atMatch" in helper
+    assert "a[href*='/companies/']" in helper
+
+
 

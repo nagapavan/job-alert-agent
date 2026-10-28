@@ -411,12 +411,70 @@
     return best;
   }
 
+  // -------------------------------------------------------------
+  // workatastartup.com (Y Combinator) — dedicated job extractor
+  // -------------------------------------------------------------
+  // The page ships the full, clean job description in a meta tag. The rendered
+  // page ALSO contains an "Other jobs at <company>" list plus Apply/Save/View
+  // chrome; the generic tiers would capture all of it and pollute match scoring
+  // with unrelated postings (e.g. "3+ Years View job"). Prefer the meta
+  // description and skip the generic fallbacks entirely.
+  function extractWorkAtAStartup() {
+    const metaContent = (prop) => {
+      const el =
+        document.querySelector(`meta[property="${prop}"]`) ||
+        document.querySelector(`meta[name="${prop}"]`);
+      return el ? (el.getAttribute("content") || "").trim() : "";
+    };
+
+    let description = metaContent("description") || metaContent("og:description");
+    if (!description || description.length < 200) return null;
+
+    // The field is markdown-ish (e.g. "**PMLA**"); drop the emphasis markers.
+    description = description
+      .replace(/\*\*/g, "")
+      .replace(/\r/g, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+    const rawTitle =
+      metaContent("title") || metaContent("og:title") || document.title || "";
+    // "Principal Officer at GoSats | Y Combinator's Work at a Startup"
+    const head = rawTitle.split("|")[0].trim();
+    const atMatch = head.match(/^(.*?)\s+at\s+(.+)$/i);
+    const title = (atMatch ? atMatch[1] : head).trim();
+    let company = atMatch ? atMatch[2].trim() : "";
+
+    if (!company) {
+      // Breadcrumb "Companies / GoSats (W22) / Jobs"
+      const link = Array.from(document.querySelectorAll("a[href*='/companies/']"))
+        .map((a) => (a.textContent || "").trim())
+        .find((t) => t && !/^companies$/i.test(t));
+      if (link) company = link.replace(/\s*\([^)]*\)\s*$/, "").trim();
+    }
+
+    return {
+      title: title || document.title || "Target Position",
+      company: company || "Target Company",
+      description: description.slice(0, 15000),
+      url: window.location.href,
+      atsType: "custom",
+    };
+  }
+
   function extractJobMetadata() {
     let title = "";
     let company = "";
     let description = "";
 
     const ats = detectAtsType();
+
+    // workatastartup.com: use the page's clean meta description and never the
+    // generic whole-page tiers (which include "Other jobs" + UI chrome).
+    if ((window.location.hostname || "").toLowerCase().includes("workatastartup.com")) {
+      const waas = extractWorkAtAStartup();
+      if (waas) return waas;
+    }
 
     // 1. Title Extraction
     const titleSelectors = [
