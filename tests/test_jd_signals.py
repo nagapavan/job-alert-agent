@@ -75,6 +75,25 @@ def test_parse_experience_inline_technology_still_captured():
     assert parse_experience("3 years experience in Python")[0]["technology"] == "Python"
 
 
+def test_parse_experience_scope_words_are_not_technologies():
+    """Scope/role/adjective words after "N+ years" must not become technologies."""
+    cases = (
+        "8 years of experience in Site Reliability Engineering",
+        "12+ years of IT and business/industry experience",
+        "8+ years of Backend software engineering experience",
+        "8+ Years of Strong knowledge of aerospace software",
+        "8+ Years of Proven experience defining software verification",
+        "6+ Years of Solid understanding of avionics",
+        "4+ years of Designing and operating distributed systems",
+        "8+ years of People management",
+        "3+ years AI-related experience",
+    )
+    for text in cases:
+        hint = parse_experience(text)[0]
+        assert hint["scope"] == "total", text
+        assert hint["technology"] is None, text
+
+
 def test_parse_education_abbreviations():
     assert parse_education("B.Tech in Computer Science") == ["bachelor"]
     assert parse_education("M.Tech / M.E. preferred") == ["master"]
