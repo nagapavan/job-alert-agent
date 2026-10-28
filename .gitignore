@@ -36,3 +36,17 @@ PROJECT_INDEX.md
 DEVELOPMENT_NOTES.md
 
 .opencode/
+
+# EGM drift report (dated, transient analysis artifact — never committed)
+*_DRIFT_REPORT.md
+
+# EGM-generated per-directory contract READMEs (bootstrap artifact — not committed)
+backend/README.md
+backend/ats/README.md
+backend/scripts/README.md
+extension/background/README.md
+extension/content/README.md
+extension/js/README.md
+extension/sidepanel/README.md
+frontend/README.md
+scripts/README.md
