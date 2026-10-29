@@ -136,6 +136,7 @@ from backend.preference_filter import (
 from backend.resume_index import index_resume_chunks, top_evidence
 from backend.scheduler import ScheduledJobConfig, scheduler
 from backend.scraper import (
+    ats_for_url,
     evaluate_job_due_diligence,
     extract_opportunity_company_and_title,
     extract_portal_info_from_job_url,
@@ -3779,11 +3780,17 @@ def _execute_ats_scrape(
         if _ats_on and _flags.get("ats_uber") and "uber" in comp_lower:
             discovered_jobs.extend(scrape_uber_jobs()[:35])
 
-        # B–C. Config-driven ATS portals (Greenhouse/Lever/Ashby/SmartRecruiters/Workable).
+        # B–C. Config-driven ATS portals (Greenhouse/Lever/Ashby/SmartRecruiters/Workable/Workday).
         # One loop over data/ats_portals.json; each portal is gated by its own opt-in feature flag.
-        # Uber (A), Workday (D) and Custom HTML (E) stay bespoke.
+        # A careers_url that *is* an ATS board pins the scan to that portal. Any other careers_url
+        # (auto-derived `https://www.<domain>/careers`, a direct portal) is never usable as a board
+        # slug, so those companies are probed by name instead (Uber (A) and Custom HTML (D) stay
+        # bespoke).
+        _pinned_portal = ats_for_url(comp.careers_url) if comp.careers_url else None
         for _portal in _ATS_PORTALS:
             if not (_ats_on and _flags.get(_portal.default_flag)):
+                continue
+            if _pinned_portal and _portal.id != _pinned_portal:
                 continue
             _portal_fn = globals()[_portal.scraper_attr]
             _portal_jobs = _portal_fn(
@@ -3793,28 +3800,12 @@ def _execute_ats_scrape(
                 location_filters=loc_filters,
                 work_mode=wm_filter,
                 max_matches=35,
-                careers_url=comp.careers_url,
+                careers_url=comp.careers_url if _pinned_portal == _portal.id else None,
             )
             if _portal_jobs:
                 discovered_jobs.extend(_portal_jobs)
 
-        # D. Workday — still dispatched by its own block here: the engine's `post_json` shape and
-        # `workday_board` resolver land in a follow-up change, after which this block is removed and
-        # Workday joins the config-driven loop above.
-        if _ats_on and _flags.get("ats_workday"):
-            wd_jobs = scrape_workday_jobs(
-                comp.name,
-                title_filters=title_filters,
-                city_filters=city_filters,
-                location_filters=loc_filters,
-                work_mode=wm_filter,
-                max_matches=35,
-                careers_url=comp.careers_url,
-            )
-            if wd_jobs:
-                discovered_jobs.extend(wd_jobs)
-
-        # E. Custom HTML portal scraper — opt-in (arbitrary HTML scraping)
+        # D. Custom HTML portal scraper — opt-in (arbitrary HTML scraping)
         if _ats_on and _flags.get("ats_custom_html") and comp.careers_url:
             custom_jobs = scrape_custom_jobs(comp.careers_url)
             if custom_jobs:
@@ -7047,6 +7038,23 @@ def _run_google_jobs_task_runner(
                     raw_jobs = fetch_google_jobs(
                         query=q_str, location=location, max_results=10
                     )
+                    # google.com/robots.txt disallows /search, so the direct SERP path is normally
+                    # gated off and returns []. Fall back to the browser renderer instead of
+                    # reporting an empty scan.
+                    if not raw_jobs:
+                        logger.info(
+                            f"[Google Jobs] Direct SERP unavailable for '{q_str}' "
+                            "(robots-gated); falling back to the Playwright renderer."
+                        )
+                        try:
+                            with sync_playwright() as p:
+                                raw_jobs = fetch_google_jobs_playwright(
+                                    p, query=q_str, location=location, headless=True
+                                )
+                        except Exception as p_err:
+                            logger.debug(
+                                f"Playwright fallback for Google Jobs failed for '{q_str}': {p_err}"
+                            )
 
                 # Opt-in fallback: the direct SERP is often blocked, so try the open-source
                 # JobSpy aggregator when the flag is enabled and the direct path found nothing.

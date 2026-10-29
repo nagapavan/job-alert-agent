@@ -195,8 +195,46 @@ def search_ddg(query: str, max_results: int = 5) -> List[Dict[str, str]]:
 # -------------------------------------------------------------
 
 
+# Canonical ATS host markers, keyed by the portal id used in data/ats_portals.json.
+ATS_HOST_MARKERS = {
+    "greenhouse": ("greenhouse.io",),
+    "lever": ("lever.co",),
+    "ashby": ("ashbyhq.com",),
+    "smartrecruiters": ("smartrecruiters.com",),
+    "workable": ("workable.com",),
+    "workday": ("myworkdayjobs.com", "workday.com"),
+}
+
+
+def ats_for_url(url: str) -> Optional[str]:
+    """Returns the portal id that owns ``url``'s host, else None.
+
+    Keeps a scan pinned to the ATS board a company actually lives on, so a careers URL is never
+    reused as another portal's board slug (see docs/ATS_PORTALS.md §Risk tiers).
+    """
+    if not url or not isinstance(url, str) or not url.strip():
+        return None
+    try:
+        parsed = urllib.parse.urlparse(url.strip() if "://" in url else f"https://{url.strip()}")
+        host = (parsed.hostname or "").lower()
+    except Exception:
+        return None
+    if not host:
+        return None
+    for portal_id, markers in ATS_HOST_MARKERS.items():
+        for marker in markers:
+            if host == marker or host.endswith("." + marker):
+                return portal_id
+    return None
+
+
 def extract_slug_from_careers_url(url_or_name: str, ats: str) -> str:
-    """Extracts clean board slug from career portal URL or company name."""
+    """Extracts clean board slug from career portal URL or company name.
+
+    A URL that is not on ``ats``'s own host yields ``""`` — never the URL itself — so callers
+    skip the portal instead of requesting ``/companies/https://careers.example.com/postings``.
+    A plain company name still degrades to a name-derived slug for board discovery.
+    """
     if not url_or_name or not url_or_name.strip():
         return ""
     val = url_or_name.strip()
@@ -213,6 +251,8 @@ def extract_slug_from_careers_url(url_or_name: str, ats: str) -> str:
             parsed = urllib.parse.urlparse(val if "://" in val else f"https://{val}")
             path = parsed.path
             host = (parsed.hostname or "").lower()
+            if ats in ATS_HOST_MARKERS and ats_for_url(val) != ats:
+                return ""
             if ats == "greenhouse":
                 if "for=" in val:
                     params = urllib.parse.parse_qs(parsed.query)
@@ -1024,15 +1064,118 @@ def unwrap_google_redirect_url(url: str) -> str:
     return url
 
 
+_GOOGLE_ALERT_ROLE_WORDS = (
+    "engineer", "developer", "manager", "analyst", "designer", "scientist", "architect",
+    "lead", "intern", "consultant", "administrator", "recruiter", "specialist", "director",
+    "programmer", "devops", "sre", "qa", "tester",
+)
+
+_GOOGLE_ALERT_SPLIT_RE = re.compile(r"\s+[-–—|·]\s+|\s+at\s+", re.I)
+_GOOGLE_ALERT_BLOCK_RE = re.compile(r"[\n•·]+")
+
+
+def _clean_alert_segment(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", value or "").strip(" \t-–—•|·,;")
+    # Drop Google search operators / connector words that leak into snippet text.
+    return re.sub(r"^(site:\S+|for|and)\s+", "", cleaned, flags=re.I)
+
+
+def _parse_google_alert_text(text: str, email_subject: str = "") -> List[Dict[str, Any]]:
+    """Extracts opportunity candidates from a plain-text Google Alerts snippet.
+
+    Gmail is read metadata+snippet only (never the message body), so an alert's tracking links are
+    not available on this path: candidates carry a title/company but no URL. Kept deliberately
+    conservative — a block must contain a role word and a short, role-free company segment to
+    become an opportunity, because snippet text is lossy and a false positive costs a real row.
+    """
+    body = re.sub(r"^\s*Google\s+Alert\s*[-–—:]\s*", "", text or "", flags=re.I)
+    body = re.sub(r"^.*?\d+\s+new\s+results?\s+for\s+", "", body, flags=re.I)
+    query_match = re.match(r"^\s*Google\s+Alert\s*[-–—:]\s*(.+)$", email_subject or "", re.I)
+    if query_match:
+        query = query_match.group(1).strip()
+        if query:
+            stripped = re.sub(r"^\s*" + re.escape(query) + r"\s*", "", body, flags=re.I)
+            # Only drop the echoed query when a real posting survives it; otherwise the query is
+            # itself the title ("Google Alert - software engineer" + "Software Engineer - Acme").
+            if stripped != body and any(
+                word in stripped.lower() for word in _GOOGLE_ALERT_ROLE_WORDS
+            ):
+                body = stripped
+
+    jobs: List[Dict[str, Any]] = []
+    for block in _GOOGLE_ALERT_BLOCK_RE.split(body):
+        parts = [_clean_alert_segment(p) for p in _GOOGLE_ALERT_SPLIT_RE.split(block or "")]
+        parts = [p for p in parts if p]
+        if not parts:
+            continue
+        role_idx = next(
+            (
+                i
+                for i, part in enumerate(parts)
+                if any(word in part.lower() for word in _GOOGLE_ALERT_ROLE_WORDS)
+            ),
+            None,
+        )
+        if role_idx is None:
+            continue
+        title = parts[role_idx]
+        if not 3 <= len(title) <= 120:
+            continue
+        company = ""
+        for candidate in parts[role_idx + 1: role_idx + 2] + parts[max(0, role_idx - 1): role_idx]:
+            if (
+                candidate
+                and candidate != title
+                and 2 <= len(candidate) <= 40
+                and len(candidate.split()) <= 4
+                and not any(word in candidate.lower() for word in _GOOGLE_ALERT_ROLE_WORDS)
+            ):
+                company = candidate
+                break
+        if not company:
+            continue
+        jobs.append(
+            {
+                "title": title,
+                "company": company,
+                "location": "Remote / Various",
+                "salary_range": "Competitive",
+                "description": f"Discovered via Google Alert: {email_subject}".strip(),
+                "url": "",
+                "posted_at": "Recently Discovered",
+                "source": "Google Alerts",
+                "source_type": "Google",
+            }
+        )
+        if len(jobs) >= 5:
+            break
+
+    seen = set()
+    unique_jobs = []
+    for job in jobs:
+        key = (job["title"].lower(), job["company"].lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_jobs.append(job)
+    return unique_jobs
+
+
 def parse_google_alerts_digest(
     email_html_or_text: str, email_subject: str = ""
 ) -> List[Dict[str, Any]]:
     """
     Parses Google Alerts digest emails (from googlealerts-noreply@google.com).
     Decodes tracking redirects and extracts job title, source employer/site, and snippet.
+
+    Accepts HTML (real message body: links decoded into ``url``) or the plain-text snippet that
+    the Gmail scan paths can actually read — see ``_parse_google_alert_text``.
     """
     if not email_html_or_text or not email_html_or_text.strip():
         return []
+
+    if "<" not in email_html_or_text:
+        return _parse_google_alert_text(email_html_or_text, email_subject)
 
     jobs = []
     soup = BeautifulSoup(email_html_or_text, "html.parser")

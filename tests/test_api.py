@@ -508,8 +508,8 @@ def test_trigger_jobs_scrape(mock_gh, mock_intel):
 def test_trigger_jobs_scrape_forwards_filters_to_new_portals(
     mock_gh, mock_lev, mock_ashby, mock_sr, mock_wk, mock_wd
 ):
-    """SmartRecruiters/Workable are dispatched after the earlier portals miss, and receive the
-    candidate's filters (title/location/work-mode) unchanged."""
+    """With no careers_url the company has no ATS affinity, so every enabled portal is probed by
+    name and receives the candidate's filters (title/location/work-mode) unchanged."""
     mock_gh.return_value = []
     mock_lev.return_value = []
     mock_ashby.return_value = []
@@ -535,10 +535,7 @@ def test_trigger_jobs_scrape_forwards_filters_to_new_portals(
     with patch("backend.main.gather_company_intelligence"):
         comp = client.post(
             "/api/companies",
-            json={
-                "name": "AcmePortalTest",
-                "careers_url": "https://apply.workable.com/acmeportaltest/",
-            },
+            json={"name": "AcmePortalTest"},
         ).json()
         res = client.post(
             "/api/jobs/scrape",
@@ -558,6 +555,58 @@ def test_trigger_jobs_scrape_forwards_filters_to_new_portals(
         assert kwargs["location_filters"] == ["india"]
         assert kwargs["work_mode"] == "remote"
         assert kwargs["max_matches"] == 35
+        # The auto-derived careers_url is not an ATS board, so it is never forwarded as a slug.
+        assert kwargs["careers_url"] is None
+
+
+@patch("backend.main.scrape_workday_jobs")
+@patch("backend.main.scrape_workable_jobs")
+@patch("backend.main.scrape_smartrecruiters_jobs")
+@patch("backend.main.scrape_ashby_jobs")
+@patch("backend.main.scrape_lever_jobs")
+@patch("backend.main.scrape_greenhouse_jobs")
+def test_trigger_jobs_scrape_pins_company_to_its_ats_board(
+    mock_gh, mock_lev, mock_ashby, mock_sr, mock_wk, mock_wd
+):
+    """A careers_url pins the scan to the portal that owns it: a Workable board is never re-probed
+    as a Greenhouse/Lever/Ashby/SmartRecruiters/Workday slug."""
+    for mock in (mock_gh, mock_lev, mock_ashby, mock_sr, mock_wk, mock_wd):
+        mock.return_value = []
+    client.put(
+        "/api/preferences",
+        json={
+            "features": {
+                "ats_smartrecruiters": True,
+                "ats_workable": True,
+                "ats_workday": True,
+            },
+            "consents": {
+                "ats_smartrecruiters": {"ack": True},
+                "ats_workable": {"ack": True},
+                "ats_workday": {"ack": True},
+            },
+        },
+    )
+    with patch("backend.main.gather_company_intelligence"):
+        comp = client.post(
+            "/api/companies",
+            json={
+                "name": "AcmePinnedPortal",
+                "careers_url": "https://apply.workable.com/acmepinned/",
+            },
+        ).json()
+        res = client.post(
+            "/api/jobs/scrape",
+            json={"company_id": comp["id"]},
+        )
+    assert res.status_code == 200
+
+    assert mock_wk.called
+    assert not mock_gh.called
+    assert not mock_lev.called
+    assert not mock_ashby.called
+    assert not mock_sr.called
+    assert not mock_wd.called
 
 
 @patch("backend.main.launch_assisted_application_session")

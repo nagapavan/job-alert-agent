@@ -25,6 +25,7 @@ GMAIL_QUERY = (
     'newer_than:90d (from:greenhouse.io OR from:lever.co OR from:ashbyhq.com '
     'OR from:myworkdayjobs.com OR from:workday.com OR from:smartrecruiters.com '
     'OR from:workable.com OR from:icims.com OR from:taleo.net OR from:linkedin.com '
+    'OR from:googlealerts-noreply@google.com '
     'OR subject:interview OR subject:offer OR subject:"next steps" '
     'OR subject:regret OR subject:"not moving forward" '
     'OR subject:"job alert" OR subject:opportunity OR subject:application)'

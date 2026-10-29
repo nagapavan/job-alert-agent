@@ -245,6 +245,7 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
             "(from:greenhouse.io OR from:lever.co OR from:ashbyhq.com OR from:myworkdayjobs.com "
             "OR from:workday.com OR from:smartrecruiters.com OR from:workable.com "
             "OR from:icims.com OR from:taleo.net OR from:linkedin.com "
+            "OR from:googlealerts-noreply@google.com "
             "OR subject:interview OR subject:offer OR subject:\"next steps\" "
             "OR subject:regret OR subject:\"not moving forward\" OR subject:\"application\" "
             "OR subject:\"job alert\" OR subject:opportunity)"
@@ -261,9 +262,11 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
             context.close()
             return []
 
-        # Wait for search box or email row table to be interactive
+        # Wait for the result grid itself, not the page shell: the search box exists as soon as the
+        # SPA boots, so waiting on it made the row check below run before any rows rendered and sent
+        # every scan down the search-box fallback path.
         try:
-            page.wait_for_selector("input[aria-label='Search mail'], input[name='q'], tr.zA", timeout=15000)
+            page.wait_for_selector("tr.zA", timeout=15000)
         except Exception:
             pass
 

@@ -6,9 +6,12 @@ import pytest
 from backend.matchers import check_title_match as main_check
 from backend.matchers import ROLE_EXPANSIONS, check_title_match
 from backend.scraper import (
+    ats_for_url,
     evaluate_job_due_diligence,
+    extract_slug_from_careers_url,
     find_talent_partners,
     gather_company_intelligence,
+    parse_google_alerts_digest,
     scrape_ashby_jobs,
     scrape_custom_jobs,
     scrape_greenhouse_jobs,
@@ -20,6 +23,86 @@ from backend.scraper import (
     search_ddg,
     unwrap_shortened_url,
 )
+
+
+# -------------------------------------------------------------
+# Unit Tests: ATS Portal Affinity & Slug Extraction
+# -------------------------------------------------------------
+def test_ats_for_url_identifies_owning_portal():
+    assert ats_for_url("https://jobs.lever.co/stripe") == "lever"
+    assert ats_for_url("https://boards.greenhouse.io/stripe") == "greenhouse"
+    assert ats_for_url("https://acme.workable.com/x") == "workable"
+    assert ats_for_url("https://acme.wd5.myworkdayjobs.com/en-US/Ext") == "workday"
+    assert ats_for_url("https://api.smartrecruiters.com/v1/companies/stripe/postings") == "smartrecruiters"
+
+
+def test_ats_for_url_returns_none_for_non_ats_hosts():
+    assert ats_for_url("https://careers.microsoft.com") is None
+    assert ats_for_url("https://www.stripe.com/careers") is None
+    assert ats_for_url("") is None
+
+
+def test_extract_slug_from_careers_url_never_reuses_a_foreign_url_as_slug():
+    """A careers URL that is not on the portal's own host must yield no slug at all."""
+    assert extract_slug_from_careers_url("https://careers.microsoft.com", "smartrecruiters") == ""
+    assert extract_slug_from_careers_url("https://www.linkedin.com/company/acme", "smartrecruiters") == ""
+    assert extract_slug_from_careers_url("https://jobs.lever.co/stripe", "greenhouse") == ""
+    assert extract_slug_from_careers_url("https://www.stripe.com/careers", "greenhouse") == ""
+
+
+def test_extract_slug_from_careers_url_extracts_matching_boards():
+    assert extract_slug_from_careers_url("https://careers.smartrecruiters.com/stripe", "smartrecruiters") == "stripe"
+    assert extract_slug_from_careers_url("https://boards.greenhouse.io/stripe", "greenhouse") == "stripe"
+    assert extract_slug_from_careers_url("https://jobs.lever.co/stripe", "lever") == "stripe"
+    assert extract_slug_from_careers_url("https://jobs.ashbyhq.com/acme", "ashby") == "acme"
+    assert extract_slug_from_careers_url("https://apply.workable.com/acme/", "workable") == "acme"
+
+
+def test_extract_slug_from_careers_url_keeps_name_derived_discovery():
+    """A plain company name still degrades to a board guess so name-derived discovery works."""
+    assert extract_slug_from_careers_url("Stripe", "greenhouse") == "stripe"
+    assert extract_slug_from_careers_url("Acme Corp", "lever") == "acmecorp"
+
+
+# -------------------------------------------------------------
+# Unit Tests: Google Alerts Digest Parsing
+# -------------------------------------------------------------
+def test_parse_google_alerts_digest_from_html_body():
+    html = (
+        '<a href="https://www.google.com/url?q=https://boards.greenhouse.io/acme/jobs/1">'
+        "Senior Backend Engineer</a>"
+    )
+    jobs = parse_google_alerts_digest(html, "Google Alert - backend")
+    assert len(jobs) == 1
+    assert jobs[0]["title"] == "Senior Backend Engineer"
+    assert jobs[0]["url"] == "https://boards.greenhouse.io/acme/jobs/1"
+
+
+def test_parse_google_alerts_digest_from_plain_snippet():
+    """The Gmail scan paths only read a plain-text snippet; parsing must not require anchors."""
+    jobs = parse_google_alerts_digest(
+        "Software Engineer - Acme Corp - Bengaluru, Karnataka - Indeed.com",
+        "Google Alert - software engineer",
+    )
+    assert len(jobs) == 1
+    assert jobs[0]["title"] == "Software Engineer"
+    assert jobs[0]["company"] == "Acme Corp"
+    assert jobs[0]["source"] == "Google Alerts"
+
+
+def test_parse_google_alerts_digest_plain_snippet_strips_alert_boilerplate():
+    jobs = parse_google_alerts_digest(
+        "1 new result for site:jobs.lever.co Backend Engineer at Notion",
+        "Google Alert - lever",
+    )
+    assert len(jobs) == 1
+    assert jobs[0]["title"] == "Backend Engineer"
+    assert jobs[0]["company"] == "Notion"
+
+
+def test_parse_google_alerts_digest_ignores_non_job_snippets():
+    assert parse_google_alerts_digest("Your weekly digest of unrelated news", "Google Alert - news") == []
+    assert parse_google_alerts_digest("", "Google Alert - x") == []
 
 
 # -------------------------------------------------------------

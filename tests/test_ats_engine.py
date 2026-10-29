@@ -564,3 +564,32 @@ def test_workday_map_item_uses_passed_ctx_not_instance_state():
     assert "b.wd5.myworkdayjobs.com" in url_b
     assert url_a == url_a2
     assert not hasattr(scraper, "_ctx")
+
+
+# -------------------------------------------------------------
+# Permission gate reporting
+# -------------------------------------------------------------
+def test_blocked_host_is_reported_once_per_run(monkeypatch, caplog):
+    """A robots-blocked host must not emit one INFO line per company in a run."""
+    import logging as _logging
+
+    from backend.ats.engine import _BLOCKED_HOSTS_REPORTED, _http, clear_active_pacer
+
+    monkeypatch.setattr("backend.scraper.may_fetch", lambda url, *a, **k: False)
+    _BLOCKED_HOSTS_REPORTED.clear()
+    cfg = PortalConfig(id="smartrecruiters", label="SmartRecruiters", shape="paginated_json", list_url="")
+
+    with caplog.at_level(_logging.INFO, logger="scraper.ats"):
+        for slug in ("stripe", "gitlab", "openai"):
+            assert _http("GET", f"https://api.smartrecruiters.com/v1/companies/{slug}/postings", cfg=cfg) is None
+
+    infos = [r for r in caplog.records if r.levelno == _logging.INFO]
+    assert len(infos) == 1
+    assert "api.smartrecruiters.com" in infos[0].getMessage()
+
+    # A new run reports the host again.
+    caplog.clear()
+    clear_active_pacer()
+    with caplog.at_level(_logging.INFO, logger="scraper.ats"):
+        _http("GET", "https://api.smartrecruiters.com/v1/companies/stripe/postings", cfg=cfg)
+    assert len([r for r in caplog.records if r.levelno == _logging.INFO]) == 1
