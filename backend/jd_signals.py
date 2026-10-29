@@ -19,6 +19,12 @@ _NON_TECHNOLOGY = {
     "experience", "professional", "industry", "software", "engineering",
     "related", "work", "hands-on", "handson", "relevant", "technical",
     "development", "product", "commercial", "production", "full", "total",
+    # Scope/role/adjective words that can follow "N+ years of/in" without naming a
+    # technology (e.g. "8 years of experience in Site Reliability", "8+ Years of
+    # Strong knowledge", "12+ years of IT and business", "8+ years of Backend
+    # software engineering", "4+ years of Designing and operating").
+    "site", "it", "backend", "frontend", "fullstack", "full-stack",
+    "proven", "strong", "solid", "designing", "people", "ai-related",
     # Portal UI chrome/actions that can trail a standalone "N+ years" badge
     # (e.g. "... 3+ Years  View job", "3+ years  Apply  Save").
     "view", "apply", "save", "share", "bookmark", "follow", "login", "sign",
