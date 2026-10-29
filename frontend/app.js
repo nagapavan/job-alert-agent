@@ -1544,6 +1544,11 @@ async function fetchJobs() {
         state.jobs = await res.json();
         updateKPIStats();
         applyJobFilters();
+        // The tracker reads state.jobs directly, so refresh it when it is the visible section.
+        const trackerSection = document.getElementById("tracker-section");
+        if (trackerSection && !trackerSection.classList.contains("hidden")) {
+            renderTrackerList();
+        }
     } catch (e) {
         console.error("Failed to fetch jobs", e);
     }
@@ -3605,29 +3610,43 @@ async function handleChatSubmit(e) {
 }
 
 async function updateJobStatus(jobId, newStatus, selectEl) {
+    const previousStatus = (state.jobs.find(j => j.id === jobId) || {}).status;
     try {
         const res = await fetch(`${API_BASE}/api/jobs/${jobId}/status`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ status: newStatus })
         });
-        if (res.ok) {
-            const updated = await res.json();
-            const idx = state.jobs.findIndex(j => j.id === jobId);
-            if (idx !== -1) state.jobs[idx] = updated;
-            if (selectEl) {
-                const slug = newStatus.toLowerCase().replace(/\s+/g, '-');
-                selectEl.className = `status-dropdown status-${slug}`;
+        if (!res.ok) {
+            let detail = `HTTP ${res.status}`;
+            try {
+                const errBody = await res.json();
+                if (errBody && errBody.detail) detail = errBody.detail;
+            } catch (parseErr) {
+                // Non-JSON error body; keep the status-code message.
             }
-            updateKPIStats();
-            const trackerSection = document.getElementById("tracker-section");
-            if (trackerSection && !trackerSection.classList.contains("hidden")) {
-                renderTrackerList();
-            }
-            showToast(`Status updated to '${newStatus}'`);
+            throw new Error(detail);
         }
+        const updated = await res.json();
+        const idx = state.jobs.findIndex(j => j.id === jobId);
+        if (idx !== -1) state.jobs[idx] = updated;
+        if (selectEl) {
+            const slug = newStatus.toLowerCase().replace(/\s+/g, '-');
+            selectEl.className = `status-dropdown status-${slug}`;
+            selectEl.value = newStatus;
+        }
+        // Re-renders the feed AND refreshes the feed/tracker facet counts from state.jobs.
+        applyJobFilters();
+        const trackerSection = document.getElementById("tracker-section");
+        if (trackerSection && !trackerSection.classList.contains("hidden")) {
+            renderTrackerList();
+        }
+        showToast(`Status updated to '${newStatus}'`);
     } catch (e) {
         console.error("Failed to update job status", e);
+        // Never leave the dropdown showing a stage that was not persisted.
+        if (selectEl && previousStatus) selectEl.value = previousStatus;
+        showToast(`⚠️ Could not update stage: ${e.message}`);
     }
 }
 
