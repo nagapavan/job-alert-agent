@@ -587,19 +587,12 @@
                     </div>
 
                     <div class="tracker-filter-bar">
-                        <div class="tab-group">
-                            <button class="tab-btn active" data-filter="in_progress">🚀 Applied / In Progress (<span
-                                    id="tracker-in-progress-count">0</span>)</button>
-                            <button class="tab-btn" data-filter="shortlisted">⭐ Shortlisted (<span
-                                    id="tracker-shortlisted-count">0</span>)</button>
-                            <button class="tab-btn" data-filter="to_apply">⚪ To Apply (<span
-                                    id="tracker-to-apply-count">0</span>)</button>
-                            <button class="tab-btn" data-filter="all">All Opportunities (<span
-                                    id="tracker-all-count">0</span>)</button>
-                            <button class="tab-btn" data-filter="rejected">📫 Archived / Rejected (<span
-                                    id="tracker-rejected-count">0</span>)</button>
-                            <button class="tab-btn" data-filter="not_interested">🚫 Dismissed (<span
-                                    id="tracker-dismissed-count">0</span>)</button>
+                        <div id="tracker-status-chips" class="status-chip-group">
+                            <!-- Stage chips rendered via app.js -->
+                        </div>
+                        <div class="chip-actions">
+                            <button type="button" id="tracker-chips-all" class="chip-link">All</button>
+                            <button type="button" id="tracker-chips-clear" class="chip-link">Clear</button>
                         </div>
                     </div>
 
@@ -2276,7 +2269,7 @@
     <!-- Notification Toast -->
     <div id="toast" class="toast hidden"></div>
 
-    <script src="app.js?v=20260907_8.7"></script>
+    <script src="app.js?v=20261029_8.8"></script>
 </body>
 
 </html>

@@ -4,6 +4,30 @@
 
 const API_BASE = window.location.origin;
 
+// Application Tracker stage filter: one multi-select chip per canonical status. The list mirrors
+// backend JOB_STATUSES (backend/main.py); a new status only needs to be added here.
+const TRACKER_STATUSES = [
+    "To Apply", "Shortlisted", "Applied", "Screening", "Interview", "Offered", "Rejected", "Not Interested"
+];
+const TRACKER_DEFAULT_STATUSES = ["Applied", "Screening", "Interview"];
+const TRACKER_STATUS_ALIASES = { "Saved": "Shortlisted", "Ignored": "Not Interested" };
+const TRACKER_STATUSES_STORAGE_KEY = "job_agent_tracker_statuses";
+
+function normalizeTrackerStatus(status) {
+    const value = (status || "To Apply").trim();
+    return TRACKER_STATUS_ALIASES[value] || value;
+}
+
+function loadTrackerStatuses() {
+    try {
+        const raw = JSON.parse(localStorage.getItem(TRACKER_STATUSES_STORAGE_KEY) || "null");
+        if (Array.isArray(raw) && raw.length) return raw.map(normalizeTrackerStatus);
+    } catch (e) {
+        // Corrupt value: fall back to the default selection.
+    }
+    return [...TRACKER_DEFAULT_STATUSES];
+}
+
 let state = {
     companies: [],
     catalog: [],
@@ -17,7 +41,7 @@ let state = {
     sourceFilter: "all", // 'all', 'linkedin', 'direct', 'email'
     reviewBatchId: null, // when set, feed is scoped to that sync batch ("view N new")
     lastSync: null, // latest LinkedIn sync summary from /api/linkedin/last-sync
-    trackerFilter: "in_progress", // 'in_progress', 'shortlisted', 'all', 'rejected', 'not_interested'
+    trackerStatuses: loadTrackerStatuses(), // selected tracker stage chips
     companyFilter: "all", // 'all', 'direct', 'network'
     companySearchQuery: "",
     companyLayout: localStorage.getItem("job_agent_company_layout") || "grid", // 'grid', 'list'
@@ -194,14 +218,19 @@ function initEventListeners() {
     if (statusFilter) statusFilter.addEventListener("change", applyJobFilters);
     if (scoreFilter) scoreFilter.addEventListener("change", applyJobFilters);
 
-    // 5. Tracker Filter Tabs
-    document.querySelectorAll("#tracker-section .tab-btn").forEach(btn => {
-        btn.addEventListener("click", () => {
-            document.querySelectorAll("#tracker-section .tab-btn").forEach(b => b.classList.remove("active"));
-            btn.classList.add("active");
-            setTrackerFilter(btn.getAttribute("data-filter"));
+    // 5. Tracker stage chips (multi-select)
+    const trackerChips = document.getElementById("tracker-status-chips");
+    if (trackerChips) {
+        trackerChips.addEventListener("click", (event) => {
+            const chip = event.target.closest(".status-chip");
+            if (chip) toggleTrackerStatus(chip.getAttribute("data-status"));
         });
-    });
+    }
+    const trackerChipsAll = document.getElementById("tracker-chips-all");
+    if (trackerChipsAll) trackerChipsAll.addEventListener("click", () => setTrackerStatuses(trackerChipStatuses()));
+    const trackerChipsClear = document.getElementById("tracker-chips-clear");
+    if (trackerChipsClear) trackerChipsClear.addEventListener("click", () => setTrackerStatuses([]));
+    renderTrackerChips();
 
     // 6. Modal Drawer Clipboard Buttons
     const copyCoverBtn = document.getElementById("copy-cover-letter-btn");
@@ -1802,7 +1831,6 @@ function updateFeedTabCounts() {
     const dismissedCountEl = document.getElementById("feed-count-dismissed");
 
     let cAll = 0, cShortlisted = 0, cToApply = 0, cApplied = 0, cDismissed = 0;
-    let tInProgress = 0, tRejected = 0;
 
     const query = (document.getElementById("job-search-input")?.value || "").toLowerCase();
     const minScore = parseFloat(document.getElementById("score-filter")?.value || "0");
@@ -1812,10 +1840,6 @@ function updateFeedTabCounts() {
 
     state.jobs.forEach(j => {
         const s = j.status || "To Apply";
-
-        // Global tracker metrics
-        if (s === "Applied" || ["Screening", "Interview", "Offered"].includes(s)) tInProgress++;
-        else if (s === "Rejected") tRejected++;
 
         // Feed tab count calculation synchronized with active search & criteria filters
         const matchesQuery = !query || 
@@ -1862,19 +1886,8 @@ function updateFeedTabCounts() {
     if (appliedCountEl) appliedCountEl.innerText = cApplied;
     if (dismissedCountEl) dismissedCountEl.innerText = cDismissed;
 
-    const tInProgEl = document.getElementById("tracker-in-progress-count");
-    const tShortlistEl = document.getElementById("tracker-shortlisted-count");
-    const tToApplyEl = document.getElementById("tracker-to-apply-count");
-    const tAllEl = document.getElementById("tracker-all-count");
-    const tRejEl = document.getElementById("tracker-rejected-count");
-    const tDismEl = document.getElementById("tracker-dismissed-count");
-
-    if (tInProgEl) tInProgEl.innerText = tInProgress;
-    if (tShortlistEl) tShortlistEl.innerText = state.jobs.filter(j => j.status === "Shortlisted" || j.status === "Saved").length;
-    if (tToApplyEl) tToApplyEl.innerText = state.jobs.filter(j => (j.status || "To Apply") === "To Apply").length;
-    if (tAllEl) tAllEl.innerText = state.jobs.length;
-    if (tRejEl) tRejEl.innerText = tRejected;
-    if (tDismEl) tDismEl.innerText = state.jobs.filter(j => j.status === "Not Interested" || j.status === "Ignored").length;
+    // Tracker stage chips carry their own counts, derived from the same job list.
+    renderTrackerChipCounts();
 }
 
 function setFeedTab(tabName) {
@@ -2389,37 +2402,82 @@ async function tailorJobDirect(jobId) {
 // -------------------------------------------------------------
 // Application Tracker View
 // -------------------------------------------------------------
-function setTrackerFilter(filterType) {
-    state.trackerFilter = filterType;
-    document.querySelectorAll("#tracker-section .tab-btn").forEach(btn => {
-        btn.classList.toggle("active", btn.getAttribute("data-filter") === filterType);
+// Stage chips are multi-select over the canonical status set, so adding a status needs no new
+// branch here — only an entry in TRACKER_STATUSES.
+function trackerChipStatuses() {
+    const extra = [];
+    (state.jobs || []).forEach(job => {
+        const status = normalizeTrackerStatus(job.status);
+        if (status && !TRACKER_STATUSES.includes(status) && !extra.includes(status)) {
+            extra.push(status);
+        }
     });
+    return [...TRACKER_STATUSES, ...extra];
+}
+
+function renderTrackerChips() {
+    const container = document.getElementById("tracker-status-chips");
+    if (!container) return;
+    const selected = state.trackerStatuses;
+    container.innerHTML = trackerChipStatuses().map(status => `
+        <button type="button" class="status-chip" data-status="${escapeHTML(status)}"
+                aria-pressed="${selected.includes(status) ? "true" : "false"}">
+            ${escapeHTML(status)} <span class="chip-count" data-count-for="${escapeHTML(status)}">0</span>
+        </button>
+    `).join("");
+    renderTrackerChipCounts();
+}
+
+function renderTrackerChipCounts() {
+    const container = document.getElementById("tracker-status-chips");
+    if (!container) return;
+    const counts = {};
+    (state.jobs || []).forEach(job => {
+        const status = normalizeTrackerStatus(job.status);
+        counts[status] = (counts[status] || 0) + 1;
+    });
+    container.querySelectorAll(".chip-count").forEach(el => {
+        el.innerText = counts[el.getAttribute("data-count-for")] || 0;
+    });
+}
+
+function persistTrackerStatuses() {
+    try {
+        localStorage.setItem(TRACKER_STATUSES_STORAGE_KEY, JSON.stringify(state.trackerStatuses));
+    } catch (e) {
+        // Storage unavailable: the selection still works for this session.
+    }
+}
+
+function setTrackerStatuses(statuses) {
+    state.trackerStatuses = statuses.map(normalizeTrackerStatus);
+    persistTrackerStatuses();
+    renderTrackerChips();
     renderTrackerList();
+}
+
+function toggleTrackerStatus(status) {
+    const selected = state.trackerStatuses.slice();
+    const idx = selected.indexOf(status);
+    if (idx === -1) selected.push(status);
+    else selected.splice(idx, 1);
+    setTrackerStatuses(selected);
 }
 
 function renderTrackerList() {
     const listEl = document.getElementById("tracker-list");
-    let filtered = state.jobs;
+    renderTrackerChipCounts();
 
-    if (state.trackerFilter === "in_progress") {
-        filtered = state.jobs.filter(j => ["Applied", "Screening", "Interview", "Offered"].includes(j.status));
-    } else if (state.trackerFilter === "shortlisted") {
-        filtered = state.jobs.filter(j => j.status === "Shortlisted" || j.status === "Saved");
-    } else if (state.trackerFilter === "to_apply") {
-        filtered = state.jobs.filter(j => j.status === "To Apply");
-    } else if (state.trackerFilter === "rejected") {
-        filtered = state.jobs.filter(j => j.status === "Rejected");
-    } else if (state.trackerFilter === "not_interested") {
-        filtered = state.jobs.filter(j => j.status === "Not Interested" || j.status === "Ignored");
-    } else if (state.trackerFilter === "all") {
-        filtered = state.jobs.filter(j => j.status !== "Not Interested" && j.status !== "Ignored");
-    }
+    const active = new Set(state.trackerStatuses.map(normalizeTrackerStatus));
+    const filtered = state.jobs.filter(j => active.has(normalizeTrackerStatus(j.status)));
 
     if (filtered.length === 0) {
         listEl.innerHTML = `
             <div class="empty-state">
                 <div class="empty-icon">📋</div>
-                <p>No applications match the selected filter category.</p>
+                <p>${active.size === 0
+                    ? "No stages selected — pick at least one stage above."
+                    : "No applications match the selected stages."}</p>
             </div>
         `;
         return;
@@ -2428,9 +2486,10 @@ function renderTrackerList() {
     listEl.innerHTML = filtered.map(job => {
         const appliedDate = job.applied_at ? formatDate(job.applied_at) : 'N/A';
         const rejectedDate = job.rejected_at ? formatDate(job.rejected_at) : 'N/A';
-        const statusSlug = (job.status || 'To Apply').toLowerCase().replace(/\s+/g, '-');
-        const isShortlisted = job.status === "Shortlisted" || job.status === "Saved";
-        const isDismissed = job.status === "Not Interested" || job.status === "Ignored";
+        const jobStatus = normalizeTrackerStatus(job.status);
+        const statusSlug = jobStatus.toLowerCase().replace(/\s+/g, '-');
+        const isShortlisted = jobStatus === "Shortlisted";
+        const isDismissed = jobStatus === "Not Interested";
 
         return `
             <div class="job-card ${isShortlisted ? 'shortlisted' : ''} ${isDismissed ? 'not-interested' : ''}">
@@ -2440,21 +2499,21 @@ function renderTrackerList() {
                         <span class="badge active">${escapeHTML(job.company_name || '')}</span>
                         ${isShortlisted ? `<span class="badge" style="background:rgba(234,179,8,0.2); color:#facc15; border:1px solid rgba(234,179,8,0.5);">⭐ Shortlisted</span>` : ''}
                         <span class="status-pill status-${statusSlug}">
-                            ${job.status === 'Shortlisted' ? '⭐ Shortlisted' :
-                              job.status === 'Applied' ? '🚀 Applied' : 
-                              job.status === 'Interview' ? '🎙️ Interview' : 
-                              job.status === 'Screening' ? '📋 Screening' : 
-                              job.status === 'Offered' ? '🎉 Offered' : 
-                              job.status === 'Rejected' ? '📫 Regret' : 
-                              isDismissed ? '🚫 Dismissed' : '⚪ ' + job.status}
+                            ${jobStatus === 'Shortlisted' ? '⭐ Shortlisted' :
+                              jobStatus === 'Applied' ? '🚀 Applied' : 
+                              jobStatus === 'Interview' ? '🎙️ Interview' : 
+                              jobStatus === 'Screening' ? '📋 Screening' : 
+                              jobStatus === 'Offered' ? '🎉 Offered' : 
+                              jobStatus === 'Rejected' ? '📫 Regret' : 
+                              isDismissed ? '🚫 Dismissed' : '⚪ ' + jobStatus}
                         </span>
                     </div>
                     <div class="job-meta-row">
                         <span class="job-meta-item">📍 ${escapeHTML(job.location || 'Remote / Various')}</span>
                         <span class="job-meta-item">📅 Applied: ${appliedDate}</span>
-                        ${job.status === 'Applied' && job.submission_confirmed ? `<span class="job-meta-item" style="color:#a6e3a1;">✅ Submission confirmed</span>` : ''}
-                        ${job.status === 'Applied' && !job.submission_confirmed ? `<span class="job-meta-item" style="color:#fab387;">🕓 Awaiting submit confirmation</span>` : ''}
-                        ${job.status === 'Rejected' ? `<span class="job-meta-item text-danger">🛑 Regret Date: ${rejectedDate}</span>` : ''}
+                        ${jobStatus === 'Applied' && job.submission_confirmed ? `<span class="job-meta-item" style="color:#a6e3a1;">✅ Submission confirmed</span>` : ''}
+                        ${jobStatus === 'Applied' && !job.submission_confirmed ? `<span class="job-meta-item" style="color:#fab387;">🕓 Awaiting submit confirmation</span>` : ''}
+                        ${jobStatus === 'Rejected' ? `<span class="job-meta-item text-danger">🛑 Regret Date: ${rejectedDate}</span>` : ''}
                     </div>
                 </div>
                 <div class="job-actions-right">
