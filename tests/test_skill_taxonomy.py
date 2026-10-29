@@ -18,9 +18,11 @@ class TestTaxonomyData:
         assert tax.normalize_skill("Postgres") == "postgresql"
 
     def test_over_generic_alias_is_ignored(self):
-        """Bare "benefits" must not alias the HR skill (it matched perks prose in any JD)."""
+        """Perks-prose surfaces must not alias the HR skill."""
         assert tax.normalize_skill("benefits") == "benefits"
-        assert tax.normalize_skill("employee benefits") == "benefits administration"
+        assert tax.normalize_skill("employee benefits") == "employee benefits"
+        assert tax.normalize_skill("benefits systems") == "benefits systems"
+        assert tax.normalize_skill("benefits administration") == "benefits administration"
 
     def test_alias_surfaces(self):
         assert "nodejs" in tax.alias_surfaces("node.js")
