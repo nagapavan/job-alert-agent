@@ -112,8 +112,13 @@ def iter_requirement_units(jd: str, spans: Sequence) -> List[Tuple[str, str]]:
     return units
 
 
-def key_phrase(unit_text: str, max_words: int = 8) -> str:
-    """Reduce a requirement unit to a short, de-fluffed phrase."""
+def key_phrase(unit_text: str, max_words: int = 6) -> str:
+    """Reduce a requirement unit to a short, de-fluffed phrase.
+
+    Units longer than ``max_words`` are prose, not requirements, and yield ``""``. They are
+    never truncated: slicing a sentence to its first N words invents a phrase the JD does not
+    contain and leaves visible mid-clause artifacts ("...experience, with") — issue #52.
+    """
     text = (unit_text or "").strip()
     if not text:
         return ""
@@ -128,9 +133,9 @@ def key_phrase(unit_text: str, max_words: int = 8) -> str:
                 changed = True
     text = text.strip(" .:;,-–—")
     words = text.split()
-    if not words:
+    if not words or len(words) > max_words:
         return ""
-    phrase = " ".join(words[:max_words]).strip()
+    phrase = " ".join(words).strip()
     return phrase if len(phrase) >= 3 else ""
 
 
@@ -212,7 +217,9 @@ def extract_residual_requirements(
 ) -> List[Dict[str, str]]:
     """Mine residual JD units and credit the ones the resume evidences.
 
-    Unsupported residuals are recorded to the taxonomy review queue, never scored.
+    Unsupported residuals are recorded to the taxonomy review queue, never scored. A unit that
+    is not a plausible skill phrase (prose, heading, boilerplate) is neither scored nor queued —
+    the same predicate that guards the queue decides what may become a requirement (issue #52).
     """
     from backend import skill_taxonomy
 
@@ -221,7 +228,7 @@ def extract_residual_requirements(
         if unit_covered_by_taxonomy(unit_text):
             continue
         phrase = key_phrase(unit_text)
-        if not phrase:
+        if not phrase or not skill_taxonomy.is_plausible_skill_phrase(phrase):
             continue
         supported, _score, how = resume_supports(phrase, resume_text, resume_chunks)
         if supported:

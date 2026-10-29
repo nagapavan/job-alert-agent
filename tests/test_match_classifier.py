@@ -351,3 +351,31 @@ class TestDeterministicAssessment:
             jd, None, resume_text="Alice.", job_title="Engineer"
         )
         assert a.requirements == []
+
+    def test_prose_bullets_do_not_enter_must_have_denominator(self):
+        """Residual mining must not turn responsibilities prose into must-haves (#52).
+
+        Every prose bullet below is fully evidenced by the resume, which is exactly what made
+        them score as `partial` must-haves and cap must coverage.
+        """
+        jd = (
+            "Requirements:\n"
+            "Python and Kubernetes required.\n"
+            "- Lead the design and end-to-end delivery of complex platform systems.\n"
+            "- Drive architectural decisions and system-level thinking across teams.\n"
+            "- Mentor and coach other engineers through technical guidance and reviews.\n"
+            "- Coding and delivery are core to who you are.\n"
+        )
+        resume = (
+            "Python, Kubernetes. Led the design and end-to-end delivery of complex platform "
+            "systems. Drove architectural decisions and system-level thinking across teams. "
+            "Mentored and coached other engineers through technical guidance and reviews. "
+            "Coding and delivery are core to who I am."
+        )
+        a = build_deterministic_assessment(jd, {"skills": ["Python", "Kubernetes"]}, resume_text=resume)
+        must = [r for r in a.requirements if r.category == "must_have"]
+        texts = " ".join(r.text.lower() for r in must)
+        assert "lead the design" not in texts
+        assert "coding and delivery" not in texts
+        assert "mentor and coach" not in texts
+        assert {r.text for r in must if r.kind == "skill"} == {"Python", "Kubernetes"}
