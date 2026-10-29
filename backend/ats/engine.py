@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import urllib.parse
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +49,11 @@ def _parse_retry_after(res) -> Optional[float]:
         return None
 
 
+# Per-run record of hosts already reported as robots/AI-use blocked, so one dead portal does not
+# emit a line per company. Reset with the pacer at the end of a run.
+_BLOCKED_HOSTS_REPORTED: set = set()
+
+
 def _http(method: str, url: str, *, cfg: Optional[PortalConfig] = None, **kwargs):
     """Paced, permission-gated HTTP call shared by all shape scrapers.
 
@@ -58,7 +64,15 @@ def _http(method: str, url: str, *, cfg: Optional[PortalConfig] = None, **kwargs
 
     if cfg is not None and getattr(cfg, "respect_robots", True):
         if not may_fetch(url):
-            logger.info(f"Permission gate: skipping '{url}' (robots/AI-use files).")
+            host = urllib.parse.urlsplit(url).netloc
+            if host in _BLOCKED_HOSTS_REPORTED:
+                logger.debug(f"Permission gate: skipping '{url}' (robots/AI-use files).")
+            else:
+                _BLOCKED_HOSTS_REPORTED.add(host)
+                logger.info(
+                    f"Permission gate: skipping '{url}' (robots/AI-use files); "
+                    f"'{host}' is skipped for the rest of this run."
+                )
             return None
 
     pacer = _ACTIVE_PACER
@@ -768,6 +782,7 @@ def clear_active_pacer() -> None:
     """
     global _ACTIVE_PACER
     _ACTIVE_PACER = None
+    _BLOCKED_HOSTS_REPORTED.clear()
 
 
 def run_portal(
