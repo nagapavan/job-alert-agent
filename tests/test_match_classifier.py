@@ -379,3 +379,73 @@ class TestDeterministicAssessment:
         assert "coding and delivery" not in texts
         assert "mentor and coach" not in texts
         assert {r.text for r in must if r.kind == "skill"} == {"Python", "Kubernetes"}
+
+
+class TestAmbiguousProductNames:
+    """Curated skills that are also ordinary English words (issue #50).
+
+    A case-insensitive scan reads JD prose as a requirement: "during the workday", "we go fast",
+    "you react to change", "we express ourselves". Only canonical casing or an explicit alias
+    counts.
+    """
+
+    PROSE_JD = (
+        "Requirements\n"
+        "You will have focus time during the workday. We go fast and express ourselves; "
+        "you react to change.\n"
+        "Must have Python.\n"
+    )
+
+    @pytest.mark.parametrize("skill", ["Workday", "Go", "React", "Express"])
+    def test_prose_does_not_become_a_requirement(self, skill):
+        a = build_deterministic_assessment(
+            self.PROSE_JD, {"skills": ["Python"]}, resume_text="Python"
+        )
+        assert skill not in {r.text for r in a.requirements}
+
+    def test_only_the_real_requirement_survives(self):
+        a = build_deterministic_assessment(
+            self.PROSE_JD, {"skills": ["Python"]}, resume_text="Python"
+        )
+        assert [r.text for r in a.requirements] == ["Python"]
+
+    @pytest.mark.parametrize(
+        "jd, skill",
+        [
+            ("Requirements\nGo developer with distributed systems experience.", "Go"),
+            ("Requirements\nReact and TypeScript for the frontend.", "React"),
+            ("Requirements\nExpress.js services and REST APIs.", "Express"),
+            ("Requirements\nWorkday integration experience required.", "Workday"),
+            ("Requirements\nExperience with HR systems such as Workday, Greenhouse.", "Workday"),
+        ],
+    )
+    def test_canonical_casing_still_matches(self, jd, skill):
+        a = build_deterministic_assessment(jd, {"skills": []}, resume_text="")
+        assert skill in {r.text for r in a.requirements}
+
+    @pytest.mark.parametrize(
+        "jd, skill",
+        [
+            ("Requirements\nWe write golang services.", "Go"),
+            ("Requirements\nreactjs and nextjs experience.", "React"),
+            ("Requirements\nexpressjs middleware.", "Express"),
+        ],
+    )
+    def test_unambiguous_aliases_still_match(self, jd, skill):
+        a = build_deterministic_assessment(jd, {"skills": []}, resume_text="")
+        assert skill in {r.text for r in a.requirements}
+
+    def test_all_caps_still_matches(self):
+        """An uppercase occurrence is a deliberate technology mention, not prose."""
+        a = build_deterministic_assessment(
+            "Requirements\nGO and REACT experience.", {"skills": []}, resume_text=""
+        )
+        texts = {r.text for r in a.requirements}
+        assert {"Go", "React"} <= texts
+
+    def test_lowercase_alias_is_unaffected_by_the_casing_rule(self):
+        """Only the canonical surface needs casing; aliases are unambiguous by construction."""
+        a = build_deterministic_assessment(
+            "Requirements\nexperience with golang", {"skills": []}, resume_text=""
+        )
+        assert "Go" in {r.text for r in a.requirements}

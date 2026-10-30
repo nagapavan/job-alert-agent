@@ -97,3 +97,26 @@ class TestCandidateQueue:
         assert removed == 3 and kept == 2
         counts = json.loads(path.read_text())["counts"]
         assert counts == {"stakeholder wrangling": 7, "terraform": 3}
+
+
+class TestAmbiguousFlag:
+    """Skills that are also ordinary English words are flagged in the data, not in code (#50)."""
+
+    def test_known_ambiguous_skills_are_flagged(self):
+        from backend.skill_taxonomy import AMBIGUOUS_SKILLS
+
+        assert {"go", "react", "express", "workday"} <= AMBIGUOUS_SKILLS
+
+    def test_unambiguous_skills_are_not_flagged(self):
+        from backend.skill_taxonomy import AMBIGUOUS_SKILLS
+
+        assert not {"python", "java", "kubernetes", "postgresql"} & AMBIGUOUS_SKILLS
+
+    def test_flag_comes_from_the_data_file(self):
+        import json
+
+        from backend.skill_taxonomy import TAXONOMY_PATH
+
+        raw = json.loads(TAXONOMY_PATH.read_text("utf-8"))
+        flagged = {s["name"].lower() for s in raw["skills"] if s.get("ambiguous")}
+        assert {"go", "react", "express", "workday"} <= flagged

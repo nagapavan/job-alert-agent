@@ -71,6 +71,10 @@ class _TaxonomyData:
         self.canonical_by_surface: Dict[str, str] = {}
         self.concepts: Dict[str, Set[str]] = {}
         self.cloud_providers: Set[str] = set()
+        # Canonical skills whose name is also an ordinary English word ("Go", "Workday",
+        # "React", "Express"). Matching them case-insensitively reads prose as a requirement
+        # (issue #50), so consumers must require canonical casing or an explicit alias.
+        self.ambiguous: Set[str] = set()
 
 
 def _load() -> _TaxonomyData:
@@ -109,6 +113,8 @@ def _load() -> _TaxonomyData:
         for alias in aliases:
             data.canonical_by_surface[alias] = canonical
         data.concepts[canonical] = concepts
+        if entry.get("ambiguous"):
+            data.ambiguous.add(canonical)
     data.concepts.setdefault("cloud", set())
     data.cloud_providers = {_normalize(c) for c in cloud}
     return data
@@ -121,16 +127,19 @@ DISPLAY_SKILLS: List[str] = _DATA.display_skills
 CANONICAL_BY_SURFACE: Dict[str, str] = _DATA.canonical_by_surface
 CONCEPT_GROUPS: Dict[str, Set[str]] = _DATA.concepts
 CLOUD_PROVIDERS: Set[str] = _DATA.cloud_providers
+AMBIGUOUS_SKILLS: Set[str] = _DATA.ambiguous
 
 
 def reload() -> None:
     """Reload the taxonomy from disk (used after the file changes)."""
     global _DATA, DISPLAY_SKILLS, CANONICAL_BY_SURFACE, CONCEPT_GROUPS, CLOUD_PROVIDERS
+    global AMBIGUOUS_SKILLS
     _DATA = _load()
     DISPLAY_SKILLS = _DATA.display_skills
     CANONICAL_BY_SURFACE = _DATA.canonical_by_surface
     CONCEPT_GROUPS = _DATA.concepts
     CLOUD_PROVIDERS = _DATA.cloud_providers
+    AMBIGUOUS_SKILLS = _DATA.ambiguous
 
 
 def normalize_skill(name: str) -> str:

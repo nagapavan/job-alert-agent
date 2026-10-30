@@ -228,6 +228,7 @@ def extract_match_features(
 # Skill vocabulary, aliases and concept groups come from the curated taxonomy
 # (data/skill_taxonomy.json) so the vocabulary can grow without code changes.
 from backend.skill_taxonomy import (
+    AMBIGUOUS_SKILLS as _AMBIGUOUS_SKILLS,
     CLOUD_PROVIDERS as _CLOUD_PROVIDERS,
     CONCEPT_GROUPS as _CONCEPT_GROUPS,
     DISPLAY_SKILLS as _DISPLAY_SKILLS,
@@ -258,6 +259,27 @@ def _skill_patterns(skill: str) -> "List[re.Pattern]":
     patterns = [_skill_token(skill)]
     patterns += [_skill_token(surface) for surface in _alias_surfaces(skill)]
     return patterns
+
+
+def _ambiguous_skill_match(text: str, skill: str) -> Optional[re.Match]:
+    """Match a skill whose name is also an ordinary English word (issue #50).
+
+    "Workday", "Go", "React" and "Express" are curated taxonomy skills *and* common nouns, so a
+    case-insensitive scan turns prose into requirements ("during the workday", "we go fast",
+    "you react to change", "we express ourselves"). Such a skill only counts when an occurrence
+    carries a capital letter ("Workday integration", "Go developer") or one of its unambiguous
+    aliases appears ("golang", "react.js", "expressjs").
+
+    ``text`` must be the original-case JD, not a lowercased copy.
+    """
+    for match in _skill_token(skill).finditer(text or ""):
+        if match.group(0) != match.group(0).lower():
+            return match
+    for surface in _alias_surfaces(skill):
+        match = _skill_token(surface).search(text or "")
+        if match:
+            return match
+    return None
 
 
 def _resume_skill_scan(resume_text: str) -> "set[str]":
@@ -341,12 +363,17 @@ def build_deterministic_assessment(
         if norm in seen or norm in tech_required:
             continue
         # Match the display name OR any alias surface (e.g. "golang" -> Go,
-        # "genai" -> LLM, "prompt design" -> Prompt Engineering).
-        m = None
-        for pattern in _skill_patterns(skill):
-            m = pattern.search(jd_scan_lower)
-            if m:
-                break
+        # "genai" -> LLM, "prompt design" -> Prompt Engineering). Skills whose name is also an
+        # ordinary word are matched against the original-case text instead, so prose does not
+        # become a requirement (issue #50).
+        if norm in _AMBIGUOUS_SKILLS:
+            m = _ambiguous_skill_match(jd_scan, skill)
+        else:
+            m = None
+            for pattern in _skill_patterns(skill):
+                m = pattern.search(jd_scan_lower)
+                if m:
+                    break
         if not m:
             continue
         seen.add(norm)
