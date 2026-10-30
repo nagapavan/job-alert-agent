@@ -94,6 +94,9 @@ class Resume(Base):
     filename = Column(String(255), nullable=False)
     content_encrypted = Column(Text, nullable=False)
     parsed_json_encrypted = Column(Text, nullable=True)
+    # Version of backend.parser that produced parsed_json_encrypted. NULL on rows written before
+    # versioning existed, which is exactly the "unknown, possibly stale" state (issue #54).
+    parser_version = Column(Integer, nullable=True)
     embedding = Column(SafeVector(384), nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=utc_now)
@@ -597,6 +600,12 @@ def init_db(custom_url: str = None):
                 if "created_at" not in col_names and "timestamp" in col_names:
                     conn.execute(text("ALTER TABLE application_events ADD COLUMN created_at DATETIME;"))
                     conn.execute(text("UPDATE application_events SET created_at = timestamp WHERE created_at IS NULL;"))
+
+        if "resumes" in existing_tables:
+            col_names = {c["name"] for c in inspector.get_columns("resumes")}
+            with engine.begin() as conn:
+                if "parser_version" not in col_names:
+                    conn.execute(text("ALTER TABLE resumes ADD COLUMN parser_version INTEGER;"))
 
         if "jobs" in existing_tables:
             col_names = {c["name"] for c in inspector.get_columns("jobs")}

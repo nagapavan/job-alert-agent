@@ -112,6 +112,7 @@ from backend.matchers import check_title_match
 from backend.match_scoring import ScoringConfig
 from backend.observability import setup_observability, tail_log_file
 from backend.parser import (
+    RESUME_PARSER_VERSION,
     clean_job_description,
     parse_resume_document,
     split_candidate_name,
@@ -680,6 +681,10 @@ class ResumeOut(BaseModel):
     created_at: datetime.datetime
     raw_preview: str
     parsed_json: Optional[dict] = None
+    # Parser provenance (issue #54): a stored parse is a cache, so it must say which parser
+    # produced it and whether that is still the current one.
+    parser_version: Optional[int] = None
+    parse_stale: bool = False
 
 
 class ScrapeRequest(BaseModel):
@@ -2916,6 +2921,7 @@ async def upload_resume(file: UploadFile = File(...), db: Session = Depends(get_
         filename=safe_filename,
         content_encrypted=encrypted_content,
         parsed_json_encrypted=encrypted_parsed_json,
+        parser_version=RESUME_PARSER_VERSION,
         is_active=True,
     )
     db.add(new_resume)
@@ -2934,6 +2940,8 @@ async def upload_resume(file: UploadFile = File(...), db: Session = Depends(get_
         created_at=new_resume.created_at,
         raw_preview=raw_text[:400] + ("..." if len(raw_text) > 400 else ""),
         parsed_json=parsed_json,
+        parser_version=new_resume.parser_version,
+        parse_stale=(new_resume.parser_version or 0) < RESUME_PARSER_VERSION,
     )
 
 
@@ -2971,6 +2979,8 @@ def get_active_resume(db: Session = Depends(get_db)):
         created_at=resume.created_at,
         raw_preview=decrypted_content,
         parsed_json=parsed_json,
+        parser_version=resume.parser_version,
+        parse_stale=(resume.parser_version or 0) < RESUME_PARSER_VERSION,
     )
 
 
@@ -3296,6 +3306,8 @@ def list_resumes(db: Session = Depends(get_db)):
                 raw_preview=decrypted_content[:400]
                 + ("..." if len(decrypted_content) > 400 else ""),
                 parsed_json=parsed_json,
+                parser_version=r.parser_version,
+                parse_stale=(r.parser_version or 0) < RESUME_PARSER_VERSION,
             )
         )
     return results
@@ -3328,6 +3340,8 @@ def activate_resume(resume_id: int, db: Session = Depends(get_db)):
         created_at=target.created_at,
         raw_preview=decrypted_content,
         parsed_json=parsed_json,
+        parser_version=target.parser_version,
+        parse_stale=(target.parser_version or 0) < RESUME_PARSER_VERSION,
     )
 
 
@@ -3408,12 +3422,70 @@ def update_resume_skills(
         created_at=target.created_at,
         raw_preview=decrypted_content,
         parsed_json=parsed_json,
+        parser_version=target.parser_version,
+        parse_stale=(target.parser_version or 0) < RESUME_PARSER_VERSION,
     )
 
 
 class CleanCacheRequest(BaseModel):
     clean_unapplied_jobs: bool = True
     clean_all_jobs: bool = False
+
+
+@app.post("/api/resume/{resume_id}/reparse", response_model=ResumeOut)
+def reparse_resume(resume_id: int, db: Session = Depends(get_db)):
+    """Re-derive ``parsed_json`` from the stored resume text (issue #54).
+
+    ``parsed_json_encrypted`` is a cache: it is written on upload and never re-derived, so a
+    parser improvement (or an earlier parse that dropped a role) keeps feeding every score.
+    This re-parses the encrypted text in place and stamps ``parser_version``.
+
+    User-owned edits win: ``skills``, ``name``, ``email`` and ``experience_years`` are carried
+    over from the stored parse rather than overwritten by the fresh one.
+    """
+    target = db.query(Resume).filter(Resume.id == resume_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Resume not found.")
+
+    raw_text = decrypt_data(target.content_encrypted)
+    previous: dict = {}
+    if target.parsed_json_encrypted:
+        try:
+            previous = json.loads(decrypt_data(target.parsed_json_encrypted)) or {}
+        except Exception:
+            previous = {}
+
+    fresh = parse_resume_to_json(raw_text)
+    if not fresh:
+        raise HTTPException(
+            status_code=502,
+            detail="The resume parser returned nothing; the stored parse was kept.",
+        )
+
+    for field in ("skills", "name", "email", "experience_years"):
+        if previous.get(field):
+            fresh[field] = previous[field]
+
+    target.parsed_json_encrypted = encrypt_data(json.dumps(fresh))
+    target.parser_version = RESUME_PARSER_VERSION
+    db.commit()
+    db.refresh(target)
+
+    try:
+        index_resume_chunks(db, target)
+    except Exception as idx_err:
+        logger.debug(f"Resume chunk indexing skipped: {idx_err}")
+
+    return ResumeOut(
+        id=target.id,
+        filename=target.filename,
+        is_active=target.is_active,
+        created_at=target.created_at,
+        raw_preview=raw_text,
+        parsed_json=fresh,
+        parser_version=target.parser_version,
+        parse_stale=False,
+    )
 
 
 @app.post("/api/system/clean-cache")

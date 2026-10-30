@@ -11,6 +11,11 @@ from pypdf import PdfReader
 # instead of a hardcoded list. A built-in fallback keeps the app working if it is absent.
 from backend.skill_taxonomy import DISPLAY_SKILLS as COMMON_TECH_SKILLS
 
+# Bump whenever parsing logic changes enough that stored parses are worth re-deriving.
+# Stamped onto Resume.parser_version so a stale cache is detectable instead of silently trusted
+# (issue #54).
+RESUME_PARSER_VERSION = 2
+
 MONTH_REGEX_STR = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
 
 DATE_RANGE_REGEX = re.compile(
