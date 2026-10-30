@@ -81,3 +81,35 @@ def test_live_extraction_matches_expected_band(case):
         f"{case['id']}: expected {case['expected_band']}, got {result.band} "
         f"(score={result.score})"
     )
+
+
+# --- Score scale: an empty nice-to-have set must not cost points (issue #70) ---
+def test_score_scale_renormalises_when_the_jd_states_no_nice_to_haves():
+    """Pin the scale so a future weight change cannot silently re-introduce the 20-point hole.
+
+    A JD with no preferred section scores over must 60 + seniority 15 + education 5 (80 points),
+    so an otherwise perfect fit reaches 100 instead of being capped at 80.
+    """
+    from backend.match_classifier import MatchFeatures, SimpleHeuristicClassifier
+
+    classifier = SimpleHeuristicClassifier()
+
+    def score(must_cov, nice_cov, must_count, nice_count):
+        return classifier.predict(
+            MatchFeatures(
+                must_coverage=must_cov,
+                nice_coverage=nice_cov,
+                seniority_fit=1.0,
+                education_match=1.0,
+                experience_years_delta=0.0,
+                over_qualified_flag=0.0,
+                must_count=must_count,
+                nice_count=nice_count,
+            )
+        )
+
+    assert score(1.0, 0.0, 8, 0) == pytest.approx(100.0)
+    assert score(0.5, 0.0, 8, 0) == pytest.approx(62.5)
+    # A present nice-to-have set keeps the full 100-point scale.
+    assert score(0.5, 1.0, 8, 4) == pytest.approx(70.0)
+    assert score(0.5, 0.0, 8, 4) == pytest.approx(50.0)

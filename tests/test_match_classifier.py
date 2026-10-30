@@ -8,6 +8,7 @@ from backend.match_classifier import (
     SimpleHeuristicClassifier,
     extract_match_features,
     build_deterministic_assessment,
+    build_jd_hints,
 )
 
 
@@ -449,3 +450,71 @@ class TestAmbiguousProductNames:
             "Requirements\nexperience with golang", {"skills": []}, resume_text=""
         )
         assert "Go" in {r.text for r in a.requirements}
+
+
+class TestEmptyNiceToHaveSet:
+    """A JD with no preferred section states no nice-to-haves (issue #70).
+
+    ``nice_coverage`` stays 0.0 when the set is empty, so weighting it at 20/100 scored the
+    missing set as "none met" and capped such JDs at 80.
+    """
+
+    @staticmethod
+    def _features(must_cov, nice_cov, *, must_count, nice_count, seniority=1.0, education=1.0):
+        return MatchFeatures(
+            must_coverage=must_cov,
+            nice_coverage=nice_cov,
+            seniority_fit=seniority,
+            education_match=education,
+            experience_years_delta=0.0,
+            over_qualified_flag=0.0,
+            must_count=must_count,
+            nice_count=nice_count,
+        )
+
+    def test_no_nice_section_is_scored_over_the_remaining_eighty_points(self):
+        classifier = SimpleHeuristicClassifier()
+        features = self._features(0.5, 0.0, must_count=8, nice_count=0)
+        # (0.5*60 + 1.0*15 + 1.0*5) / 80 * 100 == 62.5, not the legacy 45.0.
+        assert classifier.predict(features) == pytest.approx(62.5)
+
+    def test_a_perfect_fit_without_a_preferred_section_can_reach_one_hundred(self):
+        """The old formula capped such a JD at 80 no matter how well the candidate matched."""
+        classifier = SimpleHeuristicClassifier()
+        features = self._features(1.0, 0.0, must_count=8, nice_count=0)
+        assert classifier.predict(features) == pytest.approx(100.0)
+
+    def test_a_jd_with_nice_to_haves_keeps_its_legacy_score(self):
+        """The renormalisation must be inert when the set is present."""
+        classifier = SimpleHeuristicClassifier()
+        features = self._features(0.6, 0.75, must_count=5, nice_count=4)
+        legacy = 0.6 * 60 + 0.75 * 20 + 1.0 * 15 + 1.0 * 5
+        assert classifier.predict(features) == pytest.approx(legacy)
+
+    def test_partial_nice_coverage_still_costs_points(self):
+        """An empty set is free; a present-but-unmet set is not."""
+        classifier = SimpleHeuristicClassifier()
+        unmet = self._features(0.6, 0.0, must_count=5, nice_count=4)
+        met = self._features(0.6, 1.0, must_count=5, nice_count=4)
+        absent = self._features(0.6, 0.0, must_count=5, nice_count=0)
+        assert classifier.predict(unmet) < classifier.predict(absent) < classifier.predict(met)
+
+    def test_no_requirements_at_all_keeps_the_legacy_full_scale(self):
+        """With nothing to verify, the score stays low instead of renormalising over 20 points."""
+        classifier = SimpleHeuristicClassifier()
+        features = self._features(0.0, 0.0, must_count=0, nice_count=0)
+        assert classifier.predict(features) == pytest.approx(20.0)
+
+    def test_features_report_an_empty_nice_set_as_zero_count(self):
+        assessment = build_deterministic_assessment(
+            "Requirements\nMust have Python and Kubernetes.",
+            {"skills": ["Python", "Kubernetes"]},
+            resume_text="Python, Kubernetes",
+        )
+        features = extract_match_features(
+            {"skills": ["Python", "Kubernetes"]},
+            build_jd_hints("Requirements\nMust have Python and Kubernetes.", "Backend Engineer"),
+            assessment=assessment,
+        )
+        assert features.nice_count == 0
+        assert features.must_count > 0

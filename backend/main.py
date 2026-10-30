@@ -8707,10 +8707,16 @@ def _deterministic_match(
             for r in assessment.requirements
             if r.status not in ("met", "partial", "missing") and r.text
         ]
+        # An empty nice-to-have set means the JD states none (issue #70); reporting it as
+        # "0%" reads as "you met none of them", which is the opposite of what happened.
+        coverage_bits = [f"must-have coverage {round(features.must_coverage * 100)}%"]
+        if features.nice_count > 0:
+            coverage_bits.append(f"nice-to-have {round(features.nice_coverage * 100)}%")
+        else:
+            coverage_bits.append("no nice-to-have requirements")
         feedback = (
             f"Matched {met_count} of {len(known_reqs)} requirements "
-            f"(must-have coverage {round(features.must_coverage * 100)}%, "
-            f"nice-to-have {round(features.nice_coverage * 100)}%)."
+            f"({', '.join(coverage_bits)})."
         )
         if partial_count > 0:
             feedback += f" {partial_count} requirement{'s' if partial_count != 1 else ''} met partially — see Partial Coverage below."

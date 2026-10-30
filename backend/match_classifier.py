@@ -49,12 +49,30 @@ class SimpleHeuristicClassifier:
 
     def predict(self, features: MatchFeatures) -> float:
         """Return match score 0-100 based on requirement coverage and fit."""
-        # Weighted combination of signals
+        # Weighted combination of signals, renormalised over the components the JD actually
+        # defines (issue #70). An empty requirement set means "this JD states none", not "the
+        # candidate met none", so scoring it as 0% would silently cap the score. Must-haves
+        # dominate; nice-to-haves matter; seniority and education are secondary.
+        components = [
+            (features.must_coverage, 60, features.must_count > 0),
+            (features.nice_coverage, 20, features.nice_count > 0),
+            (features.seniority_fit, 15, True),
+            (features.education_match, 5, True),
+        ]
+        # With neither requirement set present there is nothing to verify, so keep the legacy
+        # full-scale formula and let the score stay low rather than renormalise over 20 points.
+        if features.must_count == 0 and features.nice_count == 0:
+            components = [
+                (features.must_coverage, 60, True),
+                (features.nice_coverage, 20, True),
+                (features.seniority_fit, 15, True),
+                (features.education_match, 5, True),
+            ]
+        total_weight = sum(weight for _, weight, present in components if present)
         score = (
-            features.must_coverage * 60  # Must-haves dominate
-            + features.nice_coverage * 20  # Nice-to-haves matter
-            + features.seniority_fit * 15  # Seniority alignment
-            + features.education_match * 5  # Education is secondary
+            sum(value * weight for value, weight, present in components if present)
+            / total_weight
+            * 100.0
         )
         score = min(100.0, max(0.0, score))
 
