@@ -33,6 +33,8 @@ let state = {
     catalog: [],
     jobs: [],
     selectedJobIds: new Set(),
+    rescoreAttempted: new Set(), // job ids already lazy re-scored this session (never loop)
+    rescoreErrors: new Map(), // job id -> last re-score failure message, shown in the modal
     resume: null,
     resumes: [],
     activeJobModal: null,
@@ -3333,6 +3335,142 @@ function openJobDetails(jobId) {
     return openJobDetailsModal(jobId);
 }
 
+// ---------------------------------------------------------------------------
+// Score provenance & re-scoring (issues #56 / #57)
+// A stored score records the resume version that produced it. A stale/deleted score is
+// re-scored lazily when the job is opened, and on demand from the modal or the feed.
+// ---------------------------------------------------------------------------
+function renderScoreProvenance(job) {
+    const el = document.getElementById("modal-score-provenance");
+    if (!el) return;
+    const provState = job.score_resume_state || "current";
+    const failure = state.rescoreErrors.get(job.id);
+    if (failure) {
+        el.innerText = `⚠️ Re-score did not run: ${failure}`;
+        el.classList.remove("hidden");
+        return;
+    }
+    if (provState === "current" || !job.match_scored) {
+        el.classList.add("hidden");
+        el.innerText = "";
+        return;
+    }
+    const who = job.score_resume_filename
+        ? `"${job.score_resume_filename}"`
+        : "an older resume version";
+    const when = job.score_resume_created_at ? ` (${formatDate(job.score_resume_created_at)})` : "";
+    el.innerText = provState === "deleted"
+        ? `⚠️ Scored against ${who}${when}, which has been deleted. Re-score to use your current resume.`
+        : `⚠️ Scored against ${who}${when}. Your resume has changed since — re-score to refresh.`;
+    el.classList.remove("hidden");
+}
+
+// Match-tab score panel. Shared by the modal and the re-score path, which must refresh the
+// score without re-opening the modal (that resets the chat transcript and active tab).
+function renderMatchPanel(job) {
+    // Score & Analysis
+    const hasScore = job.match_scored === true
+        && job.match_score !== null && job.match_score !== undefined;
+    const score = hasScore ? Math.round(job.match_score) : null;
+    const circleEl = document.getElementById("modal-score-circle");
+    if (hasScore) {
+        circleEl.innerText = `${score}%`;
+        circleEl.title = "AI match score";
+    } else {
+        circleEl.innerText = "—";
+        circleEl.title = "Not yet analyzed";
+    }
+    const unscoredCue = !hasScore
+        ? "\n\nℹ️ This role has not been AI match-scored. Run '⚡ Tailor AI' to generate a real ATS score."
+        : "";
+    document.getElementById("modal-analysis-details").innerText = (job.match_analysis || "Comparison summary available.") + unscoredCue;
+
+    renderGapInsights(job);
+    renderScoreProvenance(job);
+    const rescoreBtn = document.getElementById("modal-rescore-btn");
+    if (rescoreBtn) rescoreBtn.onclick = () => rescoreJob(job.id);
+}
+
+function applyJobUpdate(updated) {
+    const idx = state.jobs.findIndex(j => j.id === updated.id);
+    if (idx >= 0) state.jobs[idx] = updated;
+    state.rescoreErrors.delete(updated.id);
+    if (state.activeJobModal && state.activeJobModal.id === updated.id) {
+        state.activeJobModal = updated;
+        renderMatchPanel(updated);
+    }
+    applyJobFilters();
+}
+
+async function rescoreJob(jobId, { silent = false } = {}) {
+    const btn = document.getElementById("modal-rescore-btn");
+    if (btn) {
+        btn.disabled = true;
+        btn.innerText = "↻ Scoring…";
+    }
+    try {
+        const res = await fetch(`${API_BASE}/api/jobs/${jobId}/rescore`, { method: "POST" });
+        if (!res.ok) {
+            const detail = await res.json().catch(() => ({}));
+            throw new Error(detail.detail || `Re-score failed (${res.status})`);
+        }
+        const updated = await res.json();
+        applyJobUpdate(updated);
+        if (!silent) showToast("↻ Re-scored with your current resume.");
+        return updated;
+    } catch (e) {
+        state.rescoreErrors.set(jobId, e.message);
+        if (!silent) alert(e.message);
+        if (state.activeJobModal && state.activeJobModal.id === jobId) {
+            renderScoreProvenance(state.activeJobModal);
+        }
+        return null;
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.innerText = "↻ Re-score";
+        }
+    }
+}
+
+async function maybeRescoreStaleJob(job) {
+    if (!job || !job.match_scored) return;
+    const provState = job.score_resume_state || "current";
+    if (provState === "current") return;
+    // Attempt once per job per session: a re-score that returns stale again must not loop.
+    if (state.rescoreAttempted.has(job.id)) return;
+    state.rescoreAttempted.add(job.id);
+    await rescoreJob(job.id, { silent: true });
+}
+
+async function rescoreStaleJobs() {
+    const stale = state.jobs.filter(
+        j => j.match_scored && (j.score_resume_state === "stale" || j.score_resume_state === "deleted")
+    );
+    if (stale.length === 0) {
+        showToast("✓ No scores were produced by a different resume version.");
+        return;
+    }
+    if (!confirm(`Re-score ${stale.length} job(s) against your current resume?`)) return;
+    const btn = document.getElementById("btn-rescore-stale");
+    if (btn) btn.disabled = true;
+    try {
+        const res = await fetch(`${API_BASE}/api/match/rescore`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ stale_only: true, limit: 2000 })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || `Server returned ${res.status}`);
+        showToast(`↻ ${data.message || "Re-score queued."} Track it in Background Jobs & Queue.`);
+        fetchTasksStatus(true);
+    } catch (e) {
+        showToast(`⚠️ Could not start re-score: ${e.message}`, 5000);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
 function renderGapInsights(job) {
     const card = document.getElementById("modal-gap-insights-card");
     const body = document.getElementById("modal-gap-insights-body");
@@ -3430,24 +3568,7 @@ function openJobDetailsModal(jobId) {
         }
     }
 
-    // Score & Analysis
-    const hasScore = job.match_scored === true
-        && job.match_score !== null && job.match_score !== undefined;
-    const score = hasScore ? Math.round(job.match_score) : null;
-    const circleEl = document.getElementById("modal-score-circle");
-    if (hasScore) {
-        circleEl.innerText = `${score}%`;
-        circleEl.title = "AI match score";
-    } else {
-        circleEl.innerText = "—";
-        circleEl.title = "Not yet analyzed";
-    }
-    const unscoredCue = !hasScore
-        ? "\n\nℹ️ This role has not been AI match-scored. Run '⚡ Tailor AI' to generate a real ATS score."
-        : "";
-    document.getElementById("modal-analysis-details").innerText = (job.match_analysis || "Comparison summary available.") + unscoredCue;
-
-    renderGapInsights(job);
+    renderMatchPanel(job);
 
     // Cover Letter
     document.getElementById("modal-cover-letter-text").value = job.cover_letter_draft || "Click '⚡ Tailor AI' to generate a tailored cover letter for this role.";
@@ -3476,6 +3597,10 @@ function openJobDetailsModal(jobId) {
     if (firstTabBtn) firstTabBtn.click();
 
     document.getElementById("details-modal").classList.remove("hidden");
+
+    // Lazy re-score (issue #57): a score from a different resume version is refreshed when the
+    // user actually looks at the job. Runs once per job per session.
+    maybeRescoreStaleJob(job);
 }
 
 async function loadJobSkillsAlignment(jobId) {
