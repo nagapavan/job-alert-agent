@@ -1,3 +1,4 @@
+import hashlib
 import io
 import re
 from typing import Dict
@@ -10,6 +11,15 @@ from pypdf import PdfReader
 # Skill vocabulary is loaded from data/skill_taxonomy.json (curated, extensible data)
 # instead of a hardcoded list. A built-in fallback keeps the app working if it is absent.
 from backend.skill_taxonomy import DISPLAY_SKILLS as COMMON_TECH_SKILLS
+
+def resume_fingerprint(text: str) -> str:
+    """Content fingerprint of a resume, used as its version identity (issue #56).
+
+    The fingerprint, not a row id, is what a stored score records: re-uploading identical text is
+    the same version, editing the text is a new one, and deleting the row does not rewrite history.
+    """
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
 
 # Bump whenever parsing logic changes enough that stored parses are worth re-deriving.
 # Stamped onto Resume.parser_version so a stale cache is detectable instead of silently trusted

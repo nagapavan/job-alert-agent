@@ -97,6 +97,9 @@ class Resume(Base):
     # Version of backend.parser that produced parsed_json_encrypted. NULL on rows written before
     # versioning existed, which is exactly the "unknown, possibly stale" state (issue #54).
     parser_version = Column(Integer, nullable=True)
+    # sha256 of the decrypted text: the resume's version identity (issue #56). Re-uploading
+    # identical text is the same version; editing the text creates a new one.
+    fingerprint = Column(String(64), nullable=True, index=True)
     embedding = Column(SafeVector(384), nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=utc_now)
@@ -158,6 +161,10 @@ class Job(Base):
     # Which scoring engine produced match_score (null for legacy/baseline scores) + when.
     score_method = Column(String(50), nullable=True)
     match_scored_at = Column(DateTime, nullable=True)
+    # Which resume version produced the stored score (issue #56). Deliberately NOT a foreign key:
+    # deleting a resume must leave the score's provenance readable as "deleted", not null it out.
+    scored_resume_id = Column(Integer, nullable=True)
+    scored_resume_fingerprint = Column(String(64), nullable=True, index=True)
     # Deterministic engine's qualitative result (for UI display).
     match_band = Column(String(20), nullable=True)
     apply_recommendation = Column(String(30), nullable=True)
@@ -606,6 +613,27 @@ def init_db(custom_url: str = None):
             with engine.begin() as conn:
                 if "parser_version" not in col_names:
                     conn.execute(text("ALTER TABLE resumes ADD COLUMN parser_version INTEGER;"))
+                if "fingerprint" not in col_names:
+                    conn.execute(text("ALTER TABLE resumes ADD COLUMN fingerprint VARCHAR(64);"))
+                conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS ix_resumes_fingerprint ON resumes (fingerprint);")
+                )
+                # Backfill the version identity of rows written before fingerprinting existed
+                # (issue #56). Uses the same helper the write paths use, so the formula cannot drift.
+                from backend.parser import resume_fingerprint
+
+                pending = conn.execute(
+                    text("SELECT id, content_encrypted FROM resumes WHERE fingerprint IS NULL")
+                ).fetchall()
+                for resume_id, encrypted in pending:
+                    try:
+                        fingerprint = resume_fingerprint(decrypt_data(encrypted))
+                    except Exception:
+                        continue
+                    conn.execute(
+                        text("UPDATE resumes SET fingerprint = :fp WHERE id = :rid"),
+                        {"fp": fingerprint, "rid": resume_id},
+                    )
 
         if "jobs" in existing_tables:
             col_names = {c["name"] for c in inspector.get_columns("jobs")}
@@ -622,6 +650,13 @@ def init_db(custom_url: str = None):
                     conn.execute(text("ALTER TABLE jobs ADD COLUMN embedding BLOB;"))
                 if "submission_confirmed" not in col_names:
                     conn.execute(text("ALTER TABLE jobs ADD COLUMN submission_confirmed BOOLEAN DEFAULT 0;"))
+                if "scored_resume_id" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN scored_resume_id INTEGER;"))
+                if "scored_resume_fingerprint" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN scored_resume_fingerprint VARCHAR(64);"))
+                    conn.execute(
+                        text("CREATE INDEX IF NOT EXISTS ix_jobs_scored_resume_fingerprint ON jobs (scored_resume_fingerprint);")
+                    )
                 if "match_scored" not in col_names:
                     conn.execute(text("ALTER TABLE jobs ADD COLUMN match_scored BOOLEAN DEFAULT 0;"))
                     # Backfill legacy rows whose score/analysis came from the AI analyzer
