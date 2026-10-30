@@ -53,8 +53,11 @@ def test_match_analyze_deterministic_classifier_path_no_llm(db_session):
     assert data["match_method"] == "classifier_v1"
     assert data["match_score"] is not None
     assert data["must_coverage"] == 0.75
-    assert 55 <= data["match_score"] <= 70
-    assert data["band"] in ("Moderate", "Good")
+    # This JD has no preferred section, so the score is measured over the components it does
+    # define (must 60 + seniority 15 + education 5 = 80) instead of scoring the empty
+    # nice-to-have set as 0% (issue #70): 78.1, not the pre-#70 58.1.
+    assert 75 <= data["match_score"] <= 80
+    assert data["band"] == "Good"
     # Transparent breakdown so the score is explainable.
     assert len(data["requirements"]) == 4
     assert "Python" in data["strengths"]
@@ -91,6 +94,34 @@ def test_match_analyze_detects_ai_stack_and_preferred_section(db_session):
     # Preferred section is parsed as nice-to-have (previously reported "nice-to-have 0%").
     assert any(r["category"] == "nice_to_have" for r in data["requirements"])
     mock_assess.assert_not_called()
+
+
+def test_feedback_says_no_nice_to_have_requirements_when_the_jd_states_none(db_session):
+    """An empty nice-to-have set is "the JD states none", not "you met 0%" (issue #70)."""
+    _add_active_resume(db_session, "Alice. Skills: Python, Kubernetes.")
+    res = client.post("/api/match/analyze", json={
+        "job_title": "Backend Engineer",
+        "job_description": "Requirements\nMust have Python and Kubernetes.",
+    })
+    assert res.status_code == 200
+    feedback = res.json()["feedback"]
+    assert "no nice-to-have requirements" in feedback
+    assert "nice-to-have 0%" not in feedback
+
+
+def test_feedback_still_reports_nice_coverage_when_the_jd_has_a_preferred_section(db_session):
+    _add_active_resume(db_session, "Alice. Skills: Python, Kubernetes.")
+    res = client.post("/api/match/analyze", json={
+        "job_title": "Backend Engineer",
+        "job_description": (
+            "Requirements\nMust have Python.\n"
+            "Preferred\nKubernetes experience is a plus.\n"
+        ),
+    })
+    assert res.status_code == 200
+    feedback = res.json()["feedback"]
+    assert "nice-to-have 100%" in feedback
+    assert "no nice-to-have requirements" not in feedback
 
 
 def test_match_analyze_unconfirmable_tenure_asks_user_to_decide(db_session):
