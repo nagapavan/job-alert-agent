@@ -415,23 +415,86 @@ def _line_heading_label(line: str) -> Optional[str]:
     return None
 
 
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+")
+
+
+def _line_spans(text: str) -> List[Tuple[int, int]]:
+    """Return (start, end) offsets of every line, keeping its terminator."""
+    units: List[Tuple[int, int]] = []
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        units.append((offset, offset + len(line)))
+        offset += len(line)
+    return units
+
+
+def _sentence_spans(text: str) -> List[Tuple[int, int]]:
+    """Return (start, end) offsets of every sentence in a text with no line breaks."""
+    units: List[Tuple[int, int]] = []
+    pos = 0
+    for match in _SENTENCE_BREAK.finditer(text):
+        if match.start() > pos:
+            units.append((pos, match.start()))
+        pos = match.end()
+    if pos < len(text):
+        units.append((pos, len(text)))
+    return units
+
+
+def _leading_heading_phrase(unit: str) -> Optional[str]:
+    """Label when a sentence *starts* with a known JD heading phrase followed by content.
+
+    Only reachable for a description that lost its line breaks (issue #53): the heading sits
+    mid-line, so "Preferred Qualifications Kubernetes is a plus." has to be recognised by
+    prefix. Longest phrase wins, so "Preferred Qualifications" is not read as a bare
+    "Preferred". A description that still has line breaks never takes this path, so its spans
+    stay exactly as they were.
+    """
+    words = unit.split()
+    for count in range(min(len(words), _HEADING_WORD_LIMIT), 0, -1):
+        label = _exact_phrase_label(" ".join(words[:count]), JD_HEADINGS)
+        if label != "unknown":
+            return label
+    return None
+
+
 def jd_section_spans(text: str) -> List[SectionSpan]:
-    """Split a JD into labelled spans. Text before the first heading is 'required'."""
+    """Split a JD into labelled spans. Text before the first heading is 'required'.
+
+    A description with no line breaks is segmented by sentence instead (issue #53), because a
+    flattened JD otherwise yields one unlabelled span and every preferred item is scored as a
+    must-have. Descriptions that still have line breaks keep the line-based behaviour
+    untouched — loosening it there reclassified hundreds of stored postings for no benefit.
+    """
     text = text or ""
+    flattened = "\n" not in text
+    units = _sentence_spans(text) if flattened else _line_spans(text)
     spans: List[SectionSpan] = []
     current_label = "required"
     current_start = 0
-    offset = 0
-    for line in text.splitlines(keepends=True):
-        label = _line_heading_label(line)
+    for start, end in units:
+        unit = text[start:end]
+        label = _line_heading_label(unit)
+        if label is None and flattened and start > 0:
+            label = _leading_heading_phrase(unit.strip())
         if label is not None:
-            if offset > current_start:
-                spans.append(SectionSpan(current_label, current_start, offset))
+            if start > current_start:
+                spans.append(SectionSpan(current_label, current_start, start))
             current_label = label
-            current_start = offset
-        offset += len(line)
+            current_start = start
     spans.append(SectionSpan(current_label, current_start, len(text)))
-    return [s for s in spans if s.end > s.start or not spans]
+    if not flattened:
+        return [s for s in spans if s.end > s.start or not spans]
+    # A flattened JD can restate a heading; coalescing keeps the span list meaningful.
+    merged: List[SectionSpan] = []
+    for span in spans:
+        if span.end <= span.start:
+            continue
+        if merged and merged[-1].label == span.label:
+            merged[-1] = SectionSpan(span.label, merged[-1].start, span.end)
+        else:
+            merged.append(span)
+    return merged or [SectionSpan("required", 0, len(text))]
 
 
 def label_at(spans: Sequence[SectionSpan], offset: int) -> str:
