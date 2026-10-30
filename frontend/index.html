@@ -354,6 +354,11 @@
                             title="Scan configured target company career boards for new openings">
                             <span class="btn-icon">⚡</span> Scan Portals
                         </button>
+                        <button id="btn-rescore-stale" class="btn btn-outline"
+                            onclick="rescoreStaleJobs()"
+                            title="Recompute scores that were produced by a different resume version">
+                            <span class="btn-icon">↻</span> Re-score Stale
+                        </button>
                         <button id="btn-stop-scrape" class="btn btn-danger btn-sm hidden" onclick="stopScrape()">
                             🛑 Stop Scan
                         </button>
@@ -1507,7 +1512,12 @@
                         <div>
                             <h4>ATS Compatibility Assessment</h4>
                             <p id="modal-match-summary">Detailed comparison against your active profile.</p>
+                            <p id="modal-score-provenance" class="score-provenance hidden"></p>
                         </div>
+                        <button id="modal-rescore-btn" class="btn btn-outline btn-sm"
+                            title="Recompute this score with your current resume">
+                            ↻ Re-score
+                        </button>
                     </div>
 
                     <!-- Tech Stack & Requirements Alignment Matrix -->

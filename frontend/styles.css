@@ -2400,6 +2400,19 @@ body {
     margin-bottom: 12px;
 }
 
+/* Score provenance: which resume version produced the number (issue #56). */
+.score-provenance {
+    margin: 6px 0 0;
+    font-size: 11.5px;
+    line-height: 1.45;
+    color: #fab387;
+}
+
+.match-score-banner #modal-rescore-btn {
+    margin-left: auto;
+    white-space: nowrap;
+}
+
 .match-score-circle {
     width: 56px;
     height: 56px;

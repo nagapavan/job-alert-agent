@@ -7871,6 +7871,9 @@ class TaskResponse(BaseModel):
 
 class RescoreRequest(BaseModel):
     limit: int = Field(default=200, ge=1, le=2000)
+    # Scope (issue #57): only rows scored against a different resume version, or exactly these ids.
+    stale_only: bool = False
+    job_ids: Optional[List[int]] = None
 
 
 def _match_analysis_text(assessment, match) -> str:
@@ -8114,10 +8117,67 @@ def audit_job_score(
     return _score_audit_response(job.id, assessment, result, cached, apply_changes)
 
 
+def _apply_scoring_result(db: Session, job: Job, result) -> None:
+    """Write a ScoringResult onto a job, including the resume version that produced it."""
+    job.match_score = result.score
+    job.match_analysis = result.analysis
+    job.match_scored = True
+    job.score_method = result.method
+    job.match_scored_at = result.timestamp
+    for field, value in _score_provenance(db).items():
+        setattr(job, field, value)
+    job.match_band = result.band
+    job.apply_recommendation = result.recommendation
+    job.match_strengths_json = json.dumps(result.strengths)
+    job.match_gaps_json = json.dumps(result.gaps)
+    job.match_partials_json = json.dumps(result.partials)
+
+
+@app.post("/api/jobs/{job_id}/rescore", response_model=JobOut)
+def rescore_job(job_id: int, db: Session = Depends(get_db)):
+    """Re-score a single job synchronously (issue #57).
+
+    This is the primitive lazy re-score needs: deterministic engine first, with the same bounded
+    LLM fallback discovery uses only when the deterministic path yields no requirements. Idempotent
+    — the engine is deterministic, so two tabs re-scoring the same job write the same values.
+    """
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    active = _active_resume_row(db)
+    if not active:
+        raise HTTPException(
+            status_code=400, detail="Upload a resume before re-scoring a job."
+        )
+
+    resume_text = decrypt_data(active.content_encrypted)
+    parsed_resume = _parsed_resume_of(active)
+    description = (job.description or job.title or "").strip()
+    result = _score_job_with_engine(
+        db,
+        resume_text,
+        description,
+        parsed_resume=parsed_resume,
+        job_title=job.title or "",
+    )
+    if not result.scored:
+        raise HTTPException(
+            status_code=409,
+            detail="This job could not be scored (no usable description or no extractable requirements).",
+        )
+
+    _apply_scoring_result(db, job, result)
+    db.commit()
+    db.refresh(job)
+    return _job_out(db, job)
+
+
 def _run_match_rescore_task_runner(
     cancel_token: Optional[CancellationToken] = None,
     progress_cb: Optional[Callable] = None,
     limit: int = 200,
+    stale_only: bool = False,
+    job_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Background re-score of existing jobs (deterministic engine first, bounded LLM fallback)."""
     db = next(get_db())
@@ -8154,13 +8214,18 @@ def _run_match_rescore_task_runner(
             except Exception as idx_err:
                 logger.debug(f"Resume chunk indexing skipped: {idx_err}")
 
-        jobs = (
-            db.query(Job)
-            .filter(Job.status.notin_(["Rejected", "Not Interested"]))
-            .order_by(Job.created_at.desc())
-            .limit(limit)
-            .all()
-        )
+        query = db.query(Job).filter(Job.status.notin_(["Rejected", "Not Interested"]))
+        if job_ids:
+            query = query.filter(Job.id.in_(job_ids))
+        if stale_only:
+            # Rows scored against a different resume version: stale (that version still exists)
+            # and deleted (it does not). NULL provenance is "unknown -> current" (#56) and is
+            # deliberately left alone.
+            query = query.filter(
+                Job.scored_resume_fingerprint.isnot(None),
+                Job.scored_resume_fingerprint != active.fingerprint,
+            )
+        jobs = query.order_by(Job.created_at.desc()).limit(limit).all()
 
         for idx, job in enumerate(jobs):
             if cancel_token:
@@ -8177,18 +8242,7 @@ def _run_match_rescore_task_runner(
                 if not result.scored:
                     failed += 1
                 else:
-                    job.match_score = result.score
-                    job.match_analysis = result.analysis
-                    job.match_scored = True
-                    job.score_method = result.method
-                    job.match_scored_at = result.timestamp
-                    for _field, _value in _score_provenance(db).items():
-                        setattr(job, _field, _value)
-                    job.match_band = result.band
-                    job.apply_recommendation = result.recommendation
-                    job.match_strengths_json = json.dumps(result.strengths)
-                    job.match_gaps_json = json.dumps(result.gaps)
-                    job.match_partials_json = json.dumps(result.partials)
+                    _apply_scoring_result(db, job, result)
                     rescored += 1
                     if result.method == "classifier_v1":
                         deterministic += 1
@@ -8262,17 +8316,31 @@ def _run_match_rescore_task_runner(
 def dispatch_match_rescore_task(payload: Optional[RescoreRequest] = None):
     """Dispatches a non-blocking re-score of existing jobs with the current engine."""
     limit = payload.limit if payload else 200
+    stale_only = bool(payload and payload.stale_only)
+    job_ids = list(payload.job_ids) if payload and payload.job_ids else None
+    if stale_only and job_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose either stale_only or job_ids, not both.",
+        )
+    scope = (
+        f"{len(job_ids)} selected job(s)"
+        if job_ids
+        else ("stale job(s)" if stale_only else f"up to {limit} job(s)")
+    )
     task_id = task_engine.submit_task(
         task_type="match_rescore",
-        task_name=f"Re-score Job Matches (up to {limit})",
+        task_name=f"Re-score {scope}",
         fn=_run_match_rescore_task_runner,
         total_steps=1,
         limit=limit,
+        stale_only=stale_only,
+        job_ids=job_ids,
     )
     return TaskResponse(
         task_id=task_id,
         status="QUEUED",
-        message=f"Match re-score queued for up to {limit} job(s).",
+        message=f"Match re-score queued for {scope}.",
     )
 
 
