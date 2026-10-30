@@ -115,6 +115,7 @@ from backend.parser import (
     RESUME_PARSER_VERSION,
     clean_job_description,
     parse_resume_document,
+    resume_fingerprint,
     split_candidate_name,
 )
 from backend.playwright_app import (
@@ -650,6 +651,11 @@ class JobOut(BaseModel):
     match_scored_at: Optional[datetime.datetime] = None
     match_band: Optional[str] = None
     apply_recommendation: Optional[str] = None
+    # Which resume version produced this score (issue #56). "current" also covers rows scored
+    # before provenance existed, per the decision that unknown is treated as current.
+    score_resume_state: str = "current"
+    score_resume_filename: Optional[str] = None
+    score_resume_created_at: Optional[datetime.datetime] = None
     applied_at: Optional[datetime.datetime] = None
     interview_scheduled_at: Optional[datetime.datetime] = None
     rejected_at: Optional[datetime.datetime] = None
@@ -2224,11 +2230,12 @@ def list_jobs(
     jobs = query.order_by(Job.created_at.desc()).all()
 
     # Attach company_name helper
+    prov_ctx = _resume_provenance_context(db)
     results = []
     for j in jobs:
         j_out = JobOut.model_validate(j)
         j_out.company_name = j.company.name if j.company else None
-        results.append(j_out)
+        results.append(_apply_score_provenance(j_out, j, prov_ctx))
     return results
 
 
@@ -2616,7 +2623,7 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
 
     j_out = JobOut.model_validate(job)
     j_out.company_name = company.name
-    return j_out
+    return _apply_score_provenance(j_out, job, _resume_provenance_context(db))
 
 
 @app.get("/api/jobs/scrape-audit")
@@ -2649,7 +2656,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Job not found.")
     j_out = JobOut.model_validate(job)
     j_out.company_name = job.company.name if job.company else None
-    return j_out
+    return _apply_score_provenance(j_out, job, _resume_provenance_context(db))
 
 
 @app.patch("/api/jobs/{job_id}/status", response_model=JobOut)
@@ -2704,7 +2711,7 @@ def update_job_status(
 
     j_out = JobOut.model_validate(job)
     j_out.company_name = job.company.name if job.company else None
-    return j_out
+    return _apply_score_provenance(j_out, job, _resume_provenance_context(db))
 
 
 @app.delete("/api/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -2922,6 +2929,7 @@ async def upload_resume(file: UploadFile = File(...), db: Session = Depends(get_
         content_encrypted=encrypted_content,
         parsed_json_encrypted=encrypted_parsed_json,
         parser_version=RESUME_PARSER_VERSION,
+        fingerprint=resume_fingerprint(raw_text),
         is_active=True,
     )
     db.add(new_resume)
@@ -3468,6 +3476,7 @@ def reparse_resume(resume_id: int, db: Session = Depends(get_db)):
 
     target.parsed_json_encrypted = encrypt_data(json.dumps(fresh))
     target.parser_version = RESUME_PARSER_VERSION
+    target.fingerprint = resume_fingerprint(raw_text)
     db.commit()
     db.refresh(target)
 
@@ -3980,6 +3989,7 @@ def _execute_ats_scrape(
                 match_scored=match_scored,
                 score_method=score_method,
                 match_scored_at=match_scored_at,
+                **(_score_provenance(db) if match_scored else {}),
                 match_band=match_band,
                 apply_recommendation=apply_recommendation,
                 match_strengths_json=json.dumps(strengths) if match_scored else None,
@@ -4474,7 +4484,7 @@ def confirm_job_submission(job_id: int, db: Session = Depends(get_db)):
     db.refresh(job)
     j_out = JobOut.model_validate(job)
     j_out.company_name = job.company.name if job.company else None
-    return j_out
+    return _apply_score_provenance(j_out, job, _resume_provenance_context(db))
 
 
 @app.post("/api/jobs/bulk-apply", response_model=BulkApplyResponse)
@@ -4804,6 +4814,74 @@ def _parsed_resume_of(resume):
         return json.loads(decrypt_data(resume.parsed_json_encrypted))
     except Exception:
         return None
+
+
+def _active_resume_row(db: Session):
+    return (
+        db.query(Resume)
+        .filter(Resume.is_active == True)  # noqa: E712 - ORM filter
+        .order_by(Resume.created_at.desc())
+        .first()
+    )
+
+
+def _score_provenance(db: Session) -> dict:
+    """The resume version a score computed now belongs to (issue #56).
+
+    Returns kwargs for ``Job(...)`` / setattr on an existing row. Empty when there is no resume,
+    so an unscored row is never given provenance it does not have.
+    """
+    resume = _active_resume_row(db)
+    if not resume:
+        return {}
+    return {
+        "scored_resume_id": resume.id,
+        "scored_resume_fingerprint": resume.fingerprint,
+    }
+
+
+def _resume_provenance_context(db: Session) -> dict:
+    """Lookup tables for deriving ``score_resume_state`` without a query per job."""
+    active = _active_resume_row(db)
+    known = {}
+    for fingerprint, filename, created_at in db.query(
+        Resume.fingerprint, Resume.filename, Resume.created_at
+    ).all():
+        if fingerprint:
+            known.setdefault(fingerprint, (filename, created_at))
+    return {
+        "active_fingerprint": active.fingerprint if active else None,
+        "known": known,
+    }
+
+
+def _apply_score_provenance(job_out: "JobOut", job: Job, ctx: dict) -> "JobOut":
+    """Label a serialized job with the state of the resume version that produced its score.
+
+    ``current`` also covers rows scored before provenance existed: unknown is treated as current
+    (decision on #56) so the existing feed is not retroactively marked degraded.
+    """
+    fingerprint = getattr(job, "scored_resume_fingerprint", None)
+    if not fingerprint:
+        job_out.score_resume_state = "current"
+        return job_out
+    if fingerprint == ctx.get("active_fingerprint"):
+        job_out.score_resume_state = "current"
+    elif fingerprint in ctx.get("known", {}):
+        job_out.score_resume_state = "stale"
+    else:
+        job_out.score_resume_state = "deleted"
+    filename, created_at = ctx.get("known", {}).get(fingerprint, (None, None))
+    job_out.score_resume_filename = filename
+    job_out.score_resume_created_at = created_at
+    return job_out
+
+
+def _job_out(db: Session, job: Job, ctx: Optional[dict] = None) -> "JobOut":
+    """Serialize a job with company name and score provenance attached."""
+    job_out = JobOut.model_validate(job)
+    job_out.company_name = job.company.name if job.company else None
+    return _apply_score_provenance(job_out, job, ctx or _resume_provenance_context(db))
 
 
 _JD_CUE_RE = re.compile(
@@ -5619,6 +5697,7 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                             match_scored=match_scored,
                             score_method=score_method,
                             match_scored_at=match_scored_at,
+                            **(_score_provenance(db) if match_scored else {}),
                             match_band=match_band,
                             apply_recommendation=apply_recommendation,
                             match_strengths_json=json.dumps(strengths) if match_scored else None,
@@ -5747,6 +5826,7 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
                                 match_scored=match_scored,
                                 score_method=score_method,
                                 match_scored_at=match_scored_at,
+                                **(_score_provenance(db) if match_scored else {}),
                                 match_band=match_band,
                                 apply_recommendation=apply_recommendation,
                                 match_strengths_json=json.dumps(strengths) if match_scored else None,
@@ -6114,6 +6194,7 @@ def scrape_google_jobs_endpoint(
                     match_scored=match_scored,
                     score_method=score_method,
                     match_scored_at=match_scored_at,
+                    **(_score_provenance(db) if match_scored else {}),
                     match_band=match_band,
                     apply_recommendation=apply_recommendation,
                     match_strengths_json=json.dumps(strengths) if match_scored else None,
@@ -6790,6 +6871,7 @@ def _execute_external_sync(
                             match_scored=match_scored,
                             score_method=score_method,
                             match_scored_at=match_scored_at,
+                            **(_score_provenance(db) if match_scored else {}),
                             match_band=match_band,
                             apply_recommendation=apply_recommendation,
                             match_strengths_json=json.dumps(strengths) if match_scored else None,
@@ -7439,6 +7521,7 @@ def _run_linkedin_sync_task_runner(
                                     match_scored=match_scored,
                                     score_method=score_method,
                                     match_scored_at=match_scored_at,
+                                    **(_score_provenance(db) if match_scored else {}),
                                     match_band=match_band,
                                     apply_recommendation=apply_recommendation,
                                     match_strengths_json=json.dumps(strengths) if match_scored else None,
@@ -8017,6 +8100,8 @@ def audit_job_score(
         job.score_method = "classifier_v1+judge"
         job.match_scored = True
         job.match_scored_at = datetime.datetime.now(datetime.timezone.utc)
+        for _field, _value in _score_provenance(db).items():
+            setattr(job, _field, _value)
         s, g, p = _derive_strengths_gaps(result["assessment"])
         job.match_strengths_json = json.dumps(s)
         job.match_gaps_json = json.dumps(g)
@@ -8097,6 +8182,8 @@ def _run_match_rescore_task_runner(
                     job.match_scored = True
                     job.score_method = result.method
                     job.match_scored_at = result.timestamp
+                    for _field, _value in _score_provenance(db).items():
+                        setattr(job, _field, _value)
                     job.match_band = result.band
                     job.apply_recommendation = result.recommendation
                     job.match_strengths_json = json.dumps(result.strengths)
