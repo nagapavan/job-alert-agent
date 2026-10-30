@@ -119,3 +119,72 @@ class TestMustHavePolicy:
             "Software Engineer", "", "Preferred: Vue experience is a bonus."
         )
         assert reason is None
+
+
+class TestTypographicNormalisation:
+    """Headings as JDs actually write them (issue #61).
+
+    An unfolded curly apostrophe defeats the whole heading vocabulary, so the requirements
+    body stays inside the preceding intro span and is masked out of scoring entirely.
+    """
+
+    @pytest.mark.parametrize(
+        "line, expected",
+        [
+            ("What you’ll be doing", "responsibilities"),      # U+2019
+            ("What you‘ll be doing", "responsibilities"),      # U+2018
+            ("What you’ll bring", "required"),
+            ("What you’ll do", "responsibilities"),
+            ("What we’re looking for", "required"),
+            ("Nice to have", "preferred"),
+        ],
+    )
+    def test_curly_apostrophes_classify_like_ascii(self, line, expected):
+        assert si.classify_heading(line, "jd") == expected
+        assert si.normalize_heading(line) == si.normalize_heading(
+            line.replace("\u2019", "'").replace("\u2018", "'")
+        )
+
+    @pytest.mark.parametrize(
+        "line, expected",
+        [
+            ("💻 WHAT YOU’LL BE DOING", "responsibilities"),
+            ("✨ WHAT YOU’LL BRING TO THE TEAM", "required"),
+            ("⚒️ Benefits", "boilerplate"),
+        ],
+    )
+    def test_leading_emoji_is_ignored(self, line, expected):
+        assert si.classify_heading(line, "jd") == expected
+
+    @pytest.mark.parametrize(
+        "line, expected",
+        [
+            (".NET Developer", ".net developer"),
+            ("C++ Engineer", "c++ engineer"),
+            ("Node.js", "node.js"),
+        ],
+    )
+    def test_leading_punctuation_that_belongs_to_a_name_survives(self, line, expected):
+        assert si.normalize_heading(line) == expected
+
+    def test_curly_apostrophe_heading_splits_the_jd(self):
+        """A real JD shape: intro, then a curly-apostrophe requirements heading."""
+        jd = (
+            "About the job\n\nWe are Wolt, we deliver things.\n\n"
+            "What you’ll be doing\n\nBuild backend services in Go and Kotlin.\n"
+            "Own Kubernetes deployments and Kafka pipelines.\n\n"
+            "What we offer\n\nA great team.\n"
+        )
+        spans = si.jd_section_spans(jd)
+        labels = [s.label for s in spans]
+        assert "responsibilities" in labels
+        resp = [s for s in spans if s.label == "responsibilities"][0]
+        body = jd[resp.start:resp.end]
+        assert "Kubernetes" in body and "Kafka" in body
+        # The intro must not swallow the requirements body any more.
+        intro = [s for s in spans if s.label == "intro"][0]
+        assert "Kubernetes" not in jd[intro.start:intro.end]
+
+    def test_ascii_headings_are_unchanged(self):
+        jd = "About us\n\nWe build tools.\n\nRequirements\n\nPython and Go.\n"
+        assert [s.label for s in si.jd_section_spans(jd)] == ["intro", "required"]

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -166,11 +167,44 @@ _EMBED_EXEMPLARS: Dict[str, Dict[str, Tuple[str, ...]]] = {
 _WS_RE = re.compile(r"\s+")
 _TRAILING_PUNCT_RE = re.compile(r"[\s:•●*\-.–—]+$")
 
+# Typographic punctuation JDs actually ship with. Unfolded, "What you’ll be doing" matches no
+# heading phrase, the requirements body stays inside the preceding intro span and is masked
+# out of scoring (issue #61).
+_QUOTE_FOLD = str.maketrans(
+    {
+        "\u2018": "'",  # ‘
+        "\u2019": "'",  # ’
+        "\u201b": "'",  # ‛
+        "\u201c": '"',  # “
+        "\u201d": '"',  # ”
+        "\u00a0": " ",  # nbsp
+    }
+)
+
+
+def _strip_leading_symbols(text: str) -> str:
+    """Drop leading emoji/variation selectors/control chars, keeping real punctuation.
+
+    Only symbol (S*), mark (M*) and control (C*) code points are removed, so a leading dot or
+    plus that is part of a name (".NET") survives.
+    """
+    i = 0
+    while i < len(text) and unicodedata.category(text[i])[0] in ("S", "M", "C"):
+        i += 1
+    return text[i:]
+
 
 def normalize_heading(line: str) -> str:
-    """Lowercase, collapse whitespace, strip leading bullets and trailing punctuation."""
-    text = (line or "").strip()
+    """Lowercase, collapse whitespace, strip bullets/emoji and trailing punctuation.
+
+    Typographic punctuation is folded to ASCII first: JDs routinely use ``’`` ("What you’ll
+    be doing") and an unfolded quote defeats the whole heading vocabulary, which silently
+    masks the requirements body as intro/boilerplate (issue #61). Leading emoji are dropped
+    for the same reason (``💻 WHAT YOU'LL BE DOING``).
+    """
+    text = (line or "").translate(_QUOTE_FOLD).strip()
     text = text.lstrip("".join(BULLET_CHARS)).strip()
+    text = _strip_leading_symbols(text).strip()
     text = _TRAILING_PUNCT_RE.sub("", text)
     text = _WS_RE.sub(" ", text)
     return text.lower()
