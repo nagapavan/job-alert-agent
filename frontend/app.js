@@ -3176,7 +3176,94 @@ function normalizeDisplayText(value) {
         .trim();
 }
 
+// ---------------------------------------------------------------------------
+// Resume versions (issue #58): every upload is a version. Scores remember which one
+// produced them, so deleting a version never rewrites a score silently.
+// ---------------------------------------------------------------------------
+function resumeVersionTags() {
+    // Oldest upload is v1. Tags are what make two identically-named files distinguishable
+    // without reading the date.
+    const ordered = [...(state.resumes || [])].sort(
+        (a, b) => new Date(a.created_at) - new Date(b.created_at)
+    );
+    const tags = new Map();
+    ordered.forEach((r, index) => tags.set(r.id, `v${index + 1}`));
+    return tags;
+}
+
+function renderResumeVersions() {
+    const container = document.getElementById("resume-versions-list");
+    if (!container) return;
+    const resumes = state.resumes || [];
+    if (resumes.length === 0) {
+        container.innerHTML = '<p class="text-dim" style="font-size:12.5px; margin:0;">No versions yet.</p>';
+        return;
+    }
+    const tags = resumeVersionTags();
+    container.innerHTML = resumes.map(r => {
+        const scores = r.score_count || 0;
+        const scoreBadge = scores
+            ? `<span class="badge warning" title="Stored scores produced by this version">${scores} score${scores === 1 ? "" : "s"}</span>`
+            : `<span class="badge" style="opacity:0.55;">no scores</span>`;
+        const parseBadge = r.parse_stale
+            ? `<span class="badge warning" title="Parsed by an older parser version — re-parse to refresh">stale parse</span>`
+            : "";
+        return `
+            <div class="resume-version-row${r.is_active ? " active" : ""}">
+                <div class="resume-version-main">
+                    <span class="resume-version-tag">${tags.get(r.id) || ""}</span>
+                    <span class="resume-version-name" title="${escapeHTML(r.filename)}">${escapeHTML(r.filename)}</span>
+                    ${r.is_active ? '<span class="badge verified">★ Active</span>' : ""}
+                    ${scoreBadge}
+                    ${parseBadge}
+                    <span class="date-tag">📅 ${formatDate(r.created_at)}</span>
+                </div>
+                <div class="resume-version-actions">
+                    ${r.is_active
+                        ? ""
+                        : `<button class="btn btn-secondary btn-sm" onclick="activateResume(${r.id})">Use this</button>`}
+                    <button class="btn btn-danger btn-sm"
+                        onclick="deleteResumeVersion(${r.id})"
+                        title="Delete this version">🗑️</button>
+                </div>
+            </div>`;
+    }).join("");
+}
+
+async function deleteResumeVersion(resumeId) {
+    const version = (state.resumes || []).find(r => r.id === resumeId);
+    if (!version) return;
+    const tags = resumeVersionTags();
+    const scores = version.score_count || 0;
+    const warning = scores
+        ? `\n\n${scores} stored score(s) were produced by this version. They keep their value and will be labelled "deleted"; re-score them afterwards if you want them refreshed.`
+        : "";
+    const activeNote = version.is_active
+        ? "\n\nThis is the active version. The newest remaining version becomes active."
+        : "";
+    if (!confirm(`Delete ${tags.get(resumeId) || ""} "${version.filename}"?${warning}${activeNote}`)) {
+        return;
+    }
+    try {
+        const res = await fetch(`${API_BASE}/api/resume/${resumeId}`, { method: "DELETE" });
+        if (!res.ok) {
+            const detail = await res.json().catch(() => ({}));
+            throw new Error(detail.detail || `Delete failed (${res.status})`);
+        }
+        const data = await res.json();
+        showToast(`🗑️ ${data.message || "Resume version deleted."}`, 6000);
+        await fetchResume();
+        if (state.jobs && state.jobs.length) {
+            // Score provenance changed for the jobs this version produced: refresh the feed labels.
+            await fetchJobs();
+        }
+    } catch (e) {
+        alert(e.message);
+    }
+}
+
 function renderResumeDetails() {
+    renderResumeVersions();
     const resumeDetailsEl = document.getElementById("resume-details");
     const uploadZone = document.getElementById("upload-zone");
     const selectorWrapper = document.getElementById("resume-selector-wrapper");
@@ -3195,9 +3282,10 @@ function renderResumeDetails() {
     if (state.resumes && state.resumes.length > 1) {
         if (selectorWrapper) selectorWrapper.classList.remove("hidden");
         if (selectDropdown) {
+            const tags = resumeVersionTags();
             selectDropdown.innerHTML = state.resumes.map(r => `
                 <option value="${r.id}" ${r.id === state.resume.id ? 'selected' : ''}>
-                    ${escapeHTML(r.filename)} (${formatDate(r.created_at)}) ${r.is_active ? '★ Active' : ''}
+                    ${tags.get(r.id) || ""} · ${escapeHTML(r.filename)}${r.is_active ? " ★" : ""}
                 </option>
             `).join("");
         }
