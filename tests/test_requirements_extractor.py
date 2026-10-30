@@ -9,9 +9,15 @@ class TestKeyPhrase:
     def test_strips_leadins(self):
         assert rx.key_phrase("Hands-on experience with Kubernetes") == "Kubernetes"
 
-    def test_caps_words(self):
-        phrase = rx.key_phrase("a b c d e f g h i j k")
-        assert len(phrase.split()) <= 8
+    def test_rejects_prose_instead_of_truncating(self):
+        """A long unit is prose; slicing it invents a phrase the JD never had (#52)."""
+        assert rx.key_phrase("a b c d e f g h i j k") == ""
+        assert rx.key_phrase(
+            "8+ years of professional software development experience, with"
+        ) == ""
+
+    def test_keeps_short_noun_phrase(self):
+        assert rx.key_phrase("event-driven architecture") == "event-driven architecture"
 
     def test_empty(self):
         assert rx.key_phrase("   ") == ""
@@ -69,6 +75,44 @@ class TestResidualExtraction:
             jd, spans, resume_text="demonstrated mentorship of engineers"
         )
         assert results and all(r["category"] == "nice_to_have" for r in results)
+
+    def test_prose_sentences_are_never_scored(self, monkeypatch, tmp_path):
+        """JD prose overlapping the resume must not become a must-have requirement (#52)."""
+        monkeypatch.setattr("backend.skill_taxonomy.CANDIDATES_PATH", tmp_path / "c.json")
+        jd = (
+            "Requirements:\n"
+            "- Lead the design and end-to-end delivery of complex systems.\n"
+            "- Drive the technical design discussions and facilitate technical reviews.\n"
+            "- Our platform is used by some of the largest customers.\n"
+            "- Prior experience as a technical lead is an asset.\n"
+        )
+        spans = si.jd_section_spans(jd)
+        resume = (
+            "Led the design and end-to-end delivery of complex systems. Drove technical design "
+            "discussions and facilitated technical reviews for the platform used by our largest "
+            "customers. Prior experience as a technical lead."
+        )
+        results = rx.extract_residual_requirements(jd, spans, resume_text=resume)
+        assert results == []
+
+    def test_prose_is_not_queued_as_candidate(self, monkeypatch, tmp_path):
+        """Prose rejected for scoring must also stay out of the taxonomy review queue."""
+        monkeypatch.setattr("backend.skill_taxonomy.CANDIDATES_PATH", tmp_path / "c.json")
+        jd = "Requirements:\n- Coding and delivery are core to who you are.\n"
+        spans = si.jd_section_spans(jd)
+        rx.extract_residual_requirements(jd, spans, resume_text="coding and delivery")
+        if (tmp_path / "c.json").exists():
+            keys = json.loads((tmp_path / "c.json").read_text())["counts"]
+            assert not any("coding and delivery" in k for k in keys)
+
+    def test_real_residual_skill_still_credited(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("backend.skill_taxonomy.CANDIDATES_PATH", tmp_path / "c.json")
+        jd = "Requirements:\n- Experience with event-driven architecture.\n"
+        spans = si.jd_section_spans(jd)
+        results = rx.extract_residual_requirements(
+            jd, spans, resume_text="Built event-driven architecture with Kafka."
+        )
+        assert [r["text"] for r in results] == ["event-driven architecture"]
 
 
 class TestMarkupStripping:
