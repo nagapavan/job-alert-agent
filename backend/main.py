@@ -8117,14 +8117,19 @@ def audit_job_score(
     return _score_audit_response(job.id, assessment, result, cached, apply_changes)
 
 
-def _apply_scoring_result(db: Session, job: Job, result) -> None:
-    """Write a ScoringResult onto a job, including the resume version that produced it."""
+def _apply_scoring_result(job: Job, result, provenance: dict) -> None:
+    """Write a ScoringResult onto a job.
+
+    ``provenance`` must be the resume version the result was computed against, captured when the
+    resume text was loaded. Re-reading the active resume here would stamp a score with a different
+    version if the user switches resumes during a long bulk run (issue #57 review).
+    """
     job.match_score = result.score
     job.match_analysis = result.analysis
     job.match_scored = True
     job.score_method = result.method
     job.match_scored_at = result.timestamp
-    for field, value in _score_provenance(db).items():
+    for field, value in provenance.items():
         setattr(job, field, value)
     job.match_band = result.band
     job.apply_recommendation = result.recommendation
@@ -8151,6 +8156,7 @@ def rescore_job(job_id: int, db: Session = Depends(get_db)):
         )
 
     resume_text = decrypt_data(active.content_encrypted)
+    provenance = _score_provenance(db)
     parsed_resume = _parsed_resume_of(active)
     description = (job.description or job.title or "").strip()
     result = _score_job_with_engine(
@@ -8166,7 +8172,7 @@ def rescore_job(job_id: int, db: Session = Depends(get_db)):
             detail="This job could not be scored (no usable description or no extractable requirements).",
         )
 
-    _apply_scoring_result(db, job, result)
+    _apply_scoring_result(job, result, provenance)
     db.commit()
     db.refresh(job)
     return _job_out(db, job)
@@ -8195,6 +8201,7 @@ def _run_match_rescore_task_runner(
             return {"rescored": 0, "failed": 0, "error": "no_active_resume"}
 
         resume_text = decrypt_data(active.content_encrypted)
+        provenance = _score_provenance(db)
         parsed_resume = None
         if active.parsed_json_encrypted:
             try:
@@ -8215,7 +8222,7 @@ def _run_match_rescore_task_runner(
                 logger.debug(f"Resume chunk indexing skipped: {idx_err}")
 
         query = db.query(Job).filter(Job.status.notin_(["Rejected", "Not Interested"]))
-        if job_ids:
+        if job_ids is not None:
             query = query.filter(Job.id.in_(job_ids))
         if stale_only:
             # Rows scored against a different resume version: stale (that version still exists)
@@ -8242,7 +8249,7 @@ def _run_match_rescore_task_runner(
                 if not result.scored:
                     failed += 1
                 else:
-                    _apply_scoring_result(db, job, result)
+                    _apply_scoring_result(job, result, provenance)
                     rescored += 1
                     if result.method == "classifier_v1":
                         deterministic += 1
@@ -8317,15 +8324,22 @@ def dispatch_match_rescore_task(payload: Optional[RescoreRequest] = None):
     """Dispatches a non-blocking re-score of existing jobs with the current engine."""
     limit = payload.limit if payload else 200
     stale_only = bool(payload and payload.stale_only)
-    job_ids = list(payload.job_ids) if payload and payload.job_ids else None
-    if stale_only and job_ids:
+    job_ids = list(payload.job_ids) if payload and payload.job_ids is not None else None
+    if stale_only and job_ids is not None:
         raise HTTPException(
             status_code=400,
             detail="Choose either stale_only or job_ids, not both.",
         )
+    if job_ids is not None:
+        if not job_ids:
+            raise HTTPException(status_code=400, detail="job_ids is empty; nothing to re-score.")
+        if len(job_ids) > 2000:
+            raise HTTPException(status_code=400, detail="At most 2000 job_ids per request.")
+        # The explicit selection is the whole scope: do not let the default limit truncate it.
+        limit = len(job_ids)
     scope = (
         f"{len(job_ids)} selected job(s)"
-        if job_ids
+        if job_ids is not None
         else ("stale job(s)" if stale_only else f"up to {limit} job(s)")
     )
     task_id = task_engine.submit_task(

@@ -34,6 +34,7 @@ let state = {
     jobs: [],
     selectedJobIds: new Set(),
     rescoreAttempted: new Set(), // job ids already lazy re-scored this session (never loop)
+    rescoreErrors: new Map(), // job id -> last re-score failure message, shown in the modal
     resume: null,
     resumes: [],
     activeJobModal: null,
@@ -3343,6 +3344,12 @@ function renderScoreProvenance(job) {
     const el = document.getElementById("modal-score-provenance");
     if (!el) return;
     const provState = job.score_resume_state || "current";
+    const failure = state.rescoreErrors.get(job.id);
+    if (failure) {
+        el.innerText = `⚠️ Re-score did not run: ${failure}`;
+        el.classList.remove("hidden");
+        return;
+    }
     if (provState === "current" || !job.match_scored) {
         el.classList.add("hidden");
         el.innerText = "";
@@ -3358,12 +3365,39 @@ function renderScoreProvenance(job) {
     el.classList.remove("hidden");
 }
 
+// Match-tab score panel. Shared by the modal and the re-score path, which must refresh the
+// score without re-opening the modal (that resets the chat transcript and active tab).
+function renderMatchPanel(job) {
+    // Score & Analysis
+    const hasScore = job.match_scored === true
+        && job.match_score !== null && job.match_score !== undefined;
+    const score = hasScore ? Math.round(job.match_score) : null;
+    const circleEl = document.getElementById("modal-score-circle");
+    if (hasScore) {
+        circleEl.innerText = `${score}%`;
+        circleEl.title = "AI match score";
+    } else {
+        circleEl.innerText = "—";
+        circleEl.title = "Not yet analyzed";
+    }
+    const unscoredCue = !hasScore
+        ? "\n\nℹ️ This role has not been AI match-scored. Run '⚡ Tailor AI' to generate a real ATS score."
+        : "";
+    document.getElementById("modal-analysis-details").innerText = (job.match_analysis || "Comparison summary available.") + unscoredCue;
+
+    renderGapInsights(job);
+    renderScoreProvenance(job);
+    const rescoreBtn = document.getElementById("modal-rescore-btn");
+    if (rescoreBtn) rescoreBtn.onclick = () => rescoreJob(job.id);
+}
+
 function applyJobUpdate(updated) {
     const idx = state.jobs.findIndex(j => j.id === updated.id);
     if (idx >= 0) state.jobs[idx] = updated;
+    state.rescoreErrors.delete(updated.id);
     if (state.activeJobModal && state.activeJobModal.id === updated.id) {
         state.activeJobModal = updated;
-        openJobDetailsModal(updated.id);
+        renderMatchPanel(updated);
     }
     applyJobFilters();
 }
@@ -3385,7 +3419,11 @@ async function rescoreJob(jobId, { silent = false } = {}) {
         if (!silent) showToast("↻ Re-scored with your current resume.");
         return updated;
     } catch (e) {
+        state.rescoreErrors.set(jobId, e.message);
         if (!silent) alert(e.message);
+        if (state.activeJobModal && state.activeJobModal.id === jobId) {
+            renderScoreProvenance(state.activeJobModal);
+        }
         return null;
     } finally {
         if (btn) {
@@ -3530,27 +3568,7 @@ function openJobDetailsModal(jobId) {
         }
     }
 
-    // Score & Analysis
-    const hasScore = job.match_scored === true
-        && job.match_score !== null && job.match_score !== undefined;
-    const score = hasScore ? Math.round(job.match_score) : null;
-    const circleEl = document.getElementById("modal-score-circle");
-    if (hasScore) {
-        circleEl.innerText = `${score}%`;
-        circleEl.title = "AI match score";
-    } else {
-        circleEl.innerText = "—";
-        circleEl.title = "Not yet analyzed";
-    }
-    const unscoredCue = !hasScore
-        ? "\n\nℹ️ This role has not been AI match-scored. Run '⚡ Tailor AI' to generate a real ATS score."
-        : "";
-    document.getElementById("modal-analysis-details").innerText = (job.match_analysis || "Comparison summary available.") + unscoredCue;
-
-    renderGapInsights(job);
-    renderScoreProvenance(job);
-    const rescoreBtn = document.getElementById("modal-rescore-btn");
-    if (rescoreBtn) rescoreBtn.onclick = () => rescoreJob(job.id);
+    renderMatchPanel(job);
 
     // Cover Letter
     document.getElementById("modal-cover-letter-text").value = job.cover_letter_draft || "Click '⚡ Tailor AI' to generate a tailored cover letter for this role.";

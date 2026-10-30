@@ -160,3 +160,40 @@ class TestScopedBulkRescore:
         assert res.status_code == 202
         assert submit.call_args.kwargs["stale_only"] is True
         assert "stale" in res.json()["message"]
+
+
+class TestReviewFixes:
+    """Regression tests for the #57 review: provenance capture, explicit job_ids scope."""
+
+    def test_writer_stamps_the_provenance_it_was_given_not_the_active_resume(self, db_session):
+        """A resume switch during a run must not re-label scores computed on the old text."""
+        from backend.main import ScoringResult, _apply_scoring_result
+
+        _resume(db_session, text="the resume that was actually scored against")
+        job = _job(db_session, url="prov-1")
+        result = ScoringResult(
+            score=72.0, analysis="", scored=True, method="classifier_v1",
+            timestamp=None, band="Good", recommendation="apply",
+            strengths=[], gaps=[], partials=[],
+        )
+        captured = {"scored_resume_id": 41, "scored_resume_fingerprint": "c" * 64}
+        _apply_scoring_result(job, result, captured)
+        assert job.scored_resume_id == 41
+        assert job.scored_resume_fingerprint == "c" * 64
+
+    def test_empty_job_ids_is_rejected_not_treated_as_all(self, db_session):
+        res = client.post("/api/match/rescore", json={"job_ids": []})
+        assert res.status_code == 400
+
+    def test_job_ids_are_not_truncated_by_the_default_limit(self, db_session):
+        ids = list(range(1, 251))  # more than the default limit of 200
+        with patch("backend.main.task_engine.submit_task") as submit:
+            submit.return_value = "tsk_test"
+            res = client.post("/api/match/rescore", json={"job_ids": ids})
+        assert res.status_code == 202
+        assert submit.call_args.kwargs["limit"] == 250
+        assert "250 selected" in res.json()["message"]
+
+    def test_job_ids_over_the_cap_are_rejected(self, db_session):
+        res = client.post("/api/match/rescore", json={"job_ids": list(range(1, 2002))})
+        assert res.status_code == 400
