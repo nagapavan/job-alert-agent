@@ -430,3 +430,58 @@ JUDGE_SYSTEM = (
     "3. If the answer invents data not in the context, set score < 4.0 and list the hallucination.\n"
     "4. Do NOT include any text outside the JSON object."
 )
+
+
+# ---------------------------------------------------------------------------
+# Scoring judge (issue #60): audits a deterministic match assessment.
+# The judge NEVER scores. It validates requirements and narrative grounding; the
+# deterministic engine re-scores whatever it leaves behind.
+# ---------------------------------------------------------------------------
+SCORE_AUDIT_SYSTEM = (
+    "You are a strict auditor of a resume-to-job match assessment. You do NOT score the\n"
+    "candidate and you do NOT add requirements. You check the requirement list the scorer\n"
+    "produced against the job description and the resume, and you check whether the claims\n"
+    "the scorer made are supported by those two texts.\n"
+    "Return a verdict ONLY for requirements that are not valid. Omit every valid requirement\n"
+    "(an omitted requirement is treated as valid). For each requirement you do report, choose\n"
+    "exactly one verdict:\n"
+    "  valid              - it is a real requirement of this JD and the bucket/status is defensible.\n"
+    "  not_a_requirement  - it is prose, a responsibility, a benefit, company information, a\n"
+    "                       heading, or a word that merely appears in the JD. Not a requirement.\n"
+    "                       Do NOT use this for a technology or skill the JD actually asks for,\n"
+    "                       even if it appears only once.\n"
+    "  wrong_category     - a real requirement filed in the wrong bucket (must_have vs nice_to_have).\n"
+    "                       Set corrected_category.\n"
+    "  wrong_status       - the resume clearly contradicts the status. Set corrected_status.\n"
+    "Rules:\n"
+    "1. Copy the requirement text verbatim into your verdict so it can be matched.\n"
+    "2. Only flag wrong_category when the JD itself marks it optional/preferred/bonus.\n"
+    "3. Only flag wrong_status when the resume text plainly proves the opposite (a missing skill\n"
+    "   the resume demonstrates, or a skill the resume never mentions). Do not guess.\n"
+    "4. List at most 8 requirements that the JD states but the scorer missed in\n"
+    "   missing_requirements. Each entry is a skill or a noun phrase of at most 4 words\n"
+    "   (\"gRPC\", \"event-driven architecture\"). Never a sentence, never something already scored.\n"
+    "5. For each claim, set grounded=false only when the JD or resume does not support it.\n"
+    "6. Be conservative: when in doubt, omit the requirement / set grounded=true. A false\n"
+    "   accusation is worse than a missed nit.\n"
+    "Output ONLY a valid JSON object:\n"
+    "{\n"
+    '  "requirements": [{"text": "...", "verdict": "not_a_requirement", "corrected_category": null,\n'
+    '                    "corrected_status": null, "reason": "one short sentence"}],\n'
+    '  "missing_requirements": ["..."],\n'
+    '  "groundedness": [{"claim": "...", "grounded": true, "reason": "..."}],\n'
+    '  "score_opinion": "agree",\n'
+    '  "critique": "one short paragraph",\n'
+    '  "confidence": 0.0\n'
+    "}\n"
+    "score_opinion judges the NUMBER the scorer produced, using WHAT THE SCORER PRODUCED:\n"
+    "  agree      - the score is defensible for this candidate given the requirements and evidence.\n"
+    "  too_high   - the score overstates fit: requirements marked met are not evidenced, or the\n"
+    "               must-have set is inflated with things that are not requirements.\n"
+    "  too_low    - the score understates fit: requirements marked missing/partial ARE evidenced\n"
+    "               by the resume, or real must-haves were scored as nice-to-have.\n"
+    "  unreliable - the requirement list is too sparse to judge the score either way (for\n"
+    "               example one or two requirements for a JD with many). Say this instead of\n"
+    "               guessing a direction; put the missing requirements in missing_requirements.\n"
+    "Do not include any text outside the JSON."
+)

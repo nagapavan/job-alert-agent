@@ -135,6 +135,9 @@ LLM_AUDIT_MAX_CONTENT_CHARS = int(os.environ.get("LLM_AUDIT_MAX_CONTENT_CHARS", 
 # strict token-economy. max_regenerations bounds how many retries the judge may trigger.
 COPILOT_JUDGE_ENABLED = os.environ.get("COPILOT_JUDGE_ENABLED", "true").lower() in ("true", "1", "yes")
 COPILOT_JUDGE_MAX_REGEN = int(os.environ.get("COPILOT_JUDGE_MAX_REGEN", "1"))
+# Scoring judge (issue #60): audits a deterministic match assessment and bounds the
+# audit -> re-score -> re-audit loop. On-demand only, never in discovery.
+SCORE_JUDGE_MAX_ROUNDS = int(os.environ.get("SCORE_JUDGE_MAX_ROUNDS", "1"))
 # Interactive endpoints must not block on the LLM for the full timeout; the match-analysis
 # LLM fallback aborts after this many seconds and returns a fast unverified state.
 LLM_INTERACTIVE_TIMEOUT = int(os.environ.get("LLM_INTERACTIVE_TIMEOUT", "30"))
