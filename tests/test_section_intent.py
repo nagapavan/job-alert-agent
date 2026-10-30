@@ -188,3 +188,126 @@ class TestTypographicNormalisation:
     def test_ascii_headings_are_unchanged(self):
         jd = "About us\n\nWe build tools.\n\nRequirements\n\nPython and Go.\n"
         assert [s.label for s in si.jd_section_spans(jd)] == ["intro", "required"]
+
+
+class TestSingleLineSegmentation:
+    """A JD flattened onto one line still gets section labels (issue #53).
+
+    Sentence boundaries are secondary heading anchors, so a posting whose newlines were lost
+    in transit no longer scores every preferred item as a must-have.
+    """
+
+    FLAT = (
+        "About us we build things. Responsibilities Design systems. "
+        "Minimum Qualifications Python and SQL. "
+        "Preferred Qualifications Kubernetes is a plus."
+    )
+
+    def test_headings_without_colons_are_detected_mid_line(self):
+        labels = [s.label for s in si.jd_section_spans(self.FLAT)]
+        assert labels == ["required", "responsibilities", "required", "preferred"]
+
+    def test_the_preferred_items_land_in_the_preferred_span(self):
+        spans = si.jd_section_spans(self.FLAT)
+        preferred = [s for s in spans if s.label == "preferred"]
+        assert len(preferred) == 1
+        assert "Kubernetes" in self.FLAT[preferred[0].start:preferred[0].end]
+        assert si.label_at(spans, self.FLAT.index("Kubernetes")) == "preferred"
+
+    def test_colon_separated_headings_are_detected_mid_line(self):
+        jd = (
+            "About us we build things. Responsibilities: Design systems. "
+            "Minimum Qualifications: Python. Preferred Qualifications: Kubernetes."
+        )
+        labels = [s.label for s in si.jd_section_spans(jd)]
+        assert "preferred" in labels
+        assert si.label_at(si.jd_section_spans(jd), jd.index("Kubernetes")) == "preferred"
+
+    def test_flattened_spans_cover_the_whole_text_without_overlap(self):
+        spans = si.jd_section_spans(self.FLAT)
+        assert spans[0].start == 0
+        assert spans[-1].end == len(self.FLAT)
+        for left, right in zip(spans, spans[1:]):
+            assert left.end == right.start
+
+    def test_flattening_never_loses_a_label(self):
+        """The loose rule applies mid-line only, so flattening can add labels, never drop one.
+
+        At a line start the strict rule stays in force: loosening it there reclassified 416 of
+        951 stored descriptions, which is far outside this issue's scope.
+        """
+        multiline = self.FLAT.replace(". ", ".\n")
+        assert set(s.label for s in si.jd_section_spans(multiline)) <= set(
+            s.label for s in si.jd_section_spans(self.FLAT)
+        )
+
+    def test_a_line_start_is_never_loosened(self):
+        """A prose line that merely begins with a heading word must not open a section."""
+        jd = (
+            "Requirements: Python.\n"
+            "Preferred Qualifications Kubernetes is a plus, but we will train.\n"
+        )
+        spans = si.jd_section_spans(jd)
+        # The line starts with "Preferred Qualifications" but carries content, so the strict
+        # rule rejects it and the section does not flip.
+        assert [s.label for s in spans] == ["required"]
+
+    def test_a_longest_heading_phrase_wins_over_its_prefix(self):
+        """"Preferred Qualifications" must not be read as a bare "Preferred"."""
+        jd = "Minimum Qualifications Python. Preferred Qualifications Kubernetes."
+        spans = si.jd_section_spans(jd)
+        assert spans[-1].label == "preferred"
+        assert "Preferred Qualifications" in jd[spans[-1].start:spans[-1].end]
+
+    def test_a_line_start_heading_is_unaffected(self):
+        """The existing strict rule still governs headings that own their line."""
+        jd = "Requirements: Python.\nPreferred Qualifications\nKubernetes is a plus."
+        labels = [s.label for s in si.jd_section_spans(jd)]
+        assert labels == ["required", "preferred"]
+
+    def test_ordinary_prose_does_not_open_a_section(self):
+        jd = (
+            "About us we build things. Kubernetes is a plus for this role. "
+            "Minimum Qualifications Python."
+        )
+        # "Kubernetes is a plus" starts with a noun, not a heading phrase, so no new section
+        # opens, and the restated "Minimum Qualifications" coalesces with the current one.
+        labels = [s.label for s in si.jd_section_spans(jd)]
+        assert labels == ["required"]
+        assert "preferred" not in labels
+
+    def test_a_heading_free_blob_stays_a_single_required_span(self):
+        """Documented limitation: with no heading text there is nothing to anchor on.
+
+        A Schema.org/JSON-LD blob that carries no heading words at all cannot be segmented
+        from its own text, however it is split.
+        """
+        blob = " ".join(["We build software that helps teams ship faster."] * 40)
+        spans = si.jd_section_spans(blob)
+        assert [s.label for s in spans] == ["required"]
+
+
+class TestLineBreaksDisableSentenceSegmentation:
+    """Sentence segmentation is a fallback for flattened JDs only (issue #53).
+
+    Loosening the rule for descriptions that still have line breaks reclassified hundreds of
+    stored postings, so the line-based behaviour must stay exactly as it was.
+    """
+
+    def test_a_multi_sentence_line_is_not_split(self):
+        jd = "Preferred Qualifications: Kubernetes. Requirements: Python.\n"
+        spans = si.jd_section_spans(jd)
+        assert [s.label for s in spans] == ["preferred"]
+        assert spans[0].end == len(jd)
+
+    def test_multi_line_spans_are_unchanged_by_the_flattened_path(self):
+        jd = "Requirements: Python.\nPreferred Qualifications: Kubernetes.\n"
+        spans = si.jd_section_spans(jd)
+        assert [s.label for s in spans] == ["required", "preferred"]
+        assert spans[0].start == 0
+        assert spans[-1].end == len(jd)
+
+    def test_flattening_the_same_text_adds_the_preferred_section(self):
+        flat = "Requirements: Python. Preferred Qualifications: Kubernetes."
+        labels = [s.label for s in si.jd_section_spans(flat)]
+        assert "preferred" in labels
