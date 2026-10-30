@@ -4022,3 +4022,59 @@ body {
     font-weight: 500;
     color: var(--text-dim);
 }
+
+
+/* Resume versions (issue #58) */
+.resume-versions-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 4px;
+}
+
+.resume-version-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.02);
+    flex-wrap: wrap;
+}
+
+.resume-version-row.active {
+    border-color: rgba(166, 227, 161, 0.45);
+}
+
+.resume-version-main {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    min-width: 0;
+}
+
+.resume-version-tag {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-dim);
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 5px;
+    padding: 2px 6px;
+}
+
+.resume-version-name {
+    font-size: 13px;
+    color: var(--text-main);
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.resume-version-actions {
+    display: flex;
+    gap: 6px;
+}

@@ -789,6 +789,22 @@
                             </div>
                         </div>
 
+                        <!-- Resume versions (issue #58): every upload is kept, and scores remember
+                             which version produced them. -->
+                        <div class="pref-card pref-card-wide" id="resume-versions-card">
+                            <div class="pref-card-header">
+                                <div class="pref-header-title">
+                                    <span class="pref-header-icon">🗂️</span>
+                                    <h4>Resume Versions</h4>
+                                </div>
+                                <p class="section-desc" style="margin:0; max-width:420px;">
+                                    Every upload is kept as a version. A stored score remembers the version
+                                    that produced it, so deleting one never rewrites a score silently.
+                                </p>
+                            </div>
+                            <div id="resume-versions-list" class="resume-versions-list"></div>
+                        </div>
+
                         <!-- Card 4: Application Q&A Memory Bank -->
                         <div class="pref-card">
                             <div class="pref-card-header">

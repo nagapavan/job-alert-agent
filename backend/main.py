@@ -691,6 +691,9 @@ class ResumeOut(BaseModel):
     # produced it and whether that is still the current one.
     parser_version: Optional[int] = None
     parse_stale: bool = False
+    # How many stored job scores were produced by this version (issue #58). Non-zero means
+    # deleting it orphans those scores, which the UI warns about before the fact.
+    score_count: int = 0
 
 
 class ScrapeRequest(BaseModel):
@@ -3296,6 +3299,7 @@ def update_preferences(payload: UserPreferenceIn, db: Session = Depends(get_db))
 def list_resumes(db: Session = Depends(get_db)):
     """Lists all uploaded resumes with decryption and ATS status."""
     resumes = db.query(Resume).order_by(Resume.created_at.desc()).all()
+    score_counts = _resume_score_counts(db)
     results = []
     for r in resumes:
         decrypted_content = decrypt_data(r.content_encrypted)
@@ -3316,6 +3320,7 @@ def list_resumes(db: Session = Depends(get_db)):
                 parsed_json=parsed_json,
                 parser_version=r.parser_version,
                 parse_stale=(r.parser_version or 0) < RESUME_PARSER_VERSION,
+                score_count=score_counts.get(r.fingerprint, 0),
             )
         )
     return results
@@ -3361,17 +3366,37 @@ def delete_single_resume(resume_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Resume not found.")
 
     filename = target.filename
+    fingerprint = target.fingerprint
     was_active = target.is_active
+    orphaned = 0
+    if fingerprint:
+        orphaned = (
+            db.query(Job).filter(Job.scored_resume_fingerprint == fingerprint).count()
+        )
     db.delete(target)
     db.commit()
 
+    activated = None
     if was_active:
         latest = db.query(Resume).order_by(Resume.created_at.desc()).first()
         if latest:
             latest.is_active = True
             db.commit()
+            activated = latest.filename
 
-    return {"message": f"Resume '{filename}' deleted successfully."}
+    message = f"Resume '{filename}' deleted successfully."
+    if activated:
+        message += f" '{activated}' is now the active profile."
+    if orphaned:
+        message += (
+            f" {orphaned} stored score(s) keep their value and are now labelled 'deleted'."
+        )
+    return {
+        "message": message,
+        "deleted_id": resume_id,
+        "orphaned_scores": orphaned,
+        "active_resume_filename": activated,
+    }
 
 
 @app.delete("/api/resume", status_code=status.HTTP_200_OK)
@@ -4838,6 +4863,19 @@ def _score_provenance(db: Session) -> dict:
         "scored_resume_id": resume.id,
         "scored_resume_fingerprint": resume.fingerprint,
     }
+
+
+def _resume_score_counts(db: Session) -> dict:
+    """Map resume fingerprint -> number of stored scores produced by it (issue #58)."""
+    from sqlalchemy import func
+
+    rows = (
+        db.query(Job.scored_resume_fingerprint, func.count(Job.id))
+        .filter(Job.scored_resume_fingerprint.isnot(None))
+        .group_by(Job.scored_resume_fingerprint)
+        .all()
+    )
+    return {fingerprint: count for fingerprint, count in rows if fingerprint}
 
 
 def _resume_provenance_context(db: Session) -> dict:
