@@ -4,7 +4,7 @@ import logging
 import datetime
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text, 
-    DateTime, Float, ForeignKey, Boolean, TypeDecorator
+    DateTime, Float, ForeignKey, Boolean, TypeDecorator, UniqueConstraint
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, synonym
 from backend.config import DATABASE_URL, SQLITE_URL, encrypt_data, decrypt_data, cipher
@@ -308,6 +308,31 @@ class ProcessedEmail(Base):
     processed_at = Column(DateTime, default=utc_now)
 
 
+class ScoreAuditRecord(Base):
+    """One scoring-judge audit of a job's deterministic assessment (issue #60).
+
+    Doubles as the audit cache (keyed by job + assessment hash, so an unchanged assessment is
+    never re-audited) and as a label source for the self-learning pipeline: a verdict of
+    ``not_a_requirement`` or ``wrong_status`` is a high-precision training label.
+    """
+
+    __tablename__ = "score_audits"
+    __table_args__ = (
+        UniqueConstraint("job_id", "assessment_hash", name="uq_score_audit_job_hash"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_id = Column(
+        Integer, ForeignKey("jobs.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    assessment_hash = Column(String(64), index=True, nullable=False)
+    verdict_json = Column(Text, nullable=True)
+    score_before = Column(Float, nullable=True)
+    score_after = Column(Float, nullable=True)
+    applied = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=utc_now)
+
+
 class UserPreference(Base):
     """
     Single-row candidate search preferences + opt-in discovery feature flags.
@@ -359,6 +384,8 @@ DEFAULT_FEATURE_FLAGS = {
     "ats_hirist": True,
     # ---- UI insight surfaces ----
     "resume_gap_insights": True,  # show structured resume-gap/strength insights per job
+    # ---- On-demand LLM audit of a score (never used during discovery) ----
+    "score_judge": False,
     # ---- Unofficial / ambiguous endpoints: opt-in with consent ----
     "ats_smartrecruiters": False,
     "ats_workable": False,

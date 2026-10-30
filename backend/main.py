@@ -95,6 +95,7 @@ from backend.database import (
     Job,
     OperationLog,
     Resume,
+    ScoreAuditRecord,
     get_consents,
     get_db,
     get_feature_flags,
@@ -7731,6 +7732,231 @@ def _match_analysis_text(assessment, match) -> str:
     return assessment.summary or ""
 
 
+class ScoreAuditRequest(BaseModel):
+    apply: bool = False
+    allow_drops: bool = False
+    provider: Optional[str] = None
+
+
+class ScoreAuditRequirementOut(BaseModel):
+    text: str
+    category: str
+    status: str
+
+
+class ScoreAuditResponse(BaseModel):
+    job_id: int
+    cached: bool = False
+    applied: bool = False
+    score_before: float = 0.0
+    score_after: float = 0.0
+    band_before: str = ""
+    band_after: str = ""
+    must_coverage_before: float = 0.0
+    must_coverage_after: float = 0.0
+    rounds: int = 0
+    converged: bool = False
+    requirements: List[ScoreAuditRequirementOut] = []
+    removed: List[str] = []
+    flagged: List[str] = []
+    relabelled: List[str] = []
+    missing_requirements: List[str] = []
+    ungrounded_claims: List[str] = []
+    score_opinion: str = "agree"
+    critique: str = ""
+    confidence: float = 0.0
+
+
+def _score_audit_response(job_id, original, result, cached, applied) -> ScoreAuditResponse:
+    """Shape a validate_score() result for the API, diffing before/after requirements."""
+    corrected = result["assessment"]
+    after_texts = {r.text for r in corrected.requirements}
+    removed = [r.text for r in original.requirements if r.text not in after_texts]
+    flagged = [
+        v.text
+        for v in (getattr(result.get("audit"), "requirements", None) or [])
+        if v.verdict == "not_a_requirement"
+    ]
+    before_by_text = {r.text: r for r in original.requirements}
+    relabelled = [
+        r.text
+        for r in corrected.requirements
+        if (b := before_by_text.get(r.text)) is not None
+        and (b.category != r.category or b.status != r.status)
+    ]
+    audit = result.get("audit")
+    return ScoreAuditResponse(
+        job_id=job_id,
+        cached=cached,
+        applied=applied,
+        score_before=result["score_before"],
+        score_after=result["score_after"],
+        band_before=result["before"]["band"],
+        band_after=result["after"]["band"],
+        must_coverage_before=result["before"]["must_coverage"],
+        must_coverage_after=result["after"]["must_coverage"],
+        rounds=result.get("rounds", 0),
+        converged=bool(result.get("converged")),
+        requirements=[
+            ScoreAuditRequirementOut(text=r.text, category=r.category, status=r.status)
+            for r in corrected.requirements
+        ],
+        removed=removed,
+        flagged=flagged,
+        relabelled=relabelled,
+        missing_requirements=list(getattr(audit, "missing_requirements", []) or []),
+        ungrounded_claims=[
+            g.claim for g in (getattr(audit, "groundedness", []) or []) if not g.grounded
+        ],
+        score_opinion=getattr(audit, "score_opinion", "agree"),
+        critique=getattr(audit, "critique", ""),
+        confidence=float(getattr(audit, "confidence", 0.0) or 0.0),
+    )
+
+
+@app.post("/api/jobs/{job_id}/score-audit", response_model=ScoreAuditResponse)
+def audit_job_score(
+    job_id: int,
+    req: Optional[ScoreAuditRequest] = None,
+    db: Session = Depends(get_db),
+):
+    """On-demand judge audit of a job's deterministic score (issue #60).
+
+    The judge never scores: it validates the requirement set and the narrative claims, and the
+    deterministic engine re-scores whatever survives. ``apply=false`` (the default) reports the
+    corrected score without touching the stored one.
+    """
+    if not is_feature_enabled(db, "score_judge"):
+        raise HTTPException(
+            status_code=403,
+            detail="The scoring judge is off. Enable 'score_judge' in Settings -> Features.",
+        )
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    active_resume = (
+        db.query(Resume)
+        .filter(Resume.is_active == True)
+        .order_by(Resume.created_at.desc())
+        .first()
+    )
+    if not active_resume:
+        raise HTTPException(
+            status_code=400, detail="Upload a resume before auditing a score."
+        )
+
+    from backend.match_classifier import build_deterministic_assessment
+    from backend.score_judge import (
+        ScoreAudit,
+        apply_audit,
+        assessment_hash,
+        rescore,
+        validate_score,
+    )
+
+    description = job.description or ""
+    resume_text = decrypt_data(active_resume.content_encrypted)
+    parsed_resume = _parsed_resume_of(active_resume)
+    assessment = build_deterministic_assessment(
+        description, parsed_resume, resume_text=resume_text, job_title=job.title or ""
+    )
+    if not assessment.requirements:
+        raise HTTPException(
+            status_code=422,
+            detail="No requirements could be extracted from this job description, so there is nothing to audit.",
+        )
+
+    config = ScoringConfig.from_mapping(get_scoring_config(db))
+    ahash = assessment_hash(assessment)
+    record = (
+        db.query(ScoreAuditRecord)
+        .filter(
+            ScoreAuditRecord.job_id == job.id,
+            ScoreAuditRecord.assessment_hash == ahash,
+        )
+        .first()
+    )
+    apply_changes = bool(req and req.apply)
+    cached = False
+    result = None
+
+    if record and record.verdict_json:
+        try:
+            audit = ScoreAudit.model_validate(json.loads(record.verdict_json))
+        except Exception:
+            audit = None
+        if audit is not None:
+            corrected = apply_audit(assessment, audit)
+            before = rescore(assessment, parsed_resume, description, job.title or "", config)
+            after = rescore(corrected, parsed_resume, description, job.title or "", config)
+            result = {
+                "audit": audit,
+                "assessment": corrected,
+                "score_before": before["score"],
+                "score_after": after["score"],
+                "before": before,
+                "after": after,
+                "rounds": 0,
+                "converged": True,
+            }
+            cached = True
+
+    if result is None:
+        strengths, gaps, partials = _derive_strengths_gaps(assessment)
+        claims = (strengths[:4] + partials[:4] + gaps[:4])[:12]
+        result = validate_score(
+            assessment,
+            parsed_resume,
+            description,
+            resume_text=resume_text,
+            job_title=job.title or "",
+            claims=claims,
+            provider=req.provider if req else None,
+            config=config,
+            allow_drops=bool(req and req.allow_drops),
+        )
+        audit = result.get("audit")
+        if audit is None:
+            raise HTTPException(
+                status_code=502,
+                detail="The scoring judge could not run (no LLM responded). The stored score is unchanged.",
+            )
+        if record is None:
+            record = ScoreAuditRecord(
+                job_id=job.id,
+                assessment_hash=ahash,
+                verdict_json=audit.model_dump_json(),
+                score_before=result["score_before"],
+                score_after=result["score_after"],
+                applied=False,
+            )
+            db.add(record)
+        else:
+            record.verdict_json = audit.model_dump_json()
+            record.score_before = result["score_before"]
+            record.score_after = result["score_after"]
+        db.commit()
+
+    if apply_changes:
+        after = result["after"]
+        job.match_score = after["score"]
+        job.match_band = after["band"]
+        job.apply_recommendation = after["recommendation"]
+        job.score_method = "classifier_v1+judge"
+        job.match_scored = True
+        job.match_scored_at = datetime.datetime.now(datetime.timezone.utc)
+        s, g, p = _derive_strengths_gaps(result["assessment"])
+        job.match_strengths_json = json.dumps(s)
+        job.match_gaps_json = json.dumps(g)
+        job.match_partials_json = json.dumps(p)
+        job.match_analysis = _match_analysis_text(result["assessment"], None)
+        if record:
+            record.applied = True
+        db.commit()
+
+    return _score_audit_response(job.id, assessment, result, cached, apply_changes)
+
+
 def _run_match_rescore_task_runner(
     cancel_token: Optional[CancellationToken] = None,
     progress_cb: Optional[Callable] = None,
@@ -8146,9 +8372,9 @@ def _deterministic_match(
     # Runs in milliseconds with no LLM call, so bulk ATS scoring does not saturate
     # the LLM queue. Falls through to the LLM extractor only if it cannot produce
     # a usable assessment.
-    from backend import jd_signals
     from backend.match_classifier import (
         build_deterministic_assessment,
+        build_jd_hints,
         extract_match_features,
         get_classifier,
     )
@@ -8169,19 +8395,7 @@ def _deterministic_match(
         if not known:
             return None
 
-        exp_hints = jd_signals.parse_experience(description)
-        min_years = max(
-            (h.get("min_years") for h in exp_hints if h.get("min_years")), default=None
-        )
-        max_years = max(
-            (h.get("max_years") for h in exp_hints if h.get("max_years")), default=None
-        )
-        jd_hints = {
-            "min_years": min_years or 0,
-            "max_years": max_years or 100,
-            "seniority_level": jd_signals.seniority_level(job_title or ""),
-            "education_mentioned": bool(jd_signals.parse_education(description)),
-        }
+        jd_hints = build_jd_hints(description, job_title or "")
         features = extract_match_features(
             parsed_resume, jd_hints, assessment=assessment
         )

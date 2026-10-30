@@ -121,6 +121,29 @@ def load_classifier() -> SimpleHeuristicClassifier | TrainedClassifier:
         return SimpleHeuristicClassifier()
 
 
+def build_jd_hints(description: str, job_title: str = "") -> dict:
+    """JD-side hints consumed by ``extract_match_features`` (years bounds, seniority, education).
+
+    Single implementation shared by live scoring and the scoring judge, so an audit always
+    re-scores against the same JD interpretation as the original score.
+    """
+    from backend import jd_signals
+
+    exp_hints = jd_signals.parse_experience(description or "")
+    min_years = max(
+        (h.get("min_years") for h in exp_hints if h.get("min_years")), default=None
+    )
+    max_years = max(
+        (h.get("max_years") for h in exp_hints if h.get("max_years")), default=None
+    )
+    return {
+        "min_years": min_years or 0,
+        "max_years": max_years or 100,
+        "seniority_level": jd_signals.seniority_level(job_title or ""),
+        "education_mentioned": bool(jd_signals.parse_education(description or "")),
+    }
+
+
 def extract_match_features(
     parsed_resume: Optional[dict],
     jd_hints: dict,
