@@ -1685,6 +1685,15 @@
                         <button id="copy-cold-msg-btn" class="btn btn-sm btn-primary">Copy Note</button>
                     </div>
                     <textarea id="modal-cold-msg-text" class="text-area-view note-box" readonly></textarea>
+
+                    <!-- Human-in-the-loop guidance (issue #27): portals that forbid auto-fill still
+                         get help. Points are JD must-haves the resume evidences - never generated. -->
+                    <div id="modal-outreach-guidance" class="outreach-guidance hidden">
+                        <h5>Things to cover</h5>
+                        <p class="tab-tip">Write this one yourself — these are the JD requirements your
+                            resume already evidences, so every claim is one you can defend.</p>
+                        <ul id="modal-outreach-guidance-list"></ul>
+                    </div>
                 </div>
 
                 <!-- Tab 5: RAG Interview Coach -->
