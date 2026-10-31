@@ -642,6 +642,9 @@ class JobOut(BaseModel):
     cover_letter_draft: Optional[str] = None
     tailored_resume_points: Optional[str] = None
     cold_message_draft: Optional[str] = None
+    # Talking points for human-written fields (issue #27). Deterministic, never generated:
+    # only JD must-haves the resume evidences. Populated when a draft exists.
+    outreach_guidance: Optional[List[Dict[str, Any]]] = None
     is_ghost_job: bool
     repost_count: int
     submission_confirmed: bool = False
@@ -2657,9 +2660,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
-    j_out = JobOut.model_validate(job)
-    j_out.company_name = job.company.name if job.company else None
-    return _apply_score_provenance(j_out, job, _resume_provenance_context(db))
+    return _job_out(db, job)
 
 
 @app.patch("/api/jobs/{job_id}/status", response_model=JobOut)
@@ -4256,7 +4257,7 @@ def tailor_single_job(
 
     db.commit()
     db.refresh(job)
-    return job
+    return _job_out(db, job)
 
 
 @app.post("/api/jobs/bulk-tailor")
@@ -4915,11 +4916,41 @@ def _apply_score_provenance(job_out: "JobOut", job: Job, ctx: dict) -> "JobOut":
     return job_out
 
 
+def _attach_outreach_guidance(db: Session, job: Job, job_out: "JobOut") -> "JobOut":
+    """Attach human-in-the-loop talking points when the job has an outreach draft (issue #27).
+
+    Derived on read from the JD and the active resume, so nothing is persisted and no score is
+    affected. Best-effort: a failure here must never break serialization.
+    """
+    if not job.cold_message_draft:
+        return job_out
+    try:
+        active = (
+            db.query(Resume)
+            .filter(Resume.is_active == True)
+            .order_by(Resume.created_at.desc())
+            .first()
+        )
+        if not active:
+            return job_out
+        from backend.ai_helper import build_outreach_guidance
+
+        job_out.outreach_guidance = build_outreach_guidance(
+            job.description or "",
+            decrypt_data(active.content_encrypted),
+            job.title or "",
+        )
+    except Exception as e:
+        logger.debug(f"Outreach guidance unavailable for job {job.id}: {e}")
+    return job_out
+
+
 def _job_out(db: Session, job: Job, ctx: Optional[dict] = None) -> "JobOut":
     """Serialize a job with company name and score provenance attached."""
     job_out = JobOut.model_validate(job)
     job_out.company_name = job.company.name if job.company else None
-    return _apply_score_provenance(job_out, job, ctx or _resume_provenance_context(db))
+    _apply_score_provenance(job_out, job, ctx or _resume_provenance_context(db))
+    return _attach_outreach_guidance(db, job, job_out)
 
 
 _JD_CUE_RE = re.compile(

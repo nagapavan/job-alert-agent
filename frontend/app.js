@@ -3455,6 +3455,30 @@ function renderScoreProvenance(job) {
 
 // Match-tab score panel. Shared by the modal and the re-score path, which must refresh the
 // score without re-opening the modal (that resets the chat transcript and active tab).
+// Human-in-the-loop guidance (issue #27): portals that require human-written text must not be
+// auto-filled. The backend returns the JD must-haves the resume evidences; this renders them as
+// talking points and never as a draft.
+function renderOutreachGuidance(job) {
+    const wrapper = document.getElementById("modal-outreach-guidance");
+    const list = document.getElementById("modal-outreach-guidance-list");
+    if (!wrapper || !list) return;
+    const points = (job && job.outreach_guidance) || [];
+    if (!points.length) {
+        wrapper.classList.add("hidden");
+        list.innerHTML = "";
+        return;
+    }
+    list.innerHTML = points.map(p => {
+        const partial = p.status === "partial";
+        return `<li>
+            <span class="guidance-requirement">${escapeHTML(p.requirement)}</span>
+            <span class="badge ${partial ? "warning" : "verified"}">${partial ? "partial" : "met"}</span>
+            <span class="guidance-angle">${escapeHTML(p.angle || "")}</span>
+        </li>`;
+    }).join("");
+    wrapper.classList.remove("hidden");
+}
+
 function renderMatchPanel(job) {
     // Score & Analysis
     const hasScore = job.match_scored === true
@@ -3666,6 +3690,7 @@ function openJobDetailsModal(jobId) {
 
     // Cold note
     document.getElementById("modal-cold-msg-text").value = job.cold_message_draft || "Click '⚡ Tailor AI' to generate a concise LinkedIn connection note.";
+    renderOutreachGuidance(job);
 
     // Reset Chat
     document.getElementById("chat-messages").innerHTML = `

@@ -2457,6 +2457,68 @@ def _jd_relevant_skills(
     return ordered
 
 
+def build_outreach_guidance(
+    job_description: str = "",
+    resume_text: str = "",
+    job_title: str = "",
+    limit: int = 6,
+) -> List[dict]:
+    """Deterministic talking points for fields a human must write (issue #27).
+
+    Some portals explicitly require human-written text, so the tool must not fill those fields.
+    It can still help: this lists the JD's must-have requirements the resume genuinely
+    evidences, so the candidate composes the message around claims they can defend.
+
+    Nothing here is generated — every point is a requirement the deterministic scorer already
+    matched — so a resume that lacks the JD's stack yields no talking points rather than
+    invented ones.
+    """
+    job_description = (job_description or "").strip()
+    if not job_description:
+        return []
+
+    try:
+        from backend.match_classifier import build_deterministic_assessment
+        from backend.match_scoring import MET, MUST_HAVE, PARTIAL
+
+        assessment = build_deterministic_assessment(
+            job_description,
+            None,
+            resume_text=resume_text or "",
+            job_title=job_title or "",
+        )
+    except Exception as e:
+        logger.debug(f"Outreach guidance unavailable: {e}")
+        return []
+
+    points: List[dict] = []
+    seen = set()
+    for req in assessment.requirements:
+        if req.category != MUST_HAVE or req.status not in (MET, PARTIAL):
+            continue
+        text = (req.text or "").strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        points.append(
+            {
+                "requirement": text,
+                "status": req.status,
+                "angle": (
+                    f"Point to {text}: the JD lists it as a must-have and your resume "
+                    f"evidences it."
+                    if req.status == MET
+                    else f"Be specific about {text}: the JD requires it and your resume only "
+                    f"partly covers it."
+                ),
+            }
+        )
+        if len(points) >= limit:
+            break
+    return points
+
+
 # -------------------------------------------------------------
 # LinkedIn Cold Outreach Message Drafter
 # -------------------------------------------------------------
