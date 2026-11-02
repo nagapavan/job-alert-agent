@@ -506,6 +506,37 @@ def test_google_jobs_task_runner_uses_valid_fetch_kwargs(
     assert "max_results" in kwargs
 
 
+@patch("backend.main.fetch_google_jobs_playwright")
+@patch("backend.main.fetch_google_jobs")
+@patch("backend.main.get_db")
+def test_google_jobs_runner_reports_partial_when_no_query_returns_postings(
+    mock_get_db, mock_fetch, mock_fetch_pw, db_session
+):
+    """A scan where every query came back empty is degraded, not a success (issue #75)."""
+    from backend.database import OperationLog
+    from backend.main import _run_google_jobs_task_runner
+
+    mock_get_db.return_value = iter([db_session])
+    mock_fetch.return_value = []
+    mock_fetch_pw.return_value = []
+
+    result = _run_google_jobs_task_runner(
+        queries=["Backend Engineer jobs"], location="India"
+    )
+
+    assert result["jobs_found"] == 0
+    assert result["status"] == "Partial"
+
+    log = (
+        db_session.query(OperationLog)
+        .filter(OperationLog.operation_type == "google_jobs_background_scan")
+        .order_by(OperationLog.id.desc())
+        .first()
+    )
+    assert log is not None and log.status == "Partial"
+    assert "Degraded" in log.summary
+
+
 def test_fetch_jobs_via_jobspy_maps_rows(monkeypatch):
     """JobSpy adapter maps the DataFrame rows into our normalized job dicts."""
     import backend.scraper as s

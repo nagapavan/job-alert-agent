@@ -68,6 +68,7 @@ table says which file owns which concern; `AGENTS.md` §1 and §10.2 describe th
 | [`backend/resume_index.py`](../backend/resume_index.py) | RAG-lite resume chunking. `chunk_resume` splits parsed JSON into skills/role/project chunks; `index_resume_chunks` persists them into `resume_chunks`; `top_evidence` returns the chunks most similar to a query. |
 | [`backend/learning_signals.py`](../backend/learning_signals.py) | Implicit-signal labelling for classifier training. `derive_decision` maps tracked outcomes to `positive`/`strong_positive`/`negative`/`negative_outcome` with `user_initiated` vs `system_generated` provenance; `learning_readiness` reports the trainable counts. |
 | [`backend/shutdown.py`](../backend/shutdown.py) | Bounded graceful drain (`run_shutdown`, `is_shutting_down`) invoked from the ASGI shutdown lifecycle. Order: scheduler → task engine → LLM queue → browser-profile locks. See `AGENTS.md` §12.11. |
+| [`backend/channel_status.py`](../backend/channel_status.py) | Per-channel discovery outcomes (`ok`, `skipped_flag`, `not_connected`, `dependency_missing`, `degraded_zero`, `error`) plus `aggregate_status`/`describe`. Runners record outcomes so `OperationLog.status` can be `Partial`/`Failed` instead of a misleading `success` when a channel never executed. |
 
 Supporting data/config:
 

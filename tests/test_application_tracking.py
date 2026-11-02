@@ -391,7 +391,13 @@ def test_build_service_clears_token_on_invalid_grant():
          patch("backend.config.save_gmail_settings") as mock_save:
         with pytest.raises(RuntimeError, match="invalid_grant"):
             gmail_client.build_service("cid", "secret", "dead-token")
-    mock_save.assert_called_once_with(refresh_token="")
+    mock_save.assert_called_once()
+    kwargs = mock_save.call_args.kwargs
+    assert kwargs["refresh_token"] == ""
+    # The reason must be persisted so the UI can say "needs reconnect (expired <date>)"
+    # instead of a bare "not connected".
+    assert kwargs["token_expired_at"]
+    assert "invalid_grant" in kwargs["last_error"]
 
 
 def test_build_service_reraises_non_invalid_grant():
