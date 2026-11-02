@@ -471,6 +471,9 @@
                     <!-- Sync Review Banner: surfaces "N new from sync" jobs still needing review -->
                     <div id="sync-review-banner" class="sync-review-banner hidden"></div>
 
+                    <!-- Discovery health banner: a requested channel that silently degraded -->
+                    <div id="discovery-health-banner" class="sync-review-banner hidden"></div>
+
                     <div class="panel-header">
                         <div class="search-box">
                             <input type="text" id="job-search-input"
@@ -998,7 +1001,7 @@
                                     <span class="pref-header-icon">📡</span>
                                     <h4>Discovery Engines</h4>
                                 </div>
-                                <span class="badge active" style="font-size: 10px;">6 Available</span>
+                                <span class="badge active" id="discovery-engine-badge" style="font-size: 10px;">Checking…</span>
                             </div>
 
                             <div class="discovery-channels-sidebar">
@@ -1033,6 +1036,17 @@
                                             onclick="triggerExternalSync()">Sync</button>
                                     </div>
                                     <p class="discovery-channel-item-desc">Hirist, Greenhouse, Gmail</p>
+                                </div>
+
+                                <!-- Channel 3b: Gmail application-status sync -->
+                                <div class="discovery-channel-item">
+                                    <div class="discovery-channel-item-header">
+                                        <span class="discovery-channel-item-icon">📧</span>
+                                        <h5 class="discovery-channel-item-title">Gmail</h5>
+                                        <button type="button" class="btn btn-sm btn-outline discovery-channel-btn"
+                                            id="gmail-engine-sync-btn" onclick="syncGmailNow()">Sync now</button>
+                                    </div>
+                                    <p class="discovery-channel-item-desc" id="gmail-engine-status">Checking…</p>
                                 </div>
 
                                 <!-- Channel 4: Google for Jobs Scanner -->

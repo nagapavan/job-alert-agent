@@ -8,6 +8,7 @@ Design principles (see plan §/docs):
 - Google API libraries are imported lazily so the app and tests run without them installed.
 """
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("gmail_client")
@@ -140,7 +141,16 @@ def build_service(client_id: str, client_secret: str, refresh_token: str):
             try:
                 from backend.config import save_gmail_settings
 
-                save_gmail_settings(refresh_token="")
+                # Persist *why* the connection is unusable so the UI can say
+                # "Needs reconnect (expired <date>)" instead of "not connected".
+                save_gmail_settings(
+                    refresh_token="",
+                    token_expired_at=datetime.now(timezone.utc).isoformat(),
+                    last_error=(
+                        "Google rejected the stored refresh token (invalid_grant). "
+                        "Reconnect Gmail in Settings."
+                    ),
+                )
             except Exception:
                 pass
             logger.warning("Gmail refresh token is expired/revoked; cleared it (reconnect required).")
@@ -297,6 +307,14 @@ def get_status() -> Dict[str, Any]:
         "configured": is_gmail_configured(),
         "email": s["token_email"] or "",
         "connected_at": s["connected_at"] or "",
+        "token_expired_at": s["token_expired_at"] or "",
+        "last_error": s["last_error"] or "",
+        # True when credentials exist but Google rejected the token: the operator must
+        # reconnect. Distinguishes "expired" from "never configured".
+        "needs_reconnect": bool(
+            s["client_id"] and s["client_secret"] and not s["refresh_token"]
+            and s["token_expired_at"]
+        ),
         "scopes": GMAIL_SCOPES,
         "redirect_uri": GMAIL_REDIRECT_URI,
     }

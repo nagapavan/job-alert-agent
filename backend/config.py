@@ -224,6 +224,9 @@ GMAIL_SETTINGS_FILE = BASE_DIR / "data" / "gmail_settings.json"
 _GMAIL_DEFAULTS = {
     "client_id": "", "client_secret": "", "refresh_token": "",
     "token_email": "", "history_id": "", "connected_at": "", "code_verifier": "",
+    # Why the connection is not usable, surfaced in the UI instead of a bare
+    # "Client saved — not connected." Both are non-secret diagnostics.
+    "token_expired_at": "", "last_error": "",
 }
 
 
@@ -233,7 +236,8 @@ def _read_gmail_settings() -> dict:
         return settings
     try:
         raw = json.loads(GMAIL_SETTINGS_FILE.read_text("utf-8"))
-        for key in ("client_id", "token_email", "history_id", "connected_at"):
+        for key in ("client_id", "token_email", "history_id", "connected_at",
+                    "token_expired_at", "last_error"):
             settings[key] = raw.get(key) or ""
         for key in ("client_secret", "refresh_token", "code_verifier"):
             token = raw.get(key) or ""
@@ -255,14 +259,15 @@ def is_gmail_configured() -> bool:
 
 def save_gmail_settings(client_id=None, client_secret=None, refresh_token=None,
                         token_email=None, history_id=None, connected_at=None,
-                        code_verifier=None) -> dict:
+                        code_verifier=None, token_expired_at=None, last_error=None) -> dict:
     """Persists Gmail settings, encrypting sensitive fields. None leaves a value unchanged."""
     current = _read_gmail_settings()
     for key, value in (
         ("client_id", client_id), ("client_secret", client_secret),
         ("refresh_token", refresh_token), ("token_email", token_email),
         ("history_id", history_id), ("connected_at", connected_at),
-        ("code_verifier", code_verifier),
+        ("code_verifier", code_verifier), ("token_expired_at", token_expired_at),
+        ("last_error", last_error),
     ):
         if value is not None:
             current[key] = value
@@ -275,6 +280,8 @@ def save_gmail_settings(client_id=None, client_secret=None, refresh_token=None,
         "history_id": current["history_id"],
         "connected_at": current["connected_at"],
         "code_verifier": encrypt_data(current["code_verifier"]) if current["code_verifier"] else "",
+        "token_expired_at": current["token_expired_at"],
+        "last_error": current["last_error"],
     }
     GMAIL_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     GMAIL_SETTINGS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")

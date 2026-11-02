@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
+from backend import channel_status
 from backend.ai_helper import TASK_PROFILES, TaskComplexity, get_model_for_tier
 from backend.config import (
     DEFAULT_LLM_PROVIDER,
@@ -753,6 +754,9 @@ class ExternalSyncResponse(BaseModel):
     opportunities_added: int = 0
     details: List[str] = []
     message: str = ""
+    # "success" | "Partial" | "Failed" — see backend.channel_status.aggregate_status.
+    status: str = "success"
+    channels: List[dict] = []
 
 
 LATEST_SCRAPE_AUDIT: List[dict] = []
@@ -1783,6 +1787,9 @@ def gmail_oauth2callback(code: Optional[str] = None, error: Optional[str] = None
         token_email=tokens.get("email", ""),
         connected_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
         code_verifier="",
+        # A fresh token clears the previous failure diagnostics.
+        token_expired_at="",
+        last_error="",
     )
     return HTMLResponse(
         "<h3>✅ Gmail connected.</h3><p>You can close this tab and return to Job Alert Agent.</p>"
@@ -6789,6 +6796,8 @@ def _execute_external_sync(
     status_updates = 0
     opportunities_added = 0
     details = []
+    # Per-channel outcomes so the run status can be honest (see backend.channel_status).
+    outcomes = []
 
     def _source_enabled(source: str, flag: str) -> bool:
         """Probing runs only when the source is requested AND its portal flag is enabled."""
@@ -6797,6 +6806,9 @@ def _execute_external_sync(
         if not is_feature_enabled(db, flag):
             details.append(
                 f"{source} probing skipped: enable '{flag}' in Settings → Discovery Features."
+            )
+            channel_status.record(
+                outcomes, source, channel_status.SKIPPED_FLAG, f"'{flag}' disabled"
             )
             return False
         return True
@@ -6972,9 +6984,13 @@ def _execute_external_sync(
                         )
 
                 db.commit()
+            channel_status.record(
+                outcomes, "hirist", channel_status.OK, f"{hirist_checked} application(s) checked"
+            )
         except Exception as e:
             logger.error(f"Error during Hirist application sync: {e}")
             details.append(f"Hirist sync error: {str(e)}")
+            channel_status.record(outcomes, "hirist", channel_status.ERROR, str(e))
 
     if cancel_token:
         cancel_token.check()
@@ -6984,11 +7000,15 @@ def _execute_external_sync(
         details.append(
             "Gmail sync skipped: enable 'Gmail sync' in Settings → Opt-in Discovery Features."
         )
+        channel_status.record(
+            outcomes, "gmail", channel_status.SKIPPED_FLAG, "'gmail_sync' disabled"
+        )
 
     if "gmail" in payload.sources and is_feature_enabled(db, "gmail_sync"):
         email_events = []
         used_api = False
         api_error = None
+        fallback_error = None
         # API-first when connected; otherwise restricted browser fallback.
         if is_gmail_configured():
             try:
@@ -7014,6 +7034,7 @@ def _execute_external_sync(
                         p, headless=payload.headless
                     )
             except Exception as e:
+                fallback_error = str(e)
                 logger.error(f"Error during browser email status sync: {e}")
                 details.append(f"Email sync notice: {str(e)}")
 
@@ -7023,6 +7044,35 @@ def _execute_external_sync(
         if opportunities_added:
             details.append(
                 f"Gmail opportunities tracked: {opportunities_added} new role(s)."
+            )
+
+        # Honest channel outcome: "0 emails" is only meaningful when the API path ran.
+        if used_api:
+            channel_status.record(
+                outcomes, "gmail", channel_status.OK, f"{emails_checked} message(s) matched"
+            )
+        elif fallback_error:
+            channel_status.record(
+                outcomes, "gmail", channel_status.ERROR, fallback_error
+            )
+        elif api_error:
+            channel_status.record(
+                outcomes, "gmail", channel_status.NOT_CONNECTED, api_error
+            )
+        elif emails_checked == 0:
+            channel_status.record(
+                outcomes,
+                "gmail",
+                channel_status.DEGRADED_ZERO,
+                "Gmail API not connected and the browser fallback found 0 messages; "
+                "reconnect Gmail in Settings to use the API path.",
+            )
+        else:
+            channel_status.record(
+                outcomes,
+                "gmail",
+                channel_status.OK,
+                f"restricted browser fallback, {emails_checked} message(s) matched",
             )
 
     if cancel_token:
@@ -7060,9 +7110,14 @@ def _execute_external_sync(
                         f"Greenhouse requisition closed for '{gh_job.title}'"
                     )
 
+            channel_status.record(
+                outcomes, "greenhouse", channel_status.OK,
+                f"{len(greenhouse_jobs)} requisition(s) probed",
+            )
             db.commit()
         except Exception as e:
             logger.debug(f"Error during Greenhouse requisition probe: {e}")
+            channel_status.record(outcomes, "greenhouse", channel_status.ERROR, str(e))
 
     if cancel_token:
         cancel_token.check()
@@ -7096,9 +7151,14 @@ def _execute_external_sync(
                     status_updates += 1
                     details.append(f"Lever requisition closed for '{lv_job.title}'")
 
+            channel_status.record(
+                outcomes, "lever", channel_status.OK,
+                f"{len(lever_jobs)} requisition(s) probed",
+            )
             db.commit()
         except Exception as e:
             logger.debug(f"Error during Lever requisition probe: {e}")
+            channel_status.record(outcomes, "lever", channel_status.ERROR, str(e))
 
     if cancel_token:
         cancel_token.check()
@@ -7134,17 +7194,34 @@ def _execute_external_sync(
                         f"SmartRecruiters requisition closed for '{sr_job.title}'"
                     )
 
+            channel_status.record(
+                outcomes, "smartrecruiters", channel_status.OK,
+                f"{len(sr_jobs)} posting(s) probed",
+            )
             db.commit()
         except Exception as e:
             logger.debug(f"Error during SmartRecruiters requisition probe: {e}")
+            channel_status.record(outcomes, "smartrecruiters", channel_status.ERROR, str(e))
 
-    # Log operation telemetry
+    # Log operation telemetry. Status reflects what actually happened: a run where a
+    # requested channel never executed is not a success.
+    run_status = channel_status.aggregate_status(outcomes)
+    degraded_note = channel_status.describe(outcomes)
+    summary = (
+        f"External Sync: {hirist_checked} Hirist checked ({hirist_updated} updated, "
+        f"{hirist_ingested} ingested), {emails_checked} emails scanned "
+        f"({status_updates} status updates, {opportunities_added} opportunities)."
+    )
+    if degraded_note:
+        summary = f"{summary} Degraded — {degraded_note}"
     db.add(
         OperationLog(
             operation_type="external_application_sync",
-            status="success",
-            summary=f"External Sync: {hirist_checked} Hirist checked ({hirist_updated} updated, {hirist_ingested} ingested), {emails_checked} emails scanned ({status_updates} status updates, {opportunities_added} opportunities).",
-            details_json=sanitize_log_details(details),
+            status=run_status,
+            summary=summary,
+            details_json=sanitize_log_details(
+                {"details": details, "channels": outcomes}
+            ),
             jobs_count=hirist_checked + emails_checked,
             prompt_tokens=0,
             completion_tokens=0,
@@ -7169,6 +7246,8 @@ def _execute_external_sync(
         opportunities_added=opportunities_added,
         details=details,
         message=f"Synced successfully: {hirist_updated + status_updates} status updates, {hirist_ingested} new applications tracked.",
+        status=run_status,
+        channels=outcomes,
     )
 
 
@@ -7189,6 +7268,9 @@ def _run_google_jobs_task_runner(
     db = next(db_gen)
     total_discovered = 0
     errors_count = 0
+    # How many queries actually returned raw postings. Zero across all queries means the
+    # fetcher produced nothing, which is NOT the same as "no new roles to add".
+    queries_with_results = 0
 
     try:
         if not queries or len(queries) == 0:
@@ -7297,6 +7379,9 @@ def _run_google_jobs_task_runner(
                         f"[JobSpy] Direct SERP empty for '{q_str}'; JobSpy fallback disabled (jobspy_google off)."
                     )
 
+                if raw_jobs:
+                    queries_with_results += 1
+
                 for rj in raw_jobs:
                     if cancel_token:
                         cancel_token.check()
@@ -7374,13 +7459,42 @@ def _run_google_jobs_task_runner(
                 total_steps=total_steps,
             )
 
+        gjo_outcomes = []
+        if errors_count >= total_steps:
+            channel_status.record(
+                gjo_outcomes, "google_jobs", channel_status.ERROR,
+                f"all {total_steps} queries raised",
+            )
+        elif queries_with_results == 0:
+            channel_status.record(
+                gjo_outcomes, "google_jobs", channel_status.DEGRADED_ZERO,
+                f"0 of {total_steps} queries returned any posting",
+            )
+        else:
+            channel_status.record(
+                gjo_outcomes, "google_jobs", channel_status.OK,
+                f"{queries_with_results}/{total_steps} queries returned postings",
+            )
+        gjo_status = channel_status.aggregate_status(gjo_outcomes)
+        gjo_summary = (
+            f"Google Jobs Scan: {total_steps} queries scanned, "
+            f"{total_discovered} new roles discovered, {filtered_count} filtered by preferences."
+        )
+        gjo_note = channel_status.describe(gjo_outcomes)
+        if gjo_note:
+            gjo_summary = f"{gjo_summary} Degraded — {gjo_note}"
         db.add(
             OperationLog(
                 operation_type="google_jobs_background_scan",
-                status="success",
-                summary=f"Google Jobs Scan: {total_steps} queries scanned, {total_discovered} new roles discovered, {filtered_count} filtered by preferences.",
+                status=gjo_status,
+                summary=gjo_summary,
                 details_json=sanitize_log_details(
-                    {"filtered_out_of_preference": filtered_count}
+                    {
+                        "filtered_out_of_preference": filtered_count,
+                        "queries_with_results": queries_with_results,
+                        "queries_failed": errors_count,
+                        "channels": gjo_outcomes,
+                    }
                 ),
                 jobs_count=total_discovered,
                 prompt_tokens=0,
@@ -7394,6 +7508,7 @@ def _run_google_jobs_task_runner(
             "jobs_found": total_discovered,
             "filtered_out_of_preference": filtered_count,
             "errors_count": errors_count,
+            "status": gjo_status,
         }
     finally:
         db.close()

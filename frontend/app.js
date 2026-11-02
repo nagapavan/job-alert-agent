@@ -64,6 +64,8 @@ document.addEventListener("DOMContentLoaded", () => {
     initTargetPreferences();
     initConsentGate();
     loadPreferencesFromServer();
+    // Channel health is dashboard-visible (degraded banner + engine badge), not settings-only.
+    loadGmailSection();
     fetchInitialData();
 });
 
@@ -4300,14 +4302,108 @@ async function loadGmailSection() {
         }
         if (s.secret_looks_invalid) {
             statusEl.innerText = "⚠️ The saved Client Secret looks like the Client ID. Re-paste the real secret (starts with 'GOCSPX-').";
+        } else if (s.connected) {
+            statusEl.innerText = `✅ Connected${s.email ? " as " + s.email : ""}.`;
+        } else if (s.needs_reconnect) {
+            const when = s.token_expired_at ? formatDateTime(s.token_expired_at) : "";
+            statusEl.innerText = `⚠️ Reconnect required — Google rejected the stored token${when ? " (expired " + when + ")" : ""}. Application sync has been running on the reduced browser fallback.`;
+        } else if (s.client_id_set && s.client_secret_set) {
+            statusEl.innerText = "Client saved — not connected. Click Connect Gmail to authorize.";
         } else {
-            statusEl.innerText = s.connected
-                ? `✅ Connected${s.email ? " as " + s.email : ""}.`
-                : (s.client_id_set && s.client_secret_set ? "Client saved — not connected." : "Not configured.");
+            statusEl.innerText = "Not configured.";
         }
+        state.gmailStatus = s;
+        loadDiscoveryEngineHealth();
     } catch (e) {
         statusEl.innerText = "Gmail status unavailable.";
     }
+}
+
+async function syncGmailNow() {
+    const btn = document.getElementById("gmail-engine-sync-btn");
+    if (btn) { btn.disabled = true; btn.innerText = "Syncing…"; }
+    try {
+        const res = await fetch(`${API_BASE}/api/gmail/sync`, { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Gmail sync failed");
+        if (data.status === "disabled") {
+            showToast("⚠️ " + data.message);
+        } else if (data.status === "not_connected") {
+            showToast("⚠️ " + data.message);
+        } else {
+            showToast(`📧 ${data.message}`);
+        }
+        loadGmailSection();
+    } catch (e) {
+        showToast("⚠️ " + e.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.innerText = "Sync now"; }
+    }
+}
+
+// Renders real channel health for the Discovery Engines panel. The badge used to be a
+// hardcoded literal, so a dead channel still read as "available".
+function loadDiscoveryEngineHealth() {
+    const s = state.gmailStatus;
+    const statusEl = document.getElementById("gmail-engine-status");
+    const badgeEl = document.getElementById("discovery-engine-badge");
+    const gmailEnabled = !!featureFlags.gmail_sync;
+
+    let gmailState = "Disabled — enable Gmail sync in Discovery Features.";
+    let gmailBad = false;
+    if (gmailEnabled && s) {
+        if (s.connected) {
+            gmailState = `Connected${s.email ? " as " + s.email : ""} — metadata + snippet only.`;
+        } else if (s.needs_reconnect) {
+            const when = s.token_expired_at ? formatDateTime(s.token_expired_at) : "";
+            gmailState = `Needs reconnect${when ? " — token expired " + when : ""}.`;
+            gmailBad = true;
+        } else if (s.client_id_set && s.client_secret_set) {
+            gmailState = "Client saved, not connected — click Connect Gmail in the Gmail API tab.";
+            gmailBad = true;
+        } else {
+            gmailState = "Not configured — add a Google OAuth client in the Gmail API tab.";
+            gmailBad = true;
+        }
+    } else if (gmailEnabled && !s) {
+        gmailState = "Status unavailable.";
+        gmailBad = true;
+    }
+    if (statusEl) {
+        statusEl.innerText = (gmailBad ? "⚠️ " : "") + gmailState;
+    }
+    const syncBtn = document.getElementById("gmail-engine-sync-btn");
+    if (syncBtn) syncBtn.disabled = !gmailEnabled || !s || !s.connected;
+
+    if (badgeEl) {
+        // Was a hardcoded "6 Available" literal: it read as healthy even when a channel was dead.
+        const degraded = gmailBad ? 1 : 0;
+        badgeEl.innerText = degraded ? `${degraded} needs attention` : "All channels healthy";
+        badgeEl.classList.toggle("active", !degraded);
+    }
+
+    // Dashboard banner: only when something the operator enabled is actually broken.
+    const banner = document.getElementById("discovery-health-banner");
+    if (banner) {
+        if (gmailBad && gmailEnabled && !state.discoveryBannerDismissed) {
+            const when = s && s.token_expired_at ? ` (expired ${formatDateTime(s.token_expired_at)})` : "";
+            banner.innerHTML = `
+                <span>⚠️ <strong>Gmail sync is degraded${when}.</strong>
+                Application-status emails are only being read by the reduced browser fallback.</span>
+                <button class="btn btn-sm btn-primary" onclick="navigateToSection('settings'); switchSettingsTab('gmail')">Reconnect</button>
+                <button class="btn btn-sm btn-outline" onclick="dismissDiscoveryBanner()">Dismiss</button>
+            `;
+            banner.classList.remove("hidden");
+        } else {
+            banner.classList.add("hidden");
+        }
+    }
+}
+
+function dismissDiscoveryBanner() {
+    state.discoveryBannerDismissed = true;
+    const banner = document.getElementById("discovery-health-banner");
+    if (banner) banner.classList.add("hidden");
 }
 
 async function saveGmailCredentials() {
