@@ -81,21 +81,35 @@ TIMELINE = [
 def test_real_timeline_closed_role_is_17y4m():
     """Aug 2008 -> Jul 2026 = 215 months, minus the 3- and 4-month gaps = 208 = 17.33.
 
-    The sub-week PayPal -> Atlassian handover (Aug 2022 -> Sept 2022) is one month at this
-    granularity and must NOT be penalised.
+    The one-month handover between consecutive roles (Aug 2022 -> Sept 2022) must NOT be
+    penalised. ``current_year`` is pinned even though this timeline is closed, so the call can
+    never consult the wall clock if the fixture later gains an open role.
     """
-    assert estimate_total_years({"experience": TIMELINE}) == 17.33
+    assert estimate_total_years({"experience": TIMELINE}, current_year=2026) == 17.33
 
 
-def test_real_timeline_open_role_is_17y7m():
-    """Same timeline with the current role open runs to today: 211 months = 17.58."""
+def test_real_timeline_open_role_is_17y10m(monkeypatch):
+    """Same timeline with the current role open, measured to the pinned Jan 2027 reference.
+
+    ``current_year=2027`` anchors "now" to January 2027, so the open role runs past the closed
+    end (Jul 2026) to Jan 2027: 211 months = 17.83. The wall clock is explicitly forbidden so
+    this test cannot drift as the calendar advances (issue #81).
+    """
+
+    def _wall_clock_forbidden():
+        raise AssertionError("estimate_total_years must not consult the wall clock")
+
+    monkeypatch.setattr("backend.resume_signals._now_months", _wall_clock_forbidden)
+
     open_timeline = [dict(e) for e in TIMELINE]
     open_timeline[0]["dates"] = "July 2024 - Present"
-    assert estimate_total_years({"experience": open_timeline}) == 17.58
+    assert estimate_total_years({"experience": open_timeline}, current_year=2027) == 17.83
 
 
 def test_single_long_role_is_17y11m():
-    assert estimate_total_years({"experience": [{"dates": "Aug 2008 - Jul 2026"}]}) == 17.92
+    assert estimate_total_years(
+        {"experience": [{"dates": "Aug 2008 - Jul 2026"}]}, current_year=2026
+    ) == 17.92
 
 
 def test_material_gaps_are_subtracted():
@@ -127,7 +141,7 @@ class TestExperienceYearsOverride:
 
     def test_unusable_override_falls_back_to_the_timeline(self):
         parsed = {"experience": TIMELINE, "experience_years": "n/a"}
-        assert estimate_total_years(parsed) == 17.33
+        assert estimate_total_years(parsed, current_year=2026) == 17.33
 
     def test_no_override_still_derives(self):
-        assert estimate_total_years({"experience": TIMELINE}) == 17.33
+        assert estimate_total_years({"experience": TIMELINE}, current_year=2026) == 17.33
