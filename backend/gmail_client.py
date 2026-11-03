@@ -7,7 +7,10 @@ Design principles (see plan §/docs):
 - Read-only scope; refresh token stored encrypted via backend.config.
 - Google API libraries are imported lazily so the app and tests run without them installed.
 """
+import base64
+import html
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +32,8 @@ GMAIL_QUERY = (
     'OR from:googlealerts-noreply@google.com '
     'OR subject:interview OR subject:offer OR subject:"next steps" '
     'OR subject:regret OR subject:"not moving forward" '
+    'OR subject:applying OR subject:availability OR subject:scheduling '
+    'OR subject:assessment OR subject:"your application" OR subject:"was viewed" '
     'OR subject:"job alert" OR subject:opportunity OR subject:application)'
 )
 
@@ -203,6 +208,71 @@ def fetch_message_metadata(service, message_id: str) -> Dict[str, str]:
     }
 
 
+def _b64url_decode(data: str) -> str:
+    """Decodes a Gmail base64url body part to text (best-effort)."""
+    if not data:
+        return ""
+    try:
+        padded = data + "=" * (-len(data) % 4)
+        return base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _html_to_text(raw_html: str) -> str:
+    """Cheap HTML→text: drop script/style, strip tags, unescape entities."""
+    if not raw_html:
+        return ""
+    cleaned = re.sub(r"(?is)<(script|style).*?</\1>", " ", raw_html)
+    cleaned = re.sub(r"(?i)<br\s*/?>", "\n", cleaned)
+    cleaned = re.sub(r"(?i)</p>", "\n", cleaned)
+    cleaned = re.sub(r"(?s)<[^>]+>", " ", cleaned)
+    return html.unescape(cleaned)
+
+
+def _extract_payload_text(payload: dict) -> str:
+    """Walks a Gmail message payload, preferring text/plain over text/html."""
+    plain_parts: List[str] = []
+    html_parts: List[str] = []
+
+    def _walk(part: dict) -> None:
+        if not part:
+            return
+        mime = (part.get("mimeType") or "").lower()
+        body = part.get("body", {}) or {}
+        data = body.get("data")
+        if data:
+            decoded = _b64url_decode(data)
+            if mime == "text/plain":
+                plain_parts.append(decoded)
+            elif mime == "text/html":
+                html_parts.append(decoded)
+        for child in part.get("parts", []) or []:
+            _walk(child)
+
+    _walk(payload)
+    if plain_parts:
+        return "\n".join(p for p in plain_parts if p).strip()
+    if html_parts:
+        return _html_to_text("\n".join(html_parts)).strip()
+    return ""
+
+
+def fetch_message_body(service, message_id: str, max_chars: int = 6000) -> str:
+    """Fetches the full decoded text body of a message (plain preferred, HTML fallback).
+
+    Used only for opportunity-classified mail (issue #82) so a recruiter's JD can be scored
+    against the resume. Bounded to ``max_chars`` and never stores raw HTML.
+    """
+    msg = service.users().messages().get(
+        userId="me", id=message_id, format="full", fields="payload",
+    ).execute()
+    text = _extract_payload_text(msg.get("payload", {}) or {})
+    # Collapse the trailing quoted reply history / signature clutter where cheaply possible.
+    text = re.split(r"(?i)\n(?:on .{0,120}wrote:|-----original message-----|from:\s)", text)[0]
+    return text[:max_chars].strip()
+
+
 def run_gmail_sync(db) -> List[Dict[str, Any]]:
     """
     Runs the opt-in Gmail API sync. Returns classified application events
@@ -215,6 +285,7 @@ def run_gmail_sync(db) -> List[Dict[str, Any]]:
     from backend.scraper import (
         extract_company_and_role_from_email_header,
         parse_google_alerts_digest,
+        _sender_domain,
     )
 
     settings = get_gmail_settings()
@@ -232,6 +303,10 @@ def run_gmail_sync(db) -> List[Dict[str, Any]]:
         meta = fetch_message_metadata(service, mid)
         cls = classify_email(meta["subject"], meta["snippet"], meta["sender"])
         classification = cls["category"]
+        # A status event only becomes actionable once we can attach an employer. If no company
+        # resolves (or it's not a status/job-alert email at all), do NOT mark it processed: a
+        # later pattern fix should be able to re-evaluate it (issue #76 poisoned-dedup fix).
+        processed = False
         if classification in STATUS_EVENT_TYPES:
             extracted = extract_company_and_role_from_email_header(
                 meta["subject"], meta["snippet"], meta["sender"]
@@ -240,7 +315,9 @@ def run_gmail_sync(db) -> List[Dict[str, Any]]:
             if company:
                 events.append({
                     "company": company,
-                    "role": extracted.get("role") or "Software Engineer",
+                    "domain": _sender_domain(meta["sender"]),
+                    "role": extracted.get("role"),
+                    "location": extracted.get("location"),
                     "event_type": classification,
                     "confidence": cls["confidence"],
                     "ats_sender": cls["ats_sender"],
@@ -249,17 +326,25 @@ def run_gmail_sync(db) -> List[Dict[str, Any]]:
                     "sender": meta["sender"],
                     "date": meta["date"],
                 })
+                processed = True
         elif classification == "job_alert":
             # Opportunities from alerts/recruiter digests — tracked even without an application.
-            opportunities = parse_google_alerts_digest(meta["snippet"], meta["subject"])
+            # Recruiter/JD outreach is body-borne, so fetch the full body (bounded) to score it.
+            body = fetch_message_body(service, mid)
+            opportunities = parse_google_alerts_digest(
+                body or meta["snippet"], meta["subject"]
+            )
             if not opportunities:
                 extracted = extract_company_and_role_from_email_header(
-                    meta["subject"], meta["snippet"], meta["sender"]
+                    meta["subject"], body or meta["snippet"], meta["sender"]
                 )
                 if extracted.get("company"):
                     opportunities = [{
                         "title": extracted.get("role") or "Open Role",
                         "company": extracted["company"],
+                        "employer": extracted.get("employer"),
+                        "agency": extracted.get("agency"),
+                        "location": extracted.get("location"),
                         "url": "",
                     }]
             for oj in opportunities:
@@ -269,18 +354,23 @@ def run_gmail_sync(db) -> List[Dict[str, Any]]:
                     continue
                 events.append({
                     "company": company,
+                    "employer": oj.get("employer"),
+                    "agency": oj.get("agency"),
+                    "location": oj.get("location"),
                     "role": title,
                     "event_type": "opportunity",
                     "confidence": cls["confidence"],
                     "ats_sender": cls["ats_sender"],
                     "url": oj.get("url", ""),
                     "subject": meta["subject"],
-                    "snippet": meta["snippet"],
+                    "snippet": (body or meta["snippet"])[:4000],
                     "sender": meta["sender"],
                     "date": meta["date"],
                 })
-        db.add(ProcessedEmail(message_id=mid))
-        new_count += 1
+                processed = True
+        if processed:
+            db.add(ProcessedEmail(message_id=mid))
+            new_count += 1
 
     db.flush()
     logger.info(f"Gmail API sync: {len(message_ids)} messages matched, {new_count} new processed, {len(events)} events.")

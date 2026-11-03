@@ -318,6 +318,56 @@ class ProcessedEmail(Base):
     processed_at = Column(DateTime, default=utc_now)
 
 
+class PendingEmailApplication(Base):
+    """
+    A staged, anti-fatigue review item for an application-status email that did NOT meet the
+    unambiguous auto-create gate (issue #76). No Job row is created until the operator accepts.
+
+    Thread-aggregated: one row per (normalized employer, normalized role) — a multi-email thread
+    becomes a single card with an email_count, not one row per message.
+    """
+    __tablename__ = "pending_email_applications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    company = Column(String(255), nullable=False, index=True)
+    domain = Column(String(255), nullable=True)
+    role = Column(String(255), nullable=False, default="Software Engineer")
+    event_type = Column(String(50), nullable=False, default="application_received")
+    confidence = Column(Float, nullable=False, default=0.0)
+    first_seen = Column(DateTime, default=utc_now)
+    last_seen = Column(DateTime, default=utc_now)
+    email_count = Column(Integer, default=1)
+    # "pending" | "accepted" | "expired"
+    state = Column(String(20), nullable=False, default="pending")
+    snippet = Column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "company", "role", name="uq_pending_email_company_role"
+        ),
+    )
+
+
+class EmailSuppression(Base):
+    """
+    Operator ignore rules for the email review queue (issue #76). A `role`-qualified row blocks
+    that employer+role; a `role` NULL row blocks the whole domain/employer. Neither ever
+    resurfaces in the queue.
+    """
+    __tablename__ = "email_suppressions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    domain = Column(String(255), nullable=False, index=True)
+    role = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "domain", "role", name="uq_email_suppression_domain_role"
+        ),
+    )
+
+
 class ScoreAuditRecord(Base):
     """One scoring-judge audit of a job's deterministic assessment (issue #60).
 

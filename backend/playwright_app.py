@@ -137,8 +137,16 @@ EMAIL_ATS_SENDER_DOMAINS = (
 EMAIL_REJECTION_PHRASES = [
     "not moving forward", "other candidates", "unfortunately",
     "decided to pursue", "regret to inform", "not selected",
-    "won't be moving forward", "application status", "position has been filled",
-    "will not be moving forward"
+    "won't be moving forward", "position has been filled",
+    "will not be moving forward", "wish you all the luck",
+    "keep your resume on file", "no longer under consideration",
+    "decided to move forward with other", "move forward with other candidates",
+    "will not be proceeding", "not be proceeding",
+    "decided to go in a different direction", "move in a different direction",
+    "not successful", "unsuccessful", "we regret to inform",
+    "decided not to proceed", "pursue other candidates", "not a match",
+    "gone with another candidate", "will not be extending an offer",
+    "no longer being considered", "wish you the best", "wish you all the best",
 ]
 
 EMAIL_OFFER_PHRASES = [
@@ -166,7 +174,11 @@ EMAIL_ALERT_PHRASES = [
     "google alert", "job alert", "new jobs", "open roles", "matching jobs",
     "recommended for you", "positions open", "careers at", "openings at",
     "job recommendations", "new opportunities", "jobs matching", "jobs/alerts",
-    "sees you as a top applicant", "role at", "opportunities at", "opportunity at"
+    "sees you as a top applicant", "role at", "opportunities at", "opportunity at",
+    # Recruiter / agency cold outreach forwarding a JD (issue #82).
+    "job opportunity", "opportunity with", "opportunity for", "jd for",
+    "job description", "please find below", "greetings from", "hiring for",
+    "we are hiring", "position with", "role with", "on behalf of"
 ]
 
 EMAIL_APPLICATION_PHRASES = [
@@ -248,6 +260,8 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
             "OR from:googlealerts-noreply@google.com "
             "OR subject:interview OR subject:offer OR subject:\"next steps\" "
             "OR subject:regret OR subject:\"not moving forward\" OR subject:\"application\" "
+            "OR subject:applying OR subject:availability OR subject:scheduling "
+            "OR subject:assessment OR subject:\"your application\" OR subject:\"was viewed\" "
             "OR subject:\"job alert\" OR subject:opportunity)"
         )
 
@@ -273,7 +287,9 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
         # Helper to parse visible rows on current page view
         def parse_visible_rows():
             found_rows = page.query_selector_all("tr.zA")
-            for row in found_rows[:40]:
+            # Bound per page but not to a hardcoded 40: read everything visible (Gmail renders
+            # ~50 rows/page) so a bounded multi-page crawl never silently truncates at 40.
+            for row in found_rows:
                 try:
                     sender_el = row.query_selector(".yP, .zF") or row.query_selector("span[email], span.bA4 span, span[name], span[email]")
                     subject_el = row.query_selector(".bog") or row.query_selector(".bqe, span[data-thread-id], span.bqe, span.bog")
@@ -312,10 +328,15 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
                 except Exception as row_err:
                     logger.debug(f"Error parsing email row: {row_err}")
 
-        # Helper to parse visible rows on current page view and paginate through older pages
-        def scan_view_with_pagination(max_pages: int = 1):
-            for p_idx in range(max_pages):
+        # Helper to parse visible rows on current page view and paginate through older pages.
+        # Bounded crawl: each page must add new rows or we stop (prevents an endless scroll).
+        def scan_view_with_pagination(max_pages: int = 5):
+            for p_idx in range(max(1, max_pages)):
+                before = len(seen_keys)
                 parse_visible_rows()
+                if len(seen_keys) == before:
+                    # No new rows were deduped in this page — the crawl reached the end.
+                    break
                 if p_idx < max_pages - 1:
                     next_btn = page.query_selector("div[aria-label='Older'], div[data-tooltip='Older'], button[aria-label='Older'], span[aria-label='Older'], div[role='button'][aria-label='Older']")
                     if next_btn and next_btn.get_attribute("aria-disabled") != "true" and next_btn.is_visible():
@@ -360,9 +381,9 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
                         pass
             except Exception as search_err:
                 logger.warning(f"Gmail targeted search notice: {search_err}")
-        # Scan search results (2 pages ≈ up to 80 emails).
+        # Scan search results (bounded multi-page crawl; stops when a page adds no new rows).
         try:
-            scan_view_with_pagination(max_pages=2)
+            scan_view_with_pagination(max_pages=5)
         except Exception as scan_err:
             logger.warning(f"Gmail scan pagination notice: {scan_err}")
         logger.info(f"Gmail scan: parsed {len(emails)} email(s) from all-mail targeted search.")
@@ -2225,7 +2246,10 @@ def sync_email_application_events(playwright_instance, headless: bool = True) ->
     Scans candidate Gmail inbox via Playwright and extracts high-signal application status updates
     (interview invitations, rejection updates, and application submissions) matching them to employers.
     """
-    from backend.scraper import extract_company_and_role_from_email_header
+    from backend.scraper import (
+        extract_company_and_role_from_email_header,
+        _sender_domain,
+    )
 
     raw_emails = scan_gmail_for_job_alerts(playwright_instance, headless=headless)
     events = []
@@ -2243,11 +2267,12 @@ def sync_email_application_events(playwright_instance, headless: bool = True) ->
             )
 
             company = extracted.get("company")
-            role = extracted.get("role") or "Software Engineer"
+            role = extracted.get("role")
 
             if company:
                 events.append({
                     "company": company,
+                    "domain": _sender_domain(email.get("sender", "")),
                     "role": role,
                     "event_type": classification,
                     "confidence": confidence,
