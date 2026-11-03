@@ -273,7 +273,9 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
         # Helper to parse visible rows on current page view
         def parse_visible_rows():
             found_rows = page.query_selector_all("tr.zA")
-            for row in found_rows[:40]:
+            # Bound per page but not to a hardcoded 40: read everything visible (Gmail renders
+            # ~50 rows/page) so a bounded multi-page crawl never silently truncates at 40.
+            for row in found_rows:
                 try:
                     sender_el = row.query_selector(".yP, .zF") or row.query_selector("span[email], span.bA4 span, span[name], span[email]")
                     subject_el = row.query_selector(".bog") or row.query_selector(".bqe, span[data-thread-id], span.bqe, span.bog")
@@ -312,10 +314,15 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
                 except Exception as row_err:
                     logger.debug(f"Error parsing email row: {row_err}")
 
-        # Helper to parse visible rows on current page view and paginate through older pages
-        def scan_view_with_pagination(max_pages: int = 1):
-            for p_idx in range(max_pages):
+        # Helper to parse visible rows on current page view and paginate through older pages.
+        # Bounded crawl: each page must add new rows or we stop (prevents an endless scroll).
+        def scan_view_with_pagination(max_pages: int = 5):
+            for p_idx in range(max(1, max_pages)):
+                before = len(seen_keys)
                 parse_visible_rows()
+                if len(seen_keys) == before:
+                    # No new rows were deduped in this page — the crawl reached the end.
+                    break
                 if p_idx < max_pages - 1:
                     next_btn = page.query_selector("div[aria-label='Older'], div[data-tooltip='Older'], button[aria-label='Older'], span[aria-label='Older'], div[role='button'][aria-label='Older']")
                     if next_btn and next_btn.get_attribute("aria-disabled") != "true" and next_btn.is_visible():
@@ -360,9 +367,9 @@ def scan_gmail_for_job_alerts(playwright_instance, headless: bool = True) -> Lis
                         pass
             except Exception as search_err:
                 logger.warning(f"Gmail targeted search notice: {search_err}")
-        # Scan search results (2 pages ≈ up to 80 emails).
+        # Scan search results (bounded multi-page crawl; stops when a page adds no new rows).
         try:
-            scan_view_with_pagination(max_pages=2)
+            scan_view_with_pagination(max_pages=5)
         except Exception as scan_err:
             logger.warning(f"Gmail scan pagination notice: {scan_err}")
         logger.info(f"Gmail scan: parsed {len(emails)} email(s) from all-mail targeted search.")
@@ -1866,18 +1873,33 @@ def launch_assisted_application_session(
 # Google for Jobs Playwright Browser Fetcher
 # -------------------------------------------------------------
 
+_GOOGLE_JOBS_MAX_SCROLLS = 5
+
+
 def fetch_google_jobs_playwright(
-    playwright_instance, 
-    query: str, 
-    location: Optional[str] = None, 
-    headless: bool = True, 
-    max_results: int = 15
+    playwright_instance,
+    query: str,
+    location: Optional[str] = None,
+    headless: bool = True,
+    max_results: int = 15,
+    pacer=None,
+    outcome: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Automates navigation to Google for Jobs (ibp=htl;jobs) within the persistent browser session.
-    Extracts deep job details, employer names, locations, and direct external application URLs.
+    Navigates Google for Jobs (ibp=htl;jobs) in the persistent browser session.
+
+    Bounded pagination: scrolls the left job list until ``max_results`` or no growth (hard cap
+    of ``_GOOGLE_JOBS_MAX_SCROLLS`` scrolls). Detail extraction: selects each card and reads the
+    right-hand JD pane into ``description`` (the field the scorer consumes), instead of a one-line
+    snippet. ``outcome`` (optional dict) is filled with one of ``fetched`` / ``browser_busy`` /
+    ``dom_changed`` / ``zero_results`` so the runner can report honest per-query status.
     """
+    def _set_outcome(value: str) -> None:
+        if outcome is not None:
+            outcome["outcome"] = value
+
     if not query or not query.strip():
+        _set_outcome("zero_results")
         return []
 
     search_terms = query.strip()
@@ -1887,10 +1909,59 @@ def fetch_google_jobs_playwright(
     encoded_query = urllib.parse.quote(search_terms)
     url = f"https://www.google.com/search?q={encoded_query}&ibp=htl;jobs"
 
-    jobs = []
+    card_selector = (
+        "li.iFjolb, div.PwjeAc, div.gWSBe, div[data-encoded-docid]"
+    )
+    fallback_card_selector = (
+        "div.d5F0ib, div.KLsYvd, div[jsname='bN97Pc'], div.sp-c, div.s8bAkb, div[data-docid]"
+    )
+    detail_selectors = (
+        "div.KLsYvd", "div[jsname='bN97Pc']", "div.Yflw0c", "div#tlBfW",
+        "div[role='main']", "div.HBvxfe",
+    )
+
+    def _read_detail_pane(page) -> str:
+        """Reads the right-hand JD pane text (longest plausible block)."""
+        best = ""
+        for sel in detail_selectors:
+            try:
+                el = page.query_selector(sel)
+                if not el:
+                    continue
+                text = el.inner_text()
+                if isinstance(text, str) and len(text.strip()) > len(best):
+                    best = text.strip()
+            except Exception:
+                continue
+        return best
+
+    def _scroll(page) -> None:
+        """Advances the left job list by one viewport (bounded by the caller's cap)."""
+        try:
+            page.mouse.wheel(0, 2400)
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(1200)
+        except Exception:
+            pass
+
+    jobs: List[Dict[str, Any]] = []
+    seen_titles = set()
+    dom_changed = False
     try:
-        context = get_persistent_browser_context(playwright_instance, headless=headless)
+        try:
+            context = get_persistent_browser_context(playwright_instance, headless=headless)
+        except Exception as ctx_err:
+            if "BrowserProfileBusy" in type(ctx_err).__name__:
+                _set_outcome("browser_busy")
+            raise
         page = context.new_page()
+        if pacer is not None:
+            try:
+                pacer.wait(url)
+            except Exception:
+                pass
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
 
         # Auto-dismiss Google cookie/terms consent dialogs if present
@@ -1903,47 +1974,84 @@ def fetch_google_jobs_playwright(
             pass
 
         try:
-            page.wait_for_selector("li.iFjolb, div.PwjeAc, div.gWSBe, div[data-encoded-docid], div.d5F0ib, div.KLsYvd, div[jsname='bN97Pc'], div.sp-c, div.s8bAkb, div[data-docid]", timeout=8000)
+            page.wait_for_selector(card_selector, timeout=8000)
         except Exception:
-            logger.debug("Google Jobs main list selector timeout, continuing with available DOM")
+            dom_changed = True
+            logger.warning(
+                "Google Jobs main-list selector timed out (DOM may have changed); "
+                "continuing with whatever is rendered."
+            )
 
-        card_elements = page.query_selector_all("li.iFjolb, div.PwjeAc, div.gWSBe, div[data-encoded-docid]") or page.query_selector_all("div.d5F0ib, div.KLsYvd, div[jsname='bN97Pc'], div.sp-c, div.s8bAkb, div[data-docid]")
-        for card in card_elements[:max_results]:
-            try:
-                title_el = card.query_selector("div.BjJfJf, div.PUpOsf, div[role='heading'], h2, a.title") or card.query_selector("h3, .t-bold")
-                title = title_el.inner_text().strip() if title_el else ""
-                if not title or len(title) < 3:
-                    continue
+        for scroll_idx in range(_GOOGLE_JOBS_MAX_SCROLLS):
+            cards = page.query_selector_all(card_selector) or page.query_selector_all(
+                fallback_card_selector
+            )
+            if not cards:
+                break
+            before = len(seen_titles)
+            for card in cards:
+                if len(jobs) >= max_results:
+                    break
+                try:
+                    title_el = card.query_selector("div.BjJfJf, div.PUpOsf, div[role='heading'], h2, a.title") or card.query_selector("h3, .t-bold")
+                    title = title_el.inner_text().strip() if title_el else ""
+                    if not title or len(title) < 3:
+                        continue
+                    if title.lower() in seen_titles:
+                        continue
+                    seen_titles.add(title.lower())
 
-                company_el = card.query_selector("div.vNEEBe, div.wvy6fc, span.company, div.company") or card.query_selector(".s8bAkb, .MK9DJe")
-                company = company_el.inner_text().strip() if company_el else "Target Employer"
+                    company_el = card.query_selector("div.vNEEBe, div.wvy6fc, span.company, div.company") or card.query_selector(".s8bAkb, .MK9DJe")
+                    company = company_el.inner_text().strip() if company_el else "Target Employer"
 
-                loc_el = card.query_selector("div.Qk80nd, div.oc1tfd, span.location") or card.query_selector(".Qk80nd")
-                location_str = loc_el.inner_text().strip() if loc_el else "Remote / Various"
+                    loc_el = card.query_selector("div.Qk80nd, div.oc1tfd, span.location") or card.query_selector(".Qk80nd")
+                    location_str = loc_el.inner_text().strip() if loc_el else "Remote / Various"
 
-                link_el = card.query_selector("a[href]")
-                apply_url = link_el.get_attribute("href") if link_el else url
-                if apply_url and not apply_url.startswith("http"):
-                    apply_url = f"https://www.google.com{apply_url}"
+                    link_el = card.query_selector("a[href]")
+                    apply_url = link_el.get_attribute("href") if link_el else url
+                    if apply_url and not apply_url.startswith("http"):
+                        apply_url = f"https://www.google.com{apply_url}"
 
-                snippet_el = card.query_selector("div.HBvxfe, span.WbZuDe, div.Yflw0c") or card.query_selector("div.Vb0Rqe")
-                snippet = snippet_el.inner_text().strip() if snippet_el else f"Google for Jobs opening: {title} at {company}"
+                    # Detail extraction: open the card, read the JD pane into `description`.
+                    try:
+                        card.click()
+                        page.wait_for_timeout(900)
+                    except Exception:
+                        pass
+                    description = _read_detail_pane(page)
 
-                jobs.append({
-                    "title": title,
-                    "company": company,
-                    "location": location_str,
-                    "salary_range": "Competitive",
-                    "description": snippet,
-                    "url": apply_url,
-                    "posted_at": "Discovered via Google Jobs",
-                    "source": "Google Jobs",
-                    "source_type": "Google"
-                })
-            except Exception as e:
-                logger.debug(f"Error parsing Google Jobs card element: {e}")
+                    if not description:
+                        snippet_el = card.query_selector("div.HBvxfe, span.WbZuDe, div.Yflw0c") or card.query_selector("div.Vb0Rqe")
+                        snippet = snippet_el.inner_text().strip() if snippet_el else ""
+                        description = snippet or f"Google for Jobs opening: {title} at {company}"
 
-        # If zero jobs found via direct Google for Jobs widget, check organic search results on page
+                    jobs.append({
+                        "title": title,
+                        "company": company,
+                        "location": location_str,
+                        "salary_range": "Competitive",
+                        "description": description,
+                        "url": apply_url,
+                        "posted_at": "Discovered via Google Jobs",
+                        "source": "Google Jobs",
+                        "source_type": "Google",
+                    })
+                except Exception as e:
+                    logger.warning(f"Error parsing Google Jobs card element: {e}")
+
+            if len(jobs) >= max_results:
+                break
+            if len(seen_titles) == before:
+                break  # no new cards appeared → end of the list
+            if scroll_idx < _GOOGLE_JOBS_MAX_SCROLLS - 1:
+                _scroll(page)
+                if pacer is not None:
+                    try:
+                        pacer.wait(url)
+                    except Exception:
+                        pass
+
+        # Organic-results fallback if the jobs widget rendered nothing.
         if not jobs:
             organic_cards = page.query_selector_all("div.g, div.MjjYud, div[data-hveid]")
             for org in organic_cards[:max_results]:
@@ -1973,7 +2081,7 @@ def fetch_google_jobs_playwright(
                             "url": href,
                             "posted_at": "Discovered via Google Search",
                             "source": "Google Jobs",
-                            "source_type": "Google"
+                            "source_type": "Google",
                         })
                 except Exception:
                     pass
@@ -1991,6 +2099,12 @@ def fetch_google_jobs_playwright(
             seen.add(key)
             deduped.append(j)
 
+    if deduped:
+        _set_outcome("fetched")
+    elif dom_changed:
+        _set_outcome("dom_changed")
+    else:
+        _set_outcome("zero_results")
     return deduped[:max_results]
 
 

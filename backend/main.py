@@ -144,8 +144,6 @@ from backend.scraper import (
     evaluate_job_due_diligence,
     extract_opportunity_company_and_title,
     extract_portal_info_from_job_url,
-    fetch_google_jobs,
-    fetch_jobs_via_jobspy,
     find_talent_partners,
     gather_company_intelligence,
     probe_greenhouse_job_active,
@@ -6110,35 +6108,18 @@ def scrape_google_jobs_endpoint(
             discovered_jobs = []
 
             try:
-                if req.use_browser:
-                    with sync_playwright() as p:
-                        discovered_jobs = fetch_google_jobs_playwright(
-                            p,
-                            query=query_str,
-                            location=search_loc,
-                            headless=True,
-                            max_results=req.limit,
-                        )
-                else:
-                    discovered_jobs = fetch_google_jobs(
-                        query=query_str, location=search_loc, max_results=req.limit
+                # Playwright is the sole Google Jobs fetcher: the direct SERP is permanently
+                # robots-gated (google.com/robots.txt disallows /search) and can never succeed.
+                with sync_playwright() as p:
+                    discovered_jobs = fetch_google_jobs_playwright(
+                        p,
+                        query=query_str,
+                        location=search_loc,
+                        headless=True,
+                        max_results=req.limit,
                     )
-                    if not discovered_jobs:
-                        try:
-                            with sync_playwright() as p:
-                                discovered_jobs = fetch_google_jobs_playwright(
-                                    p,
-                                    query=query_str,
-                                    location=search_loc,
-                                    headless=True,
-                                    max_results=req.limit,
-                                )
-                        except Exception as p_err:
-                            logger.debug(
-                                f"Playwright fallback for Google Jobs failed for query '{query_str}': {p_err}"
-                            )
             except Exception as q_err:
-                logger.error(f"Error fetching jobs for query '{query_str}': {q_err}")
+                logger.warning(f"Error fetching jobs for query '{query_str}': {q_err}")
                 discovered_jobs = []
 
             q_discovered = len(discovered_jobs)
@@ -7271,6 +7252,12 @@ def _run_google_jobs_task_runner(
     # How many queries actually returned raw postings. Zero across all queries means the
     # fetcher produced nothing, which is NOT the same as "no new roles to add".
     queries_with_results = 0
+    # Per-query outcome: fetched | browser_busy | dom_changed | robots_blocked | zero_results.
+    per_query_outcomes: List[Dict[str, Any]] = []
+    # Route Google Jobs browser navigation through the shared HostPacer (delay + jitter + ceiling).
+    from backend.ats.pacing import build_pacer
+
+    google_pacer = build_pacer()
 
     try:
         if not queries or len(queries) == 0:
@@ -7327,57 +7314,39 @@ def _run_google_jobs_task_runner(
 
             try:
                 raw_jobs = []
-                if use_playwright:
-                    try:
-                        with sync_playwright() as p:
-                            raw_jobs = fetch_google_jobs_playwright(
-                                p, query=q_str, location=location, headless=True
-                            )
-                    except Exception as p_err:
-                        logger.debug(
-                            f"Playwright fallback to direct SERP for '{q_str}': {p_err}"
+                q_outcome_info: Dict[str, Any] = {}
+                try:
+                    with sync_playwright() as p:
+                        raw_jobs = fetch_google_jobs_playwright(
+                            p, query=q_str, location=location, headless=True,
+                            max_results=15, pacer=google_pacer, outcome=q_outcome_info,
                         )
-                        raw_jobs = fetch_google_jobs(
-                            query=q_str, location=location, max_results=10
-                        )
+                except Exception as p_err:
+                    q_outcome = q_outcome_info.get("outcome") or (
+                        "browser_busy"
+                        if "BrowserProfileBusy" in type(p_err).__name__
+                        else "error"
+                    )
+                    logger.warning(
+                        f"[Google Jobs] Playwright fetch failed for '{q_str}' "
+                        f"({q_outcome}): {p_err}"
+                    )
+                    per_query_outcomes.append(
+                        {"query": q_str[:80], "outcome": q_outcome, "error": str(p_err)[:200]}
+                    )
+                    errors_count += 1
                 else:
-                    raw_jobs = fetch_google_jobs(
-                        query=q_str, location=location, max_results=10
+                    q_outcome = q_outcome_info.get("outcome") or (
+                        "fetched" if raw_jobs else "zero_results"
                     )
-                    # google.com/robots.txt disallows /search, so the direct SERP path is normally
-                    # gated off and returns []. Fall back to the browser renderer instead of
-                    # reporting an empty scan.
-                    if not raw_jobs:
-                        logger.info(
-                            f"[Google Jobs] Direct SERP unavailable for '{q_str}' "
-                            "(robots-gated); falling back to the Playwright renderer."
+                    per_query_outcomes.append(
+                        {"query": q_str[:80], "outcome": q_outcome, "count": len(raw_jobs)}
+                    )
+                    if q_outcome == "dom_changed":
+                        logger.warning(
+                            f"[Google Jobs] DOM selector miss for '{q_str}' (dom_changed); "
+                            "Google may have changed the jobs panel markup."
                         )
-                        try:
-                            with sync_playwright() as p:
-                                raw_jobs = fetch_google_jobs_playwright(
-                                    p, query=q_str, location=location, headless=True
-                                )
-                        except Exception as p_err:
-                            logger.debug(
-                                f"Playwright fallback for Google Jobs failed for '{q_str}': {p_err}"
-                            )
-
-                # Opt-in fallback: the direct SERP is often blocked, so try the open-source
-                # JobSpy aggregator when the flag is enabled and the direct path found nothing.
-                if not raw_jobs and is_feature_enabled(db, "jobspy_google"):
-                    logger.info(
-                        f"[JobSpy] Direct SERP empty for '{q_str}'; using enabled JobSpy fallback."
-                    )
-                    raw_jobs = fetch_jobs_via_jobspy(
-                        [q_str], location=location, results_wanted=15
-                    )
-                    logger.info(
-                        f"[JobSpy] Fallback returned {len(raw_jobs or [])} result(s) for '{q_str}'."
-                    )
-                elif not raw_jobs:
-                    logger.debug(
-                        f"[JobSpy] Direct SERP empty for '{q_str}'; JobSpy fallback disabled (jobspy_google off)."
-                    )
 
                 if raw_jobs:
                     queries_with_results += 1
@@ -7493,6 +7462,7 @@ def _run_google_jobs_task_runner(
                         "filtered_out_of_preference": filtered_count,
                         "queries_with_results": queries_with_results,
                         "queries_failed": errors_count,
+                        "per_query_outcomes": per_query_outcomes,
                         "channels": gjo_outcomes,
                     }
                 ),
@@ -7866,8 +7836,7 @@ def _run_sync_all_task_runner(
 ) -> Dict[str, Any]:
     """
     Runs every enabled discovery/status stage serially (single persistent browser profile),
-    tolerating partial failures. Disabled channels are skipped entirely; JobSpy stays an
-    automatic fallback.
+    tolerating partial failures. Disabled channels are skipped entirely.
     """
     from backend.playwright_app import BrowserProfileBusy
 

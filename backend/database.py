@@ -385,7 +385,6 @@ DEFAULT_FEATURE_FLAGS = {
     "google_jobs": True,
     "linkedin_sync": False,   # session-based LinkedIn DOM automation (ToS / account risk)
     "gmail_sync": False,      # reads Gmail (opt-in, privacy-scoped)
-    "jobspy_google": False,   # unofficial Google Jobs aggregator (off by default)
     # ---- Per-portal ATS scanners (public, documented APIs) ----
     "ats_greenhouse": True,
     "ats_lever": True,
@@ -416,7 +415,6 @@ CONSENT_VERSION = 1
 
 CONSENT_REQUIRED_FEATURES = (
     "linkedin_sync",        # authenticated LinkedIn DOM automation (ToS / account-ban risk)
-    "jobspy_google",        # unofficial Google Jobs aggregator
     "ats_smartrecruiters",  # unofficial / ambiguous ATS endpoints
     "ats_workable",
     "ats_workday",
