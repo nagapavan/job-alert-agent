@@ -4001,7 +4001,7 @@ let featureFlags = {};
 let availableFeatures = {};
 
 const ALL_FEATURE_KEYS = [
-    "ats_portals", "google_jobs", "jobspy_google", "linkedin_sync", "gmail_sync",
+    "ats_portals", "google_jobs", "linkedin_sync", "gmail_sync",
     "ats_greenhouse", "ats_lever", "ats_ashby", "ats_hirist",
     "ats_smartrecruiters", "ats_workable", "ats_workday", "ats_uber", "ats_custom_html",
     "resume_gap_insights"
@@ -4055,7 +4055,7 @@ function applyFeatureFlags(flags) {
 // (consent_required_features, mirroring CONSENT_REQUIRED_FEATURES); this fallback only
 // covers the first render before preferences load.
 const CONSENT_REQUIRED_KEYS_FALLBACK = [
-    "linkedin_sync", "jobspy_google",
+    "linkedin_sync",
     "ats_smartrecruiters", "ats_workable", "ats_workday", "ats_uber", "ats_custom_html"
 ];
 let consentRequiredKeys = CONSENT_REQUIRED_KEYS_FALLBACK.slice();

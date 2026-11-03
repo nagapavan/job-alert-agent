@@ -14,14 +14,6 @@ from backend.config import AGENT_USER_AGENT, RESPECT_AI_USE_FILES, RESPECT_ROBOT
 from backend.matchers import check_title_match
 from backend.prompts import company_intelligence_synthesis_system
 
-# Optional dependency: open-source JobSpy aggregator (Google/Indeed/LinkedIn/...).
-# Imported defensively so the app runs without it installed.
-try:
-    # pyrefly: ignore [missing-import]
-    from jobspy import scrape_jobs as _jobspy_scrape_jobs
-except Exception:  # pragma: no cover - only when the optional dep is absent
-    _jobspy_scrape_jobs = None
-
 logger = logging.getLogger("scraper")
 
 HEADERS = {
@@ -1666,67 +1658,6 @@ def extract_opportunity_company_and_title(
         title = f"{title}{qualifier.group(1).rstrip(' ,')}".strip()
 
     return company, title or fallback_role
-
-
-def fetch_jobs_via_jobspy(
-    search_terms: List[str], location: Optional[str] = None, results_wanted: int = 25
-) -> List[Dict[str, Any]]:
-    """
-    Optional best-effort Google Jobs source via the open-source JobSpy library.
-
-    JobSpy is an unofficial aggregator (same ToS/robustness class as the LinkedIn path),
-    so this is opt-in and returns [] when the library is missing or scraping fails.
-    Google requires the natural-language ``google_search_term``.
-    """
-    if _jobspy_scrape_jobs is None:
-        logger.info("JobSpy is not installed; Google Jobs fallback unavailable.")
-        return []
-
-    results: List[Dict[str, Any]] = []
-    for term in search_terms or []:
-        term = (term or "").strip()
-        if not term:
-            continue
-        try:
-            df = _jobspy_scrape_jobs(
-                site_name="google",
-                google_search_term=term,
-                location=location or "",
-                results_wanted=results_wanted,
-                verbose=0,
-            )
-        except Exception as e:
-            logger.warning(f"JobSpy Google search failed for '{term}': {e}")
-            continue
-
-        if df is None:
-            continue
-        try:
-            rows = list(df.iterrows())
-        except Exception:
-            continue
-        for _, row in rows:
-            title = str(row.get("title") or "").strip()
-            url = str(row.get("job_url") or "").strip()
-            if not title or not url:
-                continue
-            results.append(
-                {
-                    "title": title,
-                    "company_name": str(row.get("company") or "Unknown").strip(),
-                    "url": url,
-                    "location": str(
-                        row.get("location") or location or "Remote / Various"
-                    ),
-                    "description": str(row.get("description") or ""),
-                    "salary_range": row.get("min_amount")
-                    and str(row.get("min_amount"))
-                    or None,
-                    "source": "Google Jobs (JobSpy)",
-                    "source_type": "Google",
-                }
-            )
-    return results
 
 
 def fetch_google_jobs(

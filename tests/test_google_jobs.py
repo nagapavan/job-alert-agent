@@ -238,6 +238,102 @@ def test_fetch_google_jobs_playwright():
         assert jobs[0]["url"] == "https://careers.rustlab.io/jobs/1"
 
 
+def test_fetch_google_jobs_playwright_reads_detail_pane():
+    """The JD pane (not the one-line snippet) becomes `description` (issue #77)."""
+    mock_p = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_p.chromium.launch_persistent_context.return_value = mock_context
+    mock_context.new_page.return_value = mock_page
+
+    mock_card = MagicMock()
+    mock_title = MagicMock()
+    mock_title.inner_text.return_value = "Principal Engineer"
+    mock_comp = MagicMock()
+    mock_comp.inner_text.return_value = "Acme"
+    mock_loc = MagicMock()
+    mock_loc.inner_text.return_value = "Hyderabad"
+    mock_link = MagicMock()
+    mock_link.get_attribute.return_value = "https://acme.example/jobs/1"
+    mock_card.query_selector.side_effect = lambda sel: {
+        "div.BjJfJf, div.PUpOsf, div[role='heading'], h2, a.title": mock_title,
+        "div.vNEEBe, div.wvy6fc, span.company, div.company": mock_comp,
+        "div.Qk80nd, div.oc1tfd, span.location": mock_loc,
+        "a[href]": mock_link,
+    }.get(sel, None)
+
+    mock_page.query_selector_all.return_value = [mock_card]
+
+    detail = MagicMock()
+    detail.inner_text.return_value = (
+        "Full JD body: responsibilities, requirements, and qualifications. " * 3
+    )
+    mock_page.query_selector.side_effect = lambda sel: (
+        detail if sel in ("div.KLsYvd", "div[jsname='bN97Pc']") else None
+    )
+
+    with patch(
+        "backend.playwright_app.get_persistent_browser_context",
+        return_value=mock_context,
+    ):
+        jobs = fetch_google_jobs_playwright(
+            mock_p, "Principal Engineer", headless=True, max_results=5
+        )
+    assert len(jobs) == 1
+    assert jobs[0]["description"].startswith("Full JD body:")
+
+
+def test_fetch_google_jobs_playwright_pagination_is_bounded(monkeypatch):
+    """Pagination scrolls at most _GOOGLE_JOBS_MAX_SCROLLS times (issue #77)."""
+    import backend.playwright_app as pw
+
+    monkeypatch.setattr(pw, "_GOOGLE_JOBS_MAX_SCROLLS", 2)
+
+    mock_p = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_p.chromium.launch_persistent_context.return_value = mock_context
+    mock_context.new_page.return_value = mock_page
+
+    counter = {"n": 0}
+
+    def make_card(title):
+        card = MagicMock()
+        t = MagicMock()
+        t.inner_text.return_value = title
+        c = MagicMock()
+        c.inner_text.return_value = "Acme"
+        l = MagicMock()
+        l.inner_text.return_value = "Remote"
+        link = MagicMock()
+        link.get_attribute.return_value = "https://acme.example/jobs/1"
+        card.query_selector.side_effect = lambda sel: {
+            "div.BjJfJf, div.PUpOsf, div[role='heading'], h2, a.title": t,
+            "div.vNEEBe, div.wvy6fc, span.company, div.company": c,
+            "div.Qk80nd, div.oc1tfd, span.location": l,
+            "a[href]": link,
+        }.get(sel, None)
+        return card
+
+    def fresh_cards(_sel):
+        # Each scroll reveals one new card (distinct title) so the list keeps growing.
+        counter["n"] += 1
+        return [make_card(f"Engineer {counter['n']}")]
+
+    mock_page.query_selector_all.side_effect = fresh_cards
+
+    with patch(
+        "backend.playwright_app.get_persistent_browser_context",
+        return_value=mock_context,
+    ):
+        jobs = fetch_google_jobs_playwright(
+            mock_p, "Engineer", headless=True, max_results=15
+        )
+    # With the cap at 2 scrolls, at most 2 pages of cards are read.
+    assert len(jobs) <= 2
+    assert mock_page.mouse.wheel.call_count <= 2
+
+
 def test_fetch_google_jobs_followed_queries_playwright():
     from backend.playwright_app import fetch_google_jobs_followed_queries_playwright
 
@@ -341,7 +437,7 @@ def test_api_google_jobs_scrape_endpoint(db_session):
         }
     ]
 
-    with patch("backend.main.fetch_google_jobs", return_value=mock_jobs):
+    with patch("backend.main.fetch_google_jobs_playwright", return_value=mock_jobs):
         res = client.post(
             "/api/jobs/google-jobs/scrape",
             json={
@@ -386,8 +482,8 @@ def test_api_google_jobs_scrape_endpoint(db_session):
 
 
 def test_api_google_jobs_scrape_multi_query(db_session):
-    def mock_fetch(query, location="India", max_results=15):
-        if "Principal" in query:
+    def mock_fetch(p, query=None, location="India", max_results=15, **kwargs):
+        if "Principal" in (query or ""):
             return [
                 {
                     "title": "Principal Architect",
@@ -414,7 +510,7 @@ def test_api_google_jobs_scrape_multi_query(db_session):
                 }
             ]
 
-    with patch("backend.main.fetch_google_jobs", side_effect=mock_fetch):
+    with patch("backend.main.fetch_google_jobs_playwright", side_effect=mock_fetch):
         res = client.post(
             "/api/jobs/google-jobs/scrape",
             json={
@@ -469,22 +565,18 @@ def test_normalize_google_query_dedupes_location():
     assert normalize_google_query("") == ""
 
 
-@patch("backend.main.fetch_google_jobs")
+@patch("backend.main.fetch_google_jobs_playwright")
 @patch("backend.main.get_db")
-def test_google_jobs_task_runner_uses_valid_fetch_kwargs(
-    mock_get_db, mock_fetch, db_session
-):
-    """Regression: the scheduled runner must call fetch_google_jobs(max_results=...), not num_results.
-
-    Previously it passed ``num_results=10`` (TypeError swallowed per query), so automatic
-    Google Jobs scans always completed in 0s with 0 items.
-    """
+def test_google_jobs_task_runner_uses_playwright(mock_get_db, mock_fetch_pw, db_session):
+    """The scheduled runner fetches via Playwright (the sole fetcher) with max_results."""
     from backend.main import _run_google_jobs_task_runner
 
     mock_get_db.return_value = iter([db_session])
 
-    # Real signature: a bogus kwarg (num_results=) raises TypeError here.
-    def fake_fetch(query, location=None, max_results=15):
+    def fake_fetch(p, query=None, location=None, headless=True, max_results=15,
+                   pacer=None, outcome=None, **kwargs):
+        if outcome is not None:
+            outcome["outcome"] = "fetched"
         return [
             {
                 "company_name": "Acme",
@@ -495,29 +587,27 @@ def test_google_jobs_task_runner_uses_valid_fetch_kwargs(
             }
         ]
 
-    mock_fetch.side_effect = fake_fetch
+    mock_fetch_pw.side_effect = fake_fetch
 
     result = _run_google_jobs_task_runner(
         queries=["Backend Engineer jobs"], location="India"
     )
     assert result["jobs_found"] == 1
-    mock_fetch.assert_called_once()
-    _, kwargs = mock_fetch.call_args
+    mock_fetch_pw.assert_called_once()
+    _, kwargs = mock_fetch_pw.call_args
     assert "max_results" in kwargs
 
 
 @patch("backend.main.fetch_google_jobs_playwright")
-@patch("backend.main.fetch_google_jobs")
 @patch("backend.main.get_db")
 def test_google_jobs_runner_reports_partial_when_no_query_returns_postings(
-    mock_get_db, mock_fetch, mock_fetch_pw, db_session
+    mock_get_db, mock_fetch_pw, db_session
 ):
     """A scan where every query came back empty is degraded, not a success (issue #75)."""
     from backend.database import OperationLog
     from backend.main import _run_google_jobs_task_runner
 
     mock_get_db.return_value = iter([db_session])
-    mock_fetch.return_value = []
     mock_fetch_pw.return_value = []
 
     result = _run_google_jobs_task_runner(
@@ -535,68 +625,44 @@ def test_google_jobs_runner_reports_partial_when_no_query_returns_postings(
     )
     assert log is not None and log.status == "Partial"
     assert "Degraded" in log.summary
+    # Per-query outcome is recorded for observability (issue #77).
+    details = json.loads(log.details_json)
+    assert details["per_query_outcomes"][0]["outcome"] == "zero_results"
 
 
-def test_fetch_jobs_via_jobspy_maps_rows(monkeypatch):
-    """JobSpy adapter maps the DataFrame rows into our normalized job dicts."""
-    import backend.scraper as s
-
-    class FakeDF:
-        def iterrows(self):
-            yield (
-                0,
-                {
-                    "title": "Staff Engineer",
-                    "company": "Acme",
-                    "job_url": "https://x/1",
-                    "location": "Bengaluru, India",
-                    "description": "desc",
-                    "min_amount": None,
-                },
-            )
-
-    monkeypatch.setattr(s, "_jobspy_scrape_jobs", lambda **kwargs: FakeDF())
-    jobs = s.fetch_jobs_via_jobspy(["Staff Engineer jobs in India"], location="India")
-    assert len(jobs) == 1
-    assert jobs[0]["title"] == "Staff Engineer"
-    assert jobs[0]["url"] == "https://x/1"
-    assert jobs[0]["source"].startswith("Google Jobs")
-
-
-def test_fetch_jobs_via_jobspy_unavailable(monkeypatch):
-    """When JobSpy is not installed the adapter degrades to an empty list."""
-    import backend.scraper as s
-
-    monkeypatch.setattr(s, "_jobspy_scrape_jobs", None)
-    assert s.fetch_jobs_via_jobspy(["anything"]) == []
-
-
-@patch("backend.main.fetch_jobs_via_jobspy")
-@patch("backend.main.fetch_google_jobs", return_value=[])
-@patch("backend.main.is_feature_enabled", return_value=True)
+@patch("backend.main.fetch_google_jobs_playwright")
 @patch("backend.main.get_db")
-def test_google_jobs_runner_falls_back_to_jobspy(
-    mock_get_db, mock_flag, mock_direct, mock_jobspy, db_session
-):
-    """When the direct SERP returns nothing and the flag is on, the runner uses JobSpy."""
+def test_google_jobs_runner_reports_browser_busy(mock_get_db, mock_fetch_pw, db_session):
+    """A BrowserProfileBusy fetch is reported as browser_busy, not silent success."""
+    from backend.database import OperationLog
     from backend.main import _run_google_jobs_task_runner
 
+    class BrowserProfileBusy(Exception):
+        pass
+
     mock_get_db.return_value = iter([db_session])
-    mock_jobspy.return_value = [
-        {
-            "title": "Principal Engineer",
-            "company_name": "Acme",
-            "url": "https://x/1",
-            "location": "Hyderabad, India",
-            "description": "d",
-        }
-    ]
+
+    def raise_busy(*args, **kwargs):
+        outcome = kwargs.get("outcome")
+        if outcome is not None:
+            outcome["outcome"] = "browser_busy"
+        raise BrowserProfileBusy("profile locked")
+
+    mock_fetch_pw.side_effect = raise_busy
 
     result = _run_google_jobs_task_runner(
-        queries=["Principal Engineer jobs in India"], location="India"
+        queries=["Backend Engineer jobs"], location="India"
     )
-    assert result["jobs_found"] == 1
-    mock_jobspy.assert_called()
+    assert result["jobs_found"] == 0
+
+    log = (
+        db_session.query(OperationLog)
+        .filter(OperationLog.operation_type == "google_jobs_background_scan")
+        .order_by(OperationLog.id.desc())
+        .first()
+    )
+    details = json.loads(log.details_json)
+    assert details["per_query_outcomes"][0]["outcome"] == "browser_busy"
 
 
 # -------------------------------------------------------------
