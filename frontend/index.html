@@ -474,6 +474,9 @@
                     <!-- Discovery health banner: a requested channel that silently degraded -->
                     <div id="discovery-health-banner" class="sync-review-banner hidden"></div>
 
+                    <!-- Email review queue (anti-fatigue): staged application emails awaiting a decision -->
+                    <div id="email-review-banner" class="sync-review-banner hidden"></div>
+
                     <div class="panel-header">
                         <div class="search-box">
                             <input type="text" id="job-search-input"
@@ -1469,6 +1472,8 @@
                         <h4 class="settings-title">Gmail API <span class="settings-hint">(optional, BYOK — metadata +
                                 snippet only, narrow query)</span></h4>
                         <div id="gmail-status" class="settings-hint" style="margin:4px 0 10px;">Checking…</div>
+                        <div id="email-review-counter" class="settings-hint"
+                            style="margin:4px 0 10px; display:none;"></div>
                         <label>Google OAuth Client ID</label>
                         <input id="gmail-client-id" class="settings-input" autocomplete="off"
                             spellcheck="false" autocapitalize="off"

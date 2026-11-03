@@ -1270,90 +1270,289 @@ def _load_company_aliases() -> List[str]:
     return aliases
 
 
+# Freemail / personal-mail providers whose SLD must never become an employer name.
+_FREEMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+    "yahoo.com", "ymail.com", "icloud.com", "me.com", "proton.me", "protonmail.com",
+    "aol.com", "msn.com", "zoho.com", "fastmail.com", "gmx.com", "mail.com",
+}
+
+# ATS / aggregator / job-board sender domains whose SLD is a vendor, not the hiring company.
+_EMAIL_ATS_DOMAINS = {
+    "greenhouse.io", "greenhouse-mail.io", "lever.co", "jobs.lever.co", "ashbyhq.com",
+    "myworkdayjobs.com", "workday.com", "smartrecruiters.com", "jobs.smartrecruiters.com",
+    "workable.com", "icims.com", "taleo.net", "linkedin.com", "googlealerts-noreply.google.com",
+    "indeed.com", "glassdoor.com", "ziprecruiter.com", "naukri.com", "wellfound.com",
+    "angel.co", "monster.com", "builtin.com", "hirist.com", "foundit.com",
+}
+
+
+def _is_ats_or_freemail_domain(domain: str) -> bool:
+    """True when a sender domain belongs to a job vendor or a personal-mail provider.
+
+    Any subdomain of a blocked apex is also blocked (e.g. ``jobs.lever.co``), so we never
+    infer an employer from a mailing relay that hides the hiring company.
+    """
+    d = (domain or "").strip().lower().lstrip("@")
+    if not d:
+        return True
+    for blocked in _EMAIL_ATS_DOMAINS | _FREEMAIL_DOMAINS:
+        if d == blocked or d.endswith("." + blocked):
+            return True
+    return False
+
+
+def _is_freemail_domain(domain: str) -> bool:
+    """True only for personal-mail providers (gmail/outlook/yahoo/…), not ATS vendors."""
+    d = (domain or "").strip().lower().lstrip("@")
+    if not d:
+        return False
+    for blocked in _FREEMAIL_DOMAINS:
+        if d == blocked or d.endswith("." + blocked):
+            return True
+    return False
+
+
+# Multi-part public suffixes (country/regional) so the SLD isn't mistaken for the brand:
+# acme.co.uk -> brand "Acme", acme.com.au -> "Acme".
+_MULTI_PART_TLDS = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "com.br", "com.cn", "co.in",
+    "co.jp", "com.mx", "com.sg", "co.nz", "com.hk", "com.my",
+}
+
+
+def _registrable_domain(domain: str) -> str:
+    """Returns the registrable (apex) domain, honouring multi-part public suffixes."""
+    labels = [lb for lb in (domain or "").lower().split(".") if lb]
+    if len(labels) < 2:
+        return domain or ""
+    if len(labels) >= 3 and ".".join(labels[-2:]) in _MULTI_PART_TLDS:
+        return ".".join(labels)
+    return ".".join(labels[-2:])
+
+
+def _sender_domain(sender: str) -> str:
+    """Returns the registrable sender domain (e.g. ``acme.com`` from ``jobs@acme.com``)."""
+    if not sender:
+        return ""
+    m = re.search(r"[\w.+-]+@([A-Za-z0-9.-]+)", sender)
+    if not m:
+        return ""
+    return _registrable_domain(m.group(1).strip().lower().rstrip("."))
+
+
+def infer_company_from_sender_domain(sender: str) -> Optional[str]:
+    """Derives an employer name from the sender's email domain.
+
+    ``"Varsha <varsha@acme.com>"`` -> ``"Acme"``. Strips ``+tag``/subdomains, takes the
+    registrable apex, and title-cases the SLD. Returns ``None`` for ATS/aggregator/freemail
+    senders so the tool never invents a company from ``noreply@linkedin.com`` or a personal box.
+    """
+    if not sender:
+        return None
+    m = re.search(r"[\w.+-]+@([A-Za-z0-9.-]+)", sender)
+    if not m:
+        return None
+    domain = m.group(1).strip().lower().rstrip(".")
+    if _is_ats_or_freemail_domain(domain):
+        return None
+    if _registrable_domain(domain) != domain:
+        domain = _registrable_domain(domain)
+    labels = [lb for lb in domain.split(".") if lb]
+    if len(labels) < 2:
+        return None
+    # For a multi-part suffix (acme.co.uk) the brand label is the one before the suffix.
+    if len(labels) >= 3 and ".".join(labels[-2:]) in _MULTI_PART_TLDS:
+        sld = labels[-3]
+    else:
+        sld = labels[-2]
+    if not sld or len(sld) < 2:
+        return None
+    return sld[:1].upper() + sld[1:]
+
+
+# Company-name candidates that are phrase fragments, not real employers.
+_COMPANY_BAD_TOKENS = {
+    "your", "the", "our", "an", "interview", "interviews", "application", "process",
+    "next", "role", "position", "job", "opportunity", "applying", "applied",
+    "application", "submitted", "harvey", "was", "for", "at", "with", "and", "or",
+}
+
+# Trailing punctuation that would otherwise poison ilike matching / domain construction.
+_COMPANY_TRAILING_PUNCT_RE = re.compile(r"[.|,|;|:|>]+$")
+
+
+def _candidate_is_junk(candidate: str) -> bool:
+    """Rejects prepositional-junk captures like 'Applying to Harvey' / '… was submitted'."""
+    lowered = (candidate or "").strip().lower()
+    if not lowered:
+        return True
+    if re.search(r"(?:applying\s+to\s+|applied\s+for\s+|was\s+submitted)", lowered):
+        return True
+    return any(tok in lowered.split() for tok in _COMPANY_BAD_TOKENS)
+
+
+# Standard engineering-role ladder, loaded from data/role_titles.json (tracked, editable).
+# Data-driven rather than hardcoded in source — mirrors data/skill_taxonomy.json.
+_ROLE_TITLES_FILE = (
+    Path(__file__).resolve().parent.parent / "data" / "role_titles.json"
+)
+_role_titles_cache: Optional[List[str]] = None
+
+
+def _load_role_titles() -> List[str]:
+    """Loads the optional role-title ladder from data/role_titles.json (a JSON array)."""
+    global _role_titles_cache
+    if _role_titles_cache is not None:
+        return _role_titles_cache
+    titles: List[str] = []
+    try:
+        if _ROLE_TITLES_FILE.exists():
+            with open(_ROLE_TITLES_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, list):
+                titles = [str(x).strip() for x in data if str(x).strip()]
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(f"Could not load role titles: {exc}")
+    _role_titles_cache = titles
+    return titles
+
+
+def _resolve_role_from_email(subject: str, snippet: str = "") -> str:
+    """Resolves a role title from an email, preferring the broad opportunity phrase regex.
+
+    ``_OPPORTUNITY_ROLE_PHRASE_RE`` captures ``Software Engineer``-style roles; the
+    seniority-only regex below catches ``Lead Engineer`` / ``Staff Engineer`` (no area word)
+    and keeps any trailing qualifier (`` - Full Stack (AI)``), so real tracked titles stay
+    matchable instead of collapsing to ``Software Engineer``. Falls back to the standard ladder.
+    """
+    for source in (subject, snippet):
+        if not source:
+            continue
+        m = _OPPORTUNITY_ROLE_PHRASE_RE.search(source)
+        if not m:
+            m = _EMAIL_SENIORITY_ROLE_RE.search(source)
+        if not m:
+            continue
+        title = m.group(1).strip()
+        qualifier = re.match(r"(\s*[(\-,\/][^:.\n]{1,50})", source[m.end():])
+        if qualifier:
+            title = f"{title}{qualifier.group(1).rstrip(' ,')}".strip()
+        return title or None
+    for r in _load_role_titles():
+        if re.search(r"\b" + re.escape(r) + r"\b", subject, re.IGNORECASE):
+            return r
+    return None
+
+
+# Work-mode tokens that read as a location suffix ("Principal Engineer - Remote").
+_WORK_MODE_TOKENS = {"remote", "hybrid", "onsite", "on-site", "on site", "anywhere", "remote-first"}
+
+
+def _looks_like_location(text: str) -> bool:
+    """True when a trailing segment is a city or a work-mode token, not a role qualifier."""
+    seg = (text or "").strip()
+    if not seg or len(seg) > 40:
+        return False
+    if seg.lower() in _WORK_MODE_TOKENS:
+        return True
+    try:
+        from backend.geo import countries_for_cities
+
+        return bool(countries_for_cities([seg]))
+    except Exception:
+        return False
+
+
+def _split_role_location(role: str) -> tuple:
+    """Splits a trailing location off a role title: ``Principal Engineer - Hyderabad`` ->
+    (``Principal Engineer``, ``Hyderabad``). A real role qualifier (`` - Full Stack (AI)``) is
+    kept intact because it is neither a city nor a work-mode token."""
+    role = (role or "").strip()
+    m = re.match(r"^(.*?)\s*[-|,]\s*([^-,|()]{2,40})$", role)
+    if m and _looks_like_location(m.group(2)):
+        return m.group(1).strip(), m.group(2).strip()
+    return role, None
+
+
+def _resolve_role_and_location(subject: str, snippet: str = "") -> tuple:
+    """Resolves the role and peels a trailing location into a separate field."""
+    role = _resolve_role_from_email(subject, snippet)
+    if not role:
+        return None, None
+    return _split_role_location(role)
+
+
+def _employer_from_subject(subject: str) -> Optional[str]:
+    """Extracts the real employer named in the subject (agency-relayed JDs).
+
+    Order: pipe-delimited segment -> ``with|at|from|for|by|about|to|on behalf of X`` regex.
+    Trailing punctuation is stripped and prepositional junk rejected.
+    """
+    subject = subject or ""
+    if "|" in subject:
+        for seg in reversed([s.strip() for s in subject.split("|")]):
+            seg = _COMPANY_TRAILING_PUNCT_RE.sub("", seg).strip()
+            if (
+                seg
+                and not _candidate_is_junk(seg)
+                and len(seg) <= 30
+                and not _EMAIL_SENIORITY_ROLE_RE.search(seg)
+                and not _OPPORTUNITY_ROLE_PHRASE_RE.search(seg)
+            ):
+                return seg
+
+    comp_match = re.search(
+        r"(?:on\s+behalf\s+of|with|at|from|for|by|about|to)\s+([A-Z][A-Za-z0-9\.\s]{2,25}?)"
+        r"(?:\s*[:|\-,]|\s+for|\s+regarding|\s+team|\s*$)",
+        subject,
+    )
+    if comp_match:
+        candidate = _COMPANY_TRAILING_PUNCT_RE.sub("", comp_match.group(1)).strip()
+        if not _candidate_is_junk(candidate):
+            return candidate
+    return None
+
+
 def extract_company_and_role_from_email_header(
     subject: str, snippet: str = "", sender: str = ""
 ) -> Dict[str, Optional[str]]:
     """
-    Extracts employer company name and candidate role title from recruiter and interview emails.
-    Handles major tech firms, startup patterns, and standard engineering hierarchies.
+    Extracts the employer, agency, role, and location from a recruiter/interview email.
+
+    ``agency`` is derived from the sender domain (e.g. ``recruise.in`` -> "Recruise").
+    ``employer`` is derived from the subject/snippet (aliases -> ``with|at|…|on behalf of X``
+    -> pipe segment). ``company`` resolves to the employer when present, else the agency, so an
+    agency relaying a JD for a real employer is tracked under the *employer* (dedup with a direct
+    posting) while the agency is preserved separately for context.
     """
     full_text = f"{subject} {snippet}".strip()
-    company = None
-    role = None
 
-    # Optional user-configured employer aliases (data/company_aliases.json); never hardcoded.
+    # Agency = the sender's organisation (None for ATS/aggregator/freemail senders).
+    agency = infer_company_from_sender_domain(sender)
+
+    # Employer = the real hiring company named in the subject/body, if any.
+    employer = None
     for comp in _load_company_aliases():
         pattern = r"\b" + re.escape(comp) + r"\b"
-        if re.search(pattern, full_text, re.IGNORECASE) or re.search(
-            pattern, sender, re.IGNORECASE
-        ):
-            company = comp
+        if re.search(pattern, full_text, re.IGNORECASE):
+            employer = comp
             break
 
-    if not company:
-        # Regex heuristics: 'with X', 'at X', 'from X', 'for X'
-        comp_match = re.search(
-            r"(?:with|at|from|for)\s+([A-Z][A-Za-z0-9\.\s]{2,25}?)(?:\s*[:|\-,]|\s+for|\s+regarding|\s+team|\s*$)",
-            subject,
-        )
-        if comp_match:
-            candidate_comp = comp_match.group(1).strip()
-            if candidate_comp.lower() not in [
-                "your",
-                "the",
-                "our",
-                "an",
-                "interview",
-                "interviews",
-                "application",
-                "process",
-                "next",
-            ]:
-                company = candidate_comp
+    if not employer:
+        employer = _employer_from_subject(subject)
 
-    # Clean subject for standard role extraction
-    clean_subj = subject
-    for prefix in [
-        "Information needed for your interviews with",
-        "Virtual Interview for",
-        "Video interview -",
-        "Interview with",
-        "Update from",
-        "Re:",
-        "Fwd:",
-    ]:
-        if prefix.lower() in clean_subj.lower():
-            clean_subj = re.sub(re.escape(prefix), "", clean_subj, flags=re.IGNORECASE)
+    company = employer or agency
 
-    standard_roles = [
-        "Principal Software Engineer",
-        "Staff Software Engineer",
-        "Senior Software Engineer",
-        "Software Development Engineer",
-        "Principal Engineer",
-        "Staff Engineer",
-        "Senior Engineer",
-        "Lead Software Engineer",
-        "Engineering Manager",
-        "Solutions Architect",
-        "Principal Architect",
-        "Staff Architect",
-        "Data Engineer",
-        "Machine Learning Engineer",
-        "AI Engineer",
-        "Software Engineer II",
-        "Software Engineer 2",
-        "Software Engineer",
-    ]
-    for r in standard_roles:
-        if re.search(r"\b" + re.escape(r) + r"\b", clean_subj, re.IGNORECASE):
-            role = r
-            break
-        elif re.search(r"\b" + re.escape(r) + r"\b", snippet, re.IGNORECASE):
-            role = r
-            break
+    role, location = _resolve_role_and_location(subject, snippet)
 
-    return {"company": company, "role": role or "Software Engineer"}
+    return {
+        "company": company,
+        "employer": employer,
+        "agency": agency,
+        "role": role,
+        "location": location,
+    }
 
 
 # Role phrases commonly embedded as the header of a job-alert snippet. Aggregators such as
@@ -1365,6 +1564,15 @@ _OPPORTUNITY_ROLE_PHRASE_RE = re.compile(
     r"Data|Machine\s+Learning|ML|AI|Platform|Cloud|DevOps|Security|Mobile|Android|iOS|"
     r"QA|Test|Site\s+Reliability|SRE|Systems?|Embedded|Product|Project|Program|Engineering)"
     r"\s+(?:Engineer|Developer|Architect|Manager|Lead|Scientist|Analyst|Designer))",
+    re.IGNORECASE,
+)
+
+# Email role phrases WITHOUT an area word: "Lead Engineer", "Staff Engineer", "Principal
+# Engineer". _OPPORTUNITY_ROLE_PHRASE_RE requires an area token, so these would otherwise
+# collapse to a generic title. Used as a fallback in _resolve_role_from_email.
+_EMAIL_SENIORITY_ROLE_RE = re.compile(
+    r"\b((?:Principal|Staff|Senior|Sr\.?|Lead|Junior|Associate|Chief)\s+"
+    r"(?:Engineer|Developer|Architect|Manager|Scientist|Analyst|Designer))",
     re.IGNORECASE,
 )
 

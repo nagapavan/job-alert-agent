@@ -66,6 +66,8 @@ document.addEventListener("DOMContentLoaded", () => {
     loadPreferencesFromServer();
     // Channel health is dashboard-visible (degraded banner + engine badge), not settings-only.
     loadGmailSection();
+    // Email review queue (anti-fatigue staged applications) surfaces in the banner slot.
+    loadEmailReviewQueue();
     fetchInitialData();
 });
 
@@ -4334,6 +4336,7 @@ async function syncGmailNow() {
             showToast(`📧 ${data.message}`);
         }
         loadGmailSection();
+        loadEmailReviewQueue();
     } catch (e) {
         showToast("⚠️ " + e.message);
     } finally {
@@ -4404,6 +4407,97 @@ function dismissDiscoveryBanner() {
     state.discoveryBannerDismissed = true;
     const banner = document.getElementById("discovery-health-banner");
     if (banner) banner.classList.add("hidden");
+}
+
+// -------------------------------------------------------------
+// Email review queue (anti-fatigue, issue #76)
+// -------------------------------------------------------------
+
+// Loads staged application emails and renders one card in the review-banner slot,
+// plus a "N awaiting review" counter in the Gmail settings tab.
+async function loadEmailReviewQueue() {
+    try {
+        const res = await fetch(`${API_BASE}/api/email/applications/pending`);
+        if (!res.ok) return;
+        const data = await res.json();
+        state.emailReview = data;
+        renderEmailReviewBanner();
+        renderEmailReviewCounter();
+    } catch (e) {
+        console.error("Failed to load email review queue", e);
+    }
+}
+
+function renderEmailReviewCounter() {
+    const el = document.getElementById("email-review-counter");
+    if (!el) return;
+    const n = (state.emailReview && state.emailReview.count) || 0;
+    if (n <= 0) { el.style.display = "none"; return; }
+    el.style.display = "";
+    el.innerHTML = `📥 <strong>${n}</strong> application email(s) awaiting review — open them in the job feed banner.`;
+}
+
+function renderEmailReviewBanner() {
+    const banner = document.getElementById("email-review-banner");
+    if (!banner) return;
+    const items = (state.emailReview && state.emailReview.items) || [];
+    if (!items.length) { banner.classList.add("hidden"); banner.innerHTML = ""; return; }
+    const first = items[0];
+    const extra = items.length - 1;
+    const domainLabel = first.domain || first.company;
+    banner.classList.remove("hidden");
+    banner.innerHTML = `
+        <span class="sync-banner-icon">📥</span>
+        <span class="sync-banner-text">
+            <strong>${escapeHTML(first.company)} · ${escapeHTML(first.role)}</strong> (${escapeHTML(first.event_type)})
+            — tracked application from an email awaiting your decision
+            ${extra ? `<span class="sync-banner-meta">+${extra} more</span>` : ""}
+        </span>
+        <span class="sync-banner-actions">
+            <button class="btn btn-sm btn-primary" onclick="emailReviewAccept(${first.id})">Track application</button>
+            <button class="btn btn-sm btn-outline" onclick="emailReviewIgnore(${first.id})">Ignore</button>
+            <button class="btn btn-sm btn-outline" onclick="emailReviewIgnoreDomain(${first.id})" title="Never show from ${escapeHTML(domainLabel)}">Ignore ${escapeHTML(domainLabel)}</button>
+        </span>
+    `;
+}
+
+async function emailReviewAccept(id) {
+    try {
+        const res = await fetch(`${API_BASE}/api/email/applications/pending/${id}/accept`, { method: "POST" });
+        const data = await res.json();
+        if (data.ok) {
+            showToast("✅ Application tracked.");
+            await loadEmailReviewQueue();
+        } else {
+            showToast("⚠️ " + (data.detail || "Could not track."));
+        }
+    } catch (e) { showToast("⚠️ " + e.message); }
+}
+
+async function emailReviewIgnore(id) {
+    try {
+        const res = await fetch(`${API_BASE}/api/email/applications/pending/${id}/ignore`, { method: "POST" });
+        const data = await res.json();
+        if (data.ok) {
+            showToast("Ignored. This employer+role won't resurface.");
+            await loadEmailReviewQueue();
+        } else {
+            showToast("⚠️ " + (data.detail || "Could not ignore."));
+        }
+    } catch (e) { showToast("⚠️ " + e.message); }
+}
+
+async function emailReviewIgnoreDomain(id) {
+    try {
+        const res = await fetch(`${API_BASE}/api/email/applications/pending/${id}/ignore-domain`, { method: "POST" });
+        const data = await res.json();
+        if (data.ok) {
+            showToast("Ignored everything from this employer.");
+            await loadEmailReviewQueue();
+        } else {
+            showToast("⚠️ " + (data.detail || "Could not ignore."));
+        }
+    } catch (e) { showToast("⚠️ " + e.message); }
 }
 
 async function saveGmailCredentials() {

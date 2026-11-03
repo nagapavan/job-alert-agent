@@ -539,11 +539,15 @@ def test_apply_email_events_updates_all_application_statuses(db_session):
 
 
 def test_apply_email_events_creates_untracked_application(db_session):
-    """An application email for a role we never discovered still creates a tracked job."""
+    """An unambiguous application email for a role we never discovered creates a tracked job.
+
+    Auto-create now requires a real sender domain (issue #76), so this carries one to stay
+    on the unambiguous path; a domain-less event is staged instead.
+    """
     from backend.main import _apply_email_events_to_db
 
     n = _apply_email_events_to_db(db_session, [{
-        "company": "UntrackedCoTest", "role": "Principal Engineer",
+        "company": "UntrackedCoTest", "role": "Principal Engineer", "domain": "untrackedco.com",
         "event_type": "application_received", "subject": "Thanks for applying",
     }])
     assert n == 1
@@ -554,6 +558,19 @@ def test_apply_email_events_creates_untracked_application(db_session):
     assert job is not None
     assert job.status == "Applied"
     assert job.source_type == "Email"
+
+
+def test_apply_email_events_stages_domainless_untracked_application(db_session):
+    """A domain-less application email can't be auto-created → staged for the operator."""
+    from backend.main import _apply_email_events_to_db, PendingEmailApplication
+
+    n = _apply_email_events_to_db(db_session, [{
+        "company": "NoDomainCo", "role": "Principal Engineer",
+        "event_type": "application_received", "subject": "Thanks for applying",
+    }])
+    assert n == 0
+    assert db_session.query(Job).count() == 0
+    assert db_session.query(PendingEmailApplication).count() == 1
 
 
 def test_low_confidence_email_events_are_guarded(db_session):

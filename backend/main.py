@@ -97,6 +97,8 @@ from backend.database import (
     OperationLog,
     Resume,
     ScoreAuditRecord,
+    EmailSuppression,
+    PendingEmailApplication,
     get_consents,
     get_db,
     get_feature_flags,
@@ -159,6 +161,9 @@ from backend.scraper import (
     scrape_uber_jobs,
     scrape_workable_jobs,
     scrape_workday_jobs,
+    _is_ats_or_freemail_domain,
+    _is_freemail_domain,
+    _sender_domain,
 )
 from backend.task_engine import CancellationToken, TaskProgress, task_engine
 
@@ -752,6 +757,7 @@ class ExternalSyncResponse(BaseModel):
     emails_checked: int = 0
     status_updates: int = 0
     opportunities_added: int = 0
+    pending_email_applications: int = 0
     details: List[str] = []
     message: str = ""
     # "success" | "Partial" | "Failed" — see backend.channel_status.aggregate_status.
@@ -3141,6 +3147,7 @@ class UserPreferenceOut(BaseModel):
     excluded_companies: str = ""
     skip_topics: str = ""
     extra_skills: List[str] = []
+    pending_email_applications: int = 0
 
 
 def normalize_target_cities(raw: Optional[str]) -> str:
@@ -3222,6 +3229,11 @@ def get_preferences(db: Session = Depends(get_db)):
         else "amazon",
         skip_topics=pref.skip_topics or "",
         extra_skills=get_extra_skills(pref),
+        pending_email_applications=(
+            db.query(PendingEmailApplication)
+            .filter(PendingEmailApplication.state == "pending")
+            .count()
+        ),
     )
 
 
@@ -6366,18 +6378,63 @@ EMAIL_AUTO_CREATE_MIN_CONFIDENCE = 0.75  # to create a brand-new job from an ema
 EMAIL_OPPORTUNITY_MIN_CONFIDENCE = 0.6  # to create a job from an email opportunity
 
 
-def _match_job_for_email_event(db, comp_name: str, role: str = ""):
+def _match_within_company(db, company, role: str, pipeline_statuses):
+    """Finds the best Job at a specific Company for a role (title-aware, then most recent)."""
+    jobs_query = db.query(Job).filter(Job.company_id == company.id)
+    if role:
+        match = (
+            jobs_query.filter(Job.title.ilike(f"%{role}%"))
+            .filter(Job.status.in_(pipeline_statuses))
+            .order_by(Job.id.desc())
+            .first()
+        )
+        if not match:
+            match = (
+                jobs_query.filter(Job.title.ilike(f"%{role}%"))
+                .order_by(Job.id.desc())
+                .first()
+            )
+        if match:
+            return match
+    candidates = jobs_query.order_by(Job.id.desc()).limit(2).all()
+    if len(candidates) == 1:
+        return candidates[0]
+    return (
+        jobs_query.filter(Job.status.in_(pipeline_statuses))
+        .order_by(Job.id.desc())
+        .first()
+    )
+
+
+def _match_job_for_email_event(db, comp_name: str, role: str = "", domain: str = ""):
     """
     Finds the best matching Job for an email event.
     Prefers an explicit title match at the company (among jobs the user has shortlisted/applied
     to), then a unique company match, then the most recent in-progress job at that company
     (avoids cross-role mixups when a company has many tracked roles).
+
+    When a sender ``domain`` is known, an exact ``Company.domain`` match is tried first, so a
+    cleaned ``acme.com`` domain matches the tracked ``acme.com`` company even when the parsed
+    company name differs slightly or carries trailing punctuation (issue #76).
     """
     pipeline_statuses = ["Applied", "Screening", "Interview", "Offered", "Shortlisted"]
+    role = (role or "").strip()
+    domain = (domain or "").strip().lower()
+
+    # Exact Company.domain match first (when a sender domain is known): this lets a cleaned
+    # `acme.com` domain find the tracked `acme.com` company even if the parsed name differs.
+    if domain:
+        comp_domain = (
+            db.query(Company).filter(Company.domain.ilike(domain)).first()
+        )
+        if comp_domain:
+            match = _match_within_company(db, comp_domain, role, pipeline_statuses)
+            if match:
+                return match
+
     comp_query = db.query(Job).filter(
         Job.company.has(Company.name.ilike(f"%{comp_name}%"))
     )
-    role = (role or "").strip()
     if role:
         match = (
             comp_query.filter(Job.title.ilike(f"%{role}%"))
@@ -6410,7 +6467,7 @@ def _ensure_tracked_job_for_email_event(db, ev):
     by a portal/LinkedIn/Google scan.
     """
     comp_name = (ev.get("company") or "").strip()
-    role = (ev.get("role") or "").strip() or "Software Engineer"
+    role = (ev.get("role") or "").strip() or "Open Role"
     if not comp_name:
         return None
     comp = db.query(Company).filter(Company.name.ilike(comp_name)).first()
@@ -6442,6 +6499,124 @@ def _ensure_tracked_job_for_email_event(db, ev):
     db.add(job)
     db.flush()
     return job
+
+
+def _email_has_application_cue(ev) -> bool:
+    """True when the email clearly references the candidate's own application process.
+
+    Distinguishes real status emails ("your application", "interview", "assessment", "offer")
+    from recruiter cold outreach or generic notifications that share a confidence boost but
+    must never auto-create a tracked job.
+    """
+    text = f"{ev.get('subject', '')} {ev.get('snippet', '')}".lower()
+    cues = (
+        "your application", "application received", "you applied", "your job application",
+        "application confirmation", "thank you for applying", "thanks for applying",
+        "applying", "applied for", "interview", "interview confirmation", "phone screen",
+        "recruiter screen", "assessment", "offer", "offer letter", "next steps",
+        "not moving forward", "regret", "was viewed", "screening", "scheduling",
+        "availability", "code challenge", "technical screen",
+    )
+    return any(cue in text for cue in cues)
+
+
+def _email_auto_create_eligible(ev) -> bool:
+    """Unambiguous case → safe to auto-create a tracked job from an email (issue #76).
+
+    Auto-create only when ALL hold: it is a status event, confidence is at or above the
+    auto-create threshold, the sender domain is a real employer (not ATS/aggregator/freemail),
+    an application-reference cue is present, and a role resolved. Anything else is staged for
+    the operator instead.
+    """
+    if ev.get("event_type") not in (
+        "application_received", "screening", "interview", "offer", "rejection",
+    ):
+        return False
+    if float(ev.get("confidence", 1.0) or 0.0) < EMAIL_AUTO_CREATE_MIN_CONFIDENCE:
+        return False
+    if not (ev.get("company") or "").strip():
+        return False
+    role = (ev.get("role") or "").strip()
+    # A placeholder role ("Open Role") is not a resolved role → not unambiguous.
+    if not role or role.lower() == "open role":
+        return False
+    domain = (ev.get("domain") or "").strip()
+    if not domain or _is_ats_or_freemail_domain(domain):
+        return False
+    return _email_has_application_cue(ev)
+
+
+def _email_is_suppressed(db, ev) -> bool:
+    """True when the operator has ignored this employer+role or the whole employer."""
+    domain = (ev.get("domain") or "").strip().lower()
+    role = (ev.get("role") or "").strip()
+    comp = (ev.get("company") or "").strip().lower()
+    if not (domain or comp):
+        return False
+    # Suppressions are keyed by domain (when known), else employer name.
+    key = domain or comp
+    return bool(
+        db.query(EmailSuppression).filter(
+            EmailSuppression.domain.ilike(key),
+            (EmailSuppression.role.is_(None)) | (EmailSuppression.role.ilike(role)),
+        ).first()
+    )
+
+
+def _stage_email_application(db, ev) -> bool:
+    """Stages a non-auto-create application email into the anti-fatigue review queue.
+
+    Thread-aggregated: one row per (normalized employer, normalized role). A repeat email
+    for the same employer+role bumps ``last_seen``/``email_count`` instead of creating a new
+    card. Returns True if a pending row exists or was created.
+
+    Only genuine application-status signals are staged: a freemail sender or a message with
+    no application-reference cue (cold outreach, "unable to reach you") queues nothing.
+    """
+    comp = (ev.get("company") or "").strip()
+    role = (ev.get("role") or "").strip() or "Software Engineer"
+    if not comp:
+        return False
+    domain = (ev.get("domain") or "").strip()
+    if domain and _is_freemail_domain(domain):
+        return False
+    if not _email_has_application_cue(ev):
+        return False
+    if _email_is_suppressed(db, ev):
+        return False
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    pending = (
+        db.query(PendingEmailApplication)
+        .filter(
+            PendingEmailApplication.company.ilike(comp),
+            PendingEmailApplication.role.ilike(role),
+            PendingEmailApplication.state == "pending",
+        )
+        .first()
+    )
+    if pending:
+        pending.last_seen = now_utc
+        pending.email_count = (pending.email_count or 0) + 1
+        if ev.get("event_type"):
+            pending.event_type = ev["event_type"]
+        if ev.get("snippet"):
+            pending.snippet = (ev["snippet"] or "")[:400]
+        return True
+    db.add(
+        PendingEmailApplication(
+            company=comp,
+            domain=(ev.get("domain") or "").strip(),
+            role=role,
+            event_type=ev.get("event_type") or "application_received",
+            confidence=float(ev.get("confidence", 0.0) or 0.0),
+            first_seen=now_utc,
+            last_seen=now_utc,
+            email_count=1,
+            state="pending",
+            snippet=(ev.get("snippet") or "")[:400],
+        )
+    )
+    return True
 
 
 def _apply_email_events_to_db(db, email_events) -> int:
@@ -6477,22 +6652,18 @@ def _apply_email_events_to_db(db, email_events) -> int:
                 f"{EMAIL_STATUS_MIN_CONFIDENCE}): '{subj[:60]}'"
             )
             continue
-        matched_job = _match_job_for_email_event(db, comp_name, role)
+        matched_job = _match_job_for_email_event(
+            db, comp_name, role, ev.get("domain", "")
+        )
         if not matched_job:
-            # Capture applications/outcomes for roles never discovered by a scan — but only
-            # for high-confidence signals, so weak matches don't create phantom jobs.
-            if (
-                ev_type
-                in (
-                    "application_received",
-                    "screening",
-                    "interview",
-                    "offer",
-                    "rejection",
-                )
-                and confidence >= EMAIL_AUTO_CREATE_MIN_CONFIDENCE
-            ):
+            # Capture applications/outcomes for roles never discovered by a scan — but ONLY
+            # for the unambiguous case (issue #76). Otherwise stage it for the operator so a
+            # real application is never silently dropped or auto-created as a phantom job.
+            if _email_auto_create_eligible(ev):
                 matched_job = _ensure_tracked_job_for_email_event(db, ev)
+            else:
+                _stage_email_application(db, ev)
+                continue
             if not matched_job:
                 continue
 
@@ -6685,6 +6856,11 @@ def _ingest_email_opportunities_to_db(db, email_events) -> int:
         snippet = (ev.get("snippet") or "").strip()
         subject = ev.get("subject", "")
         url = (ev.get("url") or "").strip()
+        # Agency-relayed JD (issue #82): track under the *employer* (dedup with a direct posting)
+        # while preserving the agency on the source string for context.
+        employer = (ev.get("employer") or "").strip()
+        agency = (ev.get("agency") or "").strip()
+        ev_location = (ev.get("location") or "").strip()
 
         comp_name, role = fallback_company, fallback_role
         # Aggregators hide the real employer in the sender header; recover it from the
@@ -6697,6 +6873,8 @@ def _ingest_email_opportunities_to_db(db, email_events) -> int:
                 comp_name = parsed_company
             if parsed_role:
                 role = parsed_role
+        if employer:
+            comp_name = employer
         if not comp_name:
             continue
 
@@ -6707,7 +6885,7 @@ def _ingest_email_opportunities_to_db(db, email_events) -> int:
         # Preference gate: Gmail roles carry no structured location, so verify against the
         # alert text. When location filters exist, an unverifiable location is rejected.
         if pref_filter.has_filters:
-            loc_text = f"{snippet} {subject}".strip()
+            loc_text = f"{ev_location} {snippet} {subject}".strip()
             if not pref_filter.title_ok(role):
                 filtered_out += 1
                 continue
@@ -6740,6 +6918,10 @@ def _ingest_email_opportunities_to_db(db, email_events) -> int:
             seen.add(batch_key)
             continue
 
+        source = "Gmail Opportunity"
+        if agency and agency.lower() != comp_name.lower():
+            source = f"Gmail Opportunity (via {agency})"
+
         db.add(
             Job(
                 company_id=comp.id,
@@ -6747,8 +6929,8 @@ def _ingest_email_opportunities_to_db(db, email_events) -> int:
                 description=snippet
                 or f"Opportunity from Gmail for {role} at {comp_name}.",
                 url=url,
-                location="Remote / Various",
-                source="Gmail Opportunity",
+                location=ev_location or "Remote / Various",
+                source=source,
                 source_type="Email",
                 status="To Apply",
                 match_score=55.0,
@@ -6773,6 +6955,143 @@ def sync_external_applications(
 ):
     """Synchronous candidate application-status sync (request path)."""
     return _execute_external_sync(payload, db)
+
+
+# -------------------------------------------------------------
+# Email review queue (anti-fatigue, issue #76)
+# -------------------------------------------------------------
+
+# Age after which a still-unresolved pending review item is dropped.
+EMAIL_PENDING_EXPIRY_DAYS = 14
+
+
+def _expire_stale_email_pending(db) -> int:
+    """Marks pending review items older than EMAIL_PENDING_EXPIRY_DAYS as expired."""
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        days=EMAIL_PENDING_EXPIRY_DAYS
+    )
+    stale = (
+        db.query(PendingEmailApplication)
+        .filter(
+            PendingEmailApplication.state == "pending",
+            PendingEmailApplication.last_seen < cutoff,
+        )
+        .all()
+    )
+    for row in stale:
+        row.state = "expired"
+    if stale:
+        db.commit()
+    return len(stale)
+
+
+@app.get("/api/email/applications/pending")
+def list_pending_email_applications(
+    db: Session = Depends(get_db),
+):
+    """Lists staged, unresolved application emails for the operator review banner.
+
+    Expired items are dropped silently first, so the count never shows stale nag cards.
+    """
+    _expire_stale_email_pending(db)
+    rows = (
+        db.query(PendingEmailApplication)
+        .filter(PendingEmailApplication.state == "pending")
+        .order_by(PendingEmailApplication.last_seen.desc())
+        .all()
+    )
+    return {
+        "count": len(rows),
+        "items": [
+            {
+                "id": r.id,
+                "company": r.company,
+                "domain": r.domain or "",
+                "role": r.role,
+                "event_type": r.event_type,
+                "confidence": r.confidence,
+                "first_seen": r.first_seen.isoformat() if r.first_seen else "",
+                "last_seen": r.last_seen.isoformat() if r.last_seen else "",
+                "email_count": r.email_count or 1,
+                "snippet": r.snippet or "",
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post("/api/email/applications/pending/{pending_id}/accept")
+def accept_pending_email_application(pending_id: int, db: Session = Depends(get_db)):
+    """Tracks the staged application: creates/updates Company + Job and marks it accepted."""
+    pending = db.query(PendingEmailApplication).get(pending_id)
+    if not pending or pending.state != "pending":
+        return {"ok": False, "detail": "Not found or already resolved."}
+    ev = {
+        "company": pending.company,
+        "domain": pending.domain or "",
+        "role": pending.role,
+        "event_type": pending.event_type,
+        "snippet": pending.snippet or "",
+        "subject": f"{pending.company} {pending.role}",
+        "confidence": pending.confidence,
+    }
+    job = _ensure_tracked_job_for_email_event(db, ev)
+    if not job:
+        return {"ok": False, "detail": "Could not create a tracked job."}
+    pending.state = "accepted"
+    db.commit()
+    return {"ok": True, "job_id": job.id, "company": pending.company, "role": pending.role}
+
+
+@app.post("/api/email/applications/pending/{pending_id}/ignore")
+def ignore_pending_email_application(
+    pending_id: int, db: Session = Depends(get_db)
+):
+    """Ignores one staged application (employer+role) and suppresses it from ever resurfacing."""
+    pending = db.query(PendingEmailApplication).get(pending_id)
+    if not pending or pending.state != "pending":
+        return {"ok": False, "detail": "Not found or already resolved."}
+    key = (pending.domain or "").strip().lower() or (pending.company or "").strip().lower()
+    role = (pending.role or "").strip()
+    if key:
+        existing = (
+            db.query(EmailSuppression)
+            .filter(
+                EmailSuppression.domain.ilike(key),
+                EmailSuppression.role.ilike(role),
+            )
+            .first()
+        )
+        if not existing:
+            db.add(EmailSuppression(domain=key, role=role or None))
+    pending.state = "accepted"
+    db.commit()
+    return {"ok": True, "ignored": key, "role": role}
+
+
+@app.post("/api/email/applications/pending/{pending_id}/ignore-domain")
+def ignore_pending_email_domain(
+    pending_id: int, db: Session = Depends(get_db)
+):
+    """Ignores everything from the staged application's employer (domain-wide suppression)."""
+    pending = db.query(PendingEmailApplication).get(pending_id)
+    if not pending or pending.state != "pending":
+        return {"ok": False, "detail": "Not found or already resolved."}
+    key = (pending.domain or "").strip().lower() or (pending.company or "").strip().lower()
+    if key:
+        existing = (
+            db.query(EmailSuppression)
+            .filter(
+                EmailSuppression.domain.ilike(key),
+                EmailSuppression.role.is_(None),
+            )
+            .first()
+        )
+        if not existing:
+            db.add(EmailSuppression(domain=key, role=None))
+    pending.state = "accepted"
+    db.commit()
+    return {"ok": True, "ignored_domain": key}
 
 
 def _execute_external_sync(
@@ -7244,6 +7563,11 @@ def _execute_external_sync(
         emails_checked=emails_checked,
         status_updates=status_updates,
         opportunities_added=opportunities_added,
+        pending_email_applications=(
+            db.query(PendingEmailApplication)
+            .filter(PendingEmailApplication.state == "pending")
+            .count()
+        ),
         details=details,
         message=f"Synced successfully: {hirist_updated + status_updates} status updates, {hirist_ingested} new applications tracked.",
         status=run_status,

@@ -19,6 +19,7 @@ data/*
 !data/company_aliases.example.json
 !data/ats_portals.json
 !data/skill_taxonomy.json
+!data/role_titles.json
 data/resumes/
 *.pdf
 *.docx
@@ -50,3 +51,10 @@ extension/js/README.md
 extension/sidepanel/README.md
 frontend/README.md
 scripts/README.md
+
+# Local reasoning docs (transient, not committed)
+reasoning/*.md
+
+# backups and audits
+job_alert_agent.db.bak-*
+*.rescore-audit-*
