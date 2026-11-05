@@ -462,6 +462,32 @@
     };
   }
 
+  // Visually hidden (screen-reader-only) nodes are structure, never the visible job title.
+  // Eightfold PCS portals (e.g. jobs.autodesk.com) ship exactly one h1 on the page and it is
+  // <h1 class="screenReaderOnly-…">Single Position</h1>, so the generic h1 tier would otherwise
+  // win and the real title (JSON-LD / og:title) is discarded.
+  const _SR_ONLY_RE = /(^|[\s_-])(sr-only|screenreaderonly|screen-reader-only|visually-?hidden|a11y-hidden)([\s_-]|$)/i;
+
+  function isVisuallyHidden(el) {
+    try {
+      const cls = typeof el.className === "string" ? el.className : "";
+      if (_SR_ONLY_RE.test(`${cls} ${el.id || ""}`)) return true;
+      const rect = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+      if (rect && rect.width <= 1 && rect.height <= 1) return true;
+    } catch (e) {
+      /* ignore */
+    }
+    return false;
+  }
+
+  // Page-level placeholders ("Job details", "Careers at Acme", "Single Position") are not job
+  // titles. Anchored on purpose: a real title such as "Careers Advisor" must survive.
+  function isGenericJobTitle(text) {
+    const t = (text || "").trim().toLowerCase();
+    if (!t || t.length < 8) return true;
+    return /^(job details?|job posting|job description|job|careers?|opportunit(?:y|ies)|apply(?: now)?|position|single position)(\s+(?:at|with|by|-)\s+.+)?$/.test(t);
+  }
+
   function extractJobMetadata() {
     let title = "";
     let company = "";
@@ -490,7 +516,7 @@
       "h1"
     ];
     for (const sel of titleSelectors) {
-      const el = deepQueryAll(sel).find((n) => (n.innerText || n.textContent || "").trim());
+      const el = deepQueryAll(sel).find((n) => (n.innerText || n.textContent || "").trim() && !isVisuallyHidden(n));
       if (el) {
         title = (el.innerText || el.textContent || "").trim();
         break;
@@ -570,7 +596,9 @@
     // Tier 0: schema.org/JobPosting structured data — full, clean description.
     const ld = extractJsonLdJobPosting();
     if (ld) {
-      if (ld.title && (!title || title.length < 8 || /job details|careers|opportunit/i.test(title))) {
+      // The JSON-LD JobPosting is the canonical record for this URL, so its title outranks any
+      // DOM node — a placeholder heading must never win over the real job title.
+      if (ld.title && !isGenericJobTitle(ld.title)) {
         title = ld.title;
       }
       if (ld.company && (!company || isGenericCompanyName(company))) {
@@ -579,6 +607,13 @@
       if (ld.description) {
         description = ld.description;
       }
+    }
+
+    // og:title fallback ("<job title> | <company>") when no usable DOM/JSON-LD title was found.
+    if (!title || isGenericJobTitle(title)) {
+      const ogEl = document.querySelector("meta[property='og:title'], meta[name='og:title']");
+      const ogTitle = ogEl ? (ogEl.getAttribute("content") || "").split("|")[0].trim() : "";
+      if (!isGenericJobTitle(ogTitle)) title = ogTitle;
     }
 
     // Anti-bot / auth challenge pages (Google reCAPTCHA interstitial, LinkedIn
@@ -658,6 +693,12 @@
     // Never treat bundled JS/CSS as a job description.
     if (looksLikeCode(description)) {
       description = "";
+    }
+
+    // Last resort: the document title, minus the "| Company" suffix.
+    if (!title || isGenericJobTitle(title)) {
+      const docTitle = String(document.title || "").split("|")[0].trim();
+      if (!isGenericJobTitle(docTitle)) title = docTitle;
     }
 
     return {
