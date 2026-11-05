@@ -215,3 +215,106 @@ class TestEmbeddingSettingsApi:
         assert res.status_code == 200
         # Invalid values are ignored; the persisted value stays valid.
         assert res.json()["backend"] in ("auto", "standalone", "external", "ollama", "hash")
+
+
+class TestBackendReporting:
+    """active_backend_name() must describe what would actually serve an embed call (#100)."""
+
+    @staticmethod
+    def _settings(backend="auto", server_url=""):
+        return {"backend": backend, "model": "x", "allow_download": False,
+                "server_url": server_url, "server_model": ""}
+
+    def _reset_probe(self, monkeypatch):
+        monkeypatch.setattr(embeddings, "_PROBE_CACHE",
+                            {"key": "", "at": 0.0, "name": ""})
+
+    def test_unreachable_external_reports_hash(self, monkeypatch):
+        # Regression: available() is hardcoded True, so the chain used to report "external"
+        # while every call fell through to the hash vectorizer.
+        monkeypatch.setattr(embeddings, "_probe_external", lambda backend: False)
+        self._reset_probe(monkeypatch)
+        assert embeddings.active_backend_name(self._settings("external")) == "hash"
+
+    def test_reachable_external_reports_external(self, monkeypatch):
+        monkeypatch.setattr(embeddings, "_probe_external", lambda backend: True)
+        self._reset_probe(monkeypatch)
+        assert embeddings.active_backend_name(self._settings("external")) == "external"
+
+    def test_hash_setting_reports_hash_without_probing(self, monkeypatch):
+        def _boom(backend):
+            raise AssertionError("must not probe when only the hash backend is configured")
+
+        monkeypatch.setattr(embeddings, "_probe_external", _boom)
+        self._reset_probe(monkeypatch)
+        assert embeddings.active_backend_name(self._settings("hash")) == "hash"
+
+    def test_stamp_records_the_backend_that_served(self, monkeypatch):
+        monkeypatch.setattr(embeddings, "resolve_backends",
+                            lambda settings=None: [HashEmbeddingBackend()])
+        embeddings.embed_text("Python")
+        assert embeddings.last_embed_stamp() == ("hash", "hash")
+
+
+class TestHashFallbackWarning:
+    def test_warns_once_with_the_reason(self, monkeypatch, caplog):
+        monkeypatch.setattr(embeddings, "_HASH_WARNED", False)
+        monkeypatch.setattr(OnnxEmbeddingBackend, "available", lambda self: False)
+        monkeypatch.setattr(
+            ExternalEmbeddingBackend, "embed",
+            lambda self, texts: (_ for _ in ()).throw(RuntimeError("connection refused")),
+        )
+        settings = {"backend": "auto", "model": "x", "allow_download": False,
+                    "server_url": "", "server_model": ""}
+        with caplog.at_level("WARNING", logger="embeddings"):
+            embed_text("Python", settings=settings)
+            embed_text("Go", settings=settings)
+        warnings = [r for r in caplog.records if "hash vectorizer" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "connection refused" in warnings[0].getMessage()
+
+
+class TestVectorStamping:
+    def test_row_records_the_backend_that_embedded_it(self, db_session, monkeypatch):
+        from backend.database import Company, Job
+
+        monkeypatch.setattr(embeddings, "resolve_backends",
+                            lambda settings=None: [HashEmbeddingBackend()])
+        vector = embeddings.embed_text("python kubernetes")
+        company = Company(name="Stamp Co", domain="stamp.example")
+        db_session.add(company)
+        db_session.flush()
+        job = Job(company_id=company.id, title="Engineer", description="python", embedding=vector)
+        db_session.add(job)
+        db_session.commit()
+
+        assert job.embedding_model == "hash"
+        assert job.embedding_dim == EMBEDDING_DIM
+
+    def test_unchanged_vector_keeps_its_existing_stamp(self, db_session, monkeypatch):
+        from backend.database import Company, Job
+
+        company = Company(name="Legacy Co", domain="legacy.example")
+        db_session.add(company)
+        db_session.flush()
+        job = Job(company_id=company.id, title="Analyst", description="sql",
+                  embedding=[0.5] * EMBEDDING_DIM, embedding_model="legacy-model",
+                  embedding_dim=EMBEDDING_DIM)
+        db_session.add(job)
+        db_session.commit()
+
+        job.status = "Shortlisted"
+        db_session.commit()
+        assert job.embedding_model == "legacy-model"
+
+
+class TestDownloadEndpoint:
+    def test_reports_failure_instead_of_returning_200(self, monkeypatch):
+        def _fail(self, texts):
+            raise RuntimeError("hub unreachable")
+
+        monkeypatch.setattr(OnnxEmbeddingBackend, "embed", _fail)
+        res = client.post("/api/settings/embeddings/download")
+        assert res.status_code == 502
+        assert "hub unreachable" in res.json()["detail"]
+

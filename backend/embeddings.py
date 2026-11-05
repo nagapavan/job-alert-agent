@@ -19,8 +19,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
 from pathlib import Path
-from typing import List, Optional, Protocol, Sequence, runtime_checkable
+from typing import List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 from backend.config import (
     EMBEDDING_DIM,
@@ -68,6 +69,7 @@ class HashEmbeddingBackend:
     """Deterministic character/word hash vectorizer; the offline last resort."""
 
     name = "hash"
+    model_id = "hash"
 
     def __init__(self, dim: int = EMBEDDING_DIM):
         self.dim = dim
@@ -128,6 +130,10 @@ class ExternalEmbeddingBackend:
         self.model = (model or "").strip() or OLLAMA_MODEL
         self.dim = dim
         self.timeout = timeout
+
+    @property
+    def model_id(self) -> str:
+        return self.model
 
     def available(self) -> bool:
         # Do not probe the network here; a down server simply fails through to the
@@ -286,6 +292,42 @@ class OnnxEmbeddingBackend:
 
 _EMBED_LOCK = threading.Lock()
 
+# Identity of the vectors produced most recently on this thread. Rows are stamped from it so
+# they record the backend that actually embedded them, not the one configuration asked for:
+# the chain degrades silently when a model is missing or a server is down.
+_EMBED_STATE = threading.local()
+
+_HASH_WARNED = False
+
+_PROBE_TTL_SECONDS = 30.0
+_PROBE_CACHE: dict = {"key": "", "at": 0.0, "name": ""}
+
+
+def _record_stamp(backend: EmbeddingBackend) -> None:
+    _EMBED_STATE.backend = backend.name
+    _EMBED_STATE.model = getattr(backend, "model_id", backend.name)
+
+
+def last_embed_stamp() -> Optional[Tuple[str, str]]:
+    """``(backend, model)`` that produced the newest vector on this thread, or ``None``."""
+    backend = getattr(_EMBED_STATE, "backend", None)
+    if not backend:
+        return None
+    return backend, getattr(_EMBED_STATE, "model", backend)
+
+
+def _warn_hash_fallback(reason: Optional[Exception]) -> None:
+    global _HASH_WARNED
+    if _HASH_WARNED:
+        return
+    _HASH_WARNED = True
+    logger.warning(
+        "Embeddings degraded to the hash vectorizer (%s). Semantic similarity stays lexical "
+        "until a real backend is available.",
+        reason or "no semantic backend configured or cached",
+    )
+
+
 
 def resolve_backends(settings: Optional[dict] = None) -> List[EmbeddingBackend]:
     """Return the ordered backend chain for the current (or supplied) settings."""
@@ -333,14 +375,20 @@ def embed_texts(texts: Sequence[str], settings: Optional[dict] = None) -> List[L
         try:
             if not backend.available():
                 continue
-            return backend.embed(texts)
+            vectors = backend.embed(texts)
         except Exception as exc:  # noqa: BLE001 - chain deliberately swallows per-backend errors
             last_error = exc
             logger.debug("Embedding backend %s failed: %s", backend.name, exc)
             continue
+        _record_stamp(backend)
+        if backend.name == "hash":
+            _warn_hash_fallback(last_error)
+        return vectors
     # HashEmbeddingBackend is always available, so this is defensive only.
-    logger.warning("All embedding backends failed (%s); using hash fallback", last_error)
-    return HashEmbeddingBackend().embed(texts)
+    fallback = HashEmbeddingBackend()
+    _record_stamp(fallback)
+    _warn_hash_fallback(last_error)
+    return fallback.embed(texts)
 
 
 def embed_text(text: str, settings: Optional[dict] = None) -> List[float]:
@@ -350,15 +398,56 @@ def embed_text(text: str, settings: Optional[dict] = None) -> List[float]:
     return embed_texts([text], settings=settings)[0]
 
 
-def active_backend_name(settings: Optional[dict] = None) -> str:
-    """Name of the first backend that would actually run for the current settings."""
-    for backend in resolve_backends(settings):
+def _probe_external(backend: ExternalEmbeddingBackend) -> bool:
+    """True when the endpoint answers a real embed request, not just a TCP handshake."""
+    import requests
+
+    try:
+        res = requests.post(
+            _embeddings_endpoint(backend.server_url),
+            json={"model": backend.model, "input": "probe"},
+            timeout=2,
+        )
+        return res.status_code == 200
+    except Exception:
+        return False
+
+
+def probe_backend_name(settings: Optional[dict] = None) -> str:
+    """Backend that would serve an embed call right now; the network probe is cached briefly."""
+    s = settings or get_embedding_settings()
+    key = "|".join(
+        str(s.get(field, ""))
+        for field in ("backend", "model", "allow_download", "server_url", "server_model")
+    )
+    now = time.monotonic()
+    if _PROBE_CACHE["key"] == key and now - _PROBE_CACHE["at"] < _PROBE_TTL_SECONDS:
+        return _PROBE_CACHE["name"]
+    name = "hash"
+    for backend in resolve_backends(s):
         try:
+            if backend.name == "external":
+                if _probe_external(backend):
+                    name = backend.name
+                    break
+                continue
             if backend.available():
-                return backend.name
+                name = backend.name
+                break
         except Exception:
             continue
-    return "hash"
+    _PROBE_CACHE.update({"key": key, "at": now, "name": name})
+    return name
+
+
+def active_backend_name(settings: Optional[dict] = None) -> str:
+    """Name of the backend that would actually serve an embed call for these settings.
+
+    Probes rather than trusting ``available()``: ``ExternalEmbeddingBackend`` reports itself
+    available without contacting the server, which made this report ``external`` while every
+    call failed through to the hash fallback.
+    """
+    return probe_backend_name(settings)
 
 
 def local_model_cached(settings: Optional[dict] = None) -> bool:

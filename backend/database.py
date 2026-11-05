@@ -4,10 +4,13 @@ import logging
 import datetime
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text, 
-    DateTime, Float, ForeignKey, Boolean, TypeDecorator, UniqueConstraint
+    DateTime, Float, ForeignKey, Boolean, TypeDecorator, UniqueConstraint,
+    event, inspect as sa_inspect,
 )
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship, synonym
-from backend.config import DATABASE_URL, SQLITE_URL, encrypt_data, decrypt_data, cipher
+from sqlalchemy.orm import Session, declarative_base, sessionmaker, relationship, synonym
+from backend.config import (
+    DATABASE_URL, EMBEDDING_DIM, SQLITE_URL, encrypt_data, decrypt_data, cipher,
+)
 
 logger = logging.getLogger("database")
 
@@ -101,6 +104,8 @@ class Resume(Base):
     # identical text is the same version; editing the text creates a new one.
     fingerprint = Column(String(64), nullable=True, index=True)
     embedding = Column(SafeVector(384), nullable=True)
+    embedding_model = Column(String(128), nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
@@ -119,6 +124,8 @@ class ResumeChunk(Base):
     section = Column(String(50), default="other")   # skills | role | project | education
     text = Column(Text, nullable=False)
     embedding = Column(SafeVector(384), nullable=True)
+    embedding_model = Column(String(128), nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=utc_now)
 
 
@@ -143,6 +150,10 @@ class Job(Base):
     tailored_resume_points = Column(Text, nullable=True)
     cold_message_draft = Column(Text, nullable=True)
     embedding = Column(SafeVector(384), nullable=True)
+    # Which backend/model produced `embedding`. Vectors from different models are not
+    # comparable, so each row records its own vector space (stamped on flush).
+    embedding_model = Column(String(128), nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
     
     # Due Diligence / Ghost Job Detection
     is_ghost_job = Column(Boolean, default=False)
@@ -256,6 +267,8 @@ class ApplicationQuestionAnswer(Base):
     _answer_text = Column("answer_text", Text, nullable=False)
     category = Column(String(100), default="general")  # "technical", "behavioral", "experience", "salary", "logistics"
     embedding = Column(SafeVector(384), nullable=True)
+    embedding_model = Column(String(128), nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
     use_count = Column(Integer, default=1)
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
@@ -284,6 +297,8 @@ class DismissedJobPattern(Base):
     description = Column(Text, nullable=True)
     reason = Column(String(255), nullable=True)
     embedding = Column(SafeVector(384), nullable=True)
+    embedding_model = Column(String(128), nullable=True)
+    embedding_dim = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=utc_now)
 
 class CustomFormField(Base):
@@ -605,6 +620,41 @@ engine = None
 SessionLocal = None
 
 
+@event.listens_for(Session, "before_flush")
+def _stamp_embedding_rows(session, flush_context, instances):
+    """Record which backend produced each vector as it is persisted.
+
+    The embedding chain degrades silently (model missing, server down -> hash fallback), so
+    the configured model is not evidence of what a row actually holds. The stamp is taken
+    from the backend that served the embed call on this thread, which is why vectors written
+    by a degraded chain are labelled ``hash`` instead of the model configuration names.
+    """
+    from backend.embeddings import last_embed_stamp
+
+    candidates = [
+        obj
+        for obj in list(session.new) + list(session.dirty)
+        if hasattr(obj, "embedding") and hasattr(obj, "embedding_model")
+    ]
+    if not candidates:
+        return
+    stamp = last_embed_stamp()
+    if not stamp:
+        return
+    _backend, model = stamp
+    for obj in candidates:
+        if obj.embedding is None:
+            continue
+        attrs = sa_inspect(obj).attrs
+        if not attrs.embedding.history.has_changes():
+            continue
+        if attrs.embedding_model.history.has_changes():
+            continue  # stamped deliberately by the caller (e.g. scripts/reembed_all.py)
+        obj.embedding_model = model
+        obj.embedding_dim = EMBEDDING_DIM
+
+
+
 def _sqlite_connect_args(url: str) -> dict:
     """Connection args for a SQLite URL (issue #74).
 
@@ -772,6 +822,27 @@ def init_db(custom_url: str = None):
                     conn.execute(text("ALTER TABLE companies ADD COLUMN market_position TEXT;"))
                 if "talking_points" not in col_names:
                     conn.execute(text("ALTER TABLE companies ADD COLUMN talking_points TEXT;"))
+
+        # Vector-space identity for every table that stores embeddings (issue #100).
+        for vector_table in (
+            "jobs",
+            "resumes",
+            "resume_chunks",
+            "application_question_answers",
+            "dismissed_job_patterns",
+        ):
+            if vector_table not in existing_tables:
+                continue
+            col_names = {c["name"] for c in inspector.get_columns(vector_table)}
+            with engine.begin() as conn:
+                if "embedding_model" not in col_names:
+                    conn.execute(
+                        text(f"ALTER TABLE {vector_table} ADD COLUMN embedding_model VARCHAR(128);")
+                    )
+                if "embedding_dim" not in col_names:
+                    conn.execute(
+                        text(f"ALTER TABLE {vector_table} ADD COLUMN embedding_dim INTEGER;")
+                    )
 
         if "user_preferences" in existing_tables:
             col_names = {c["name"] for c in inspector.get_columns("user_preferences")}

@@ -191,16 +191,19 @@ def resume_supports(
             overlap = matched / len(p_tokens)
             if overlap >= token_threshold:
                 return True, overlap, "token_overlap"
-    # Embedding fallback (Tier B); skipped for the non-semantic hash backend.
+    # Embedding fallback (Tier B); skipped when the chain had to fall back to the
+    # non-semantic hash vectorizer. Decided from the vector actually produced, because
+    # configuration alone cannot tell whether a configured backend served the request.
     try:
         from backend import embeddings
 
-        if embeddings.active_backend_name() == "hash":
-            return False, 0.0, "none"
         chunks = list(resume_chunks) if resume_chunks is not None else _resume_chunks(resume_text)
         if not chunks:
             return False, 0.0, "none"
         query = embeddings.embed_text(phrase)
+        stamp = embeddings.last_embed_stamp()
+        if not stamp or stamp[0] == "hash":
+            return False, 0.0, "none"
         best = max((_cosine(query, embeddings.embed_text(c)) for c in chunks), default=0.0)
         if best >= embedding_threshold:
             return True, best, "embedding"
