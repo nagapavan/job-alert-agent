@@ -416,7 +416,15 @@ class JobAgentRuntimeAdapter {
     lines.push(strengths.length ? strengths.map(s => `• ${s}`).join("\n") : "• No direct strengths detected.");
     lines.push("");
     lines.push("Missing Keywords / Gaps:");
-    lines.push(gaps.length ? gaps.map(g => `• ${g}`).join("\n") : "• None detected.");
+    if (gaps.length) {
+      lines.push(gaps.map(g => `• ${g}`).join("\n"));
+    } else if (partials.length) {
+      // "None detected" reads as "no gaps at all" even when most must-haves are only partially
+      // covered; point at the list that explains the missing coverage instead.
+      lines.push("• Nothing fully missing — see Partial Coverage below.");
+    } else {
+      lines.push("• None detected.");
+    }
     if (partials.length) {
       lines.push("");
       lines.push("Partial Coverage (you have some evidence — not full):");

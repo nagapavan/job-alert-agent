@@ -5187,6 +5187,7 @@ def analyze_job_match_endpoint(
             ineligibility_reason=det_match_details["ineligibility_reason"],
             strengths=det_match_details["strengths"],
             gaps=det_match_details["gaps"],
+            partials=det_match_details["partials"],
             feedback=det_match_details["feedback"],
             requirements=[
                 r.model_dump() for r in det_match_details["assessment"].requirements
