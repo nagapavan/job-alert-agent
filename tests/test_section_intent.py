@@ -77,6 +77,25 @@ class TestJdSegmentation:
         assert spans[0].label == "required"
         assert spans[-1].label == "intro"
 
+    def test_markdown_headings_split_sections(self):
+        """JSON-LD descriptions ship headings as markdown; "#" must not defeat segmentation."""
+        jd = (
+            "## Position Overview\n\n"
+            "We build things for people.\n\n"
+            "## Minimum Qualifications\n\n"
+            "  * Strong Python.\n\n"
+            "## Nice to Have\n\n"
+            "  * Familiarity with Rust.\n"
+        )
+        labels = [s.label for s in si.jd_section_spans(jd)]
+        assert labels == ["intro", "required", "preferred"]
+
+    @pytest.mark.parametrize("prefix", ["#", "##", "###", "######"])
+    def test_markdown_heading_prefix_is_stripped(self, prefix):
+        assert si.normalize_heading(f"{prefix} Minimum Qualifications") == "minimum qualifications"
+        assert si.classify_heading(f"{prefix} Minimum Qualifications", "jd") == "required"
+        assert si.classify_heading(f"{prefix} Nice to Have", "jd") == "preferred"
+
     def test_mid_sentence_a_plus_does_not_start_preferred(self):
         jd = (
             "Requirements: Python required.\n"
