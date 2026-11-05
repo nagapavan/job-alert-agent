@@ -66,6 +66,26 @@ def test_match_analyze_deterministic_classifier_path_no_llm(db_session):
     mock_assess.assert_not_called()
 
 
+def test_match_analyze_returns_partials_for_partially_covered_must_haves(db_session):
+    """The classifier path must ship `partials`: the feedback string points at that list, so
+    omitting it leaves the side panel advertising a section it can never render."""
+    _add_active_resume(db_session, "Alice. Skills: Python, Go, Rust, Kafka, JavaScript.")
+    with patch("backend.main.assess_job_requirements") as mock_assess:
+        res = client.post("/api/match/analyze", json={
+            "job_title": "Backend Engineer",
+            "job_description": "Requirements: Python, Go, Rust, Kafka and TypeScript.",
+        })
+
+    assert res.status_code == 200
+    data = res.json()
+    assert data["analysis_source"] == "classifier"
+    assert "TypeScript" in data["partials"]
+    assert data["gaps"] == []
+    # Nothing is fully missing, yet the score is not full — the panel must be able to say why.
+    assert "met partially" in data["feedback"]
+    mock_assess.assert_not_called()
+
+
 def test_match_analyze_detects_ai_stack_and_preferred_section(db_session):
     """AI/GenAI/NLU requirements are detected, and the Preferred section is not dropped."""
     _add_active_resume(
