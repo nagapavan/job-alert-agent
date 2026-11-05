@@ -426,8 +426,9 @@ class JobAgentRuntimeAdapter {
       lines.push("• None detected.");
     }
     if (partials.length) {
+      const partialLabel = `${partials.length} must-have${partials.length === 1 ? "" : "s"} met partially`;
       lines.push("");
-      lines.push("Partial Coverage (you have some evidence — not full):");
+      lines.push(`Partial Coverage (${partialLabel} — you have some evidence, not full):`);
       lines.push(partials.map(p => `• ${p}`).join("\n"));
     }
     if (missingMust.length) {

@@ -81,8 +81,10 @@ def test_match_analyze_returns_partials_for_partially_covered_must_haves(db_sess
     assert data["analysis_source"] == "classifier"
     assert "TypeScript" in data["partials"]
     assert data["gaps"] == []
-    # Nothing is fully missing, yet the score is not full — the panel must be able to say why.
-    assert "met partially" in data["feedback"]
+    # The narrative must not point at screen position or state a partial count: the rendered
+    # list is must-have-only and capped, so any number in the text can disagree with it.
+    assert "Partial Coverage" not in data["feedback"]
+    assert "below" not in data["feedback"].lower()
     mock_assess.assert_not_called()
 
 
