@@ -3,7 +3,7 @@ import os
 import re
 import threading
 import urllib.parse
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 
 from backend.config import CHROME_PROFILE_DIR
 from backend.parser import split_candidate_name
@@ -1889,6 +1889,208 @@ def launch_assisted_application_session(
 
 _GOOGLE_JOBS_MAX_SCROLLS = 5
 
+# Live-verified markup (2026-11). Google renders the Jobs vertical under `udm=8`; the legacy
+# `ibp=htl;jobs` parameter is silently dropped by a redirect to a plain web SERP, which has no
+# job list at all. Every selector below is a *fallback chain*: Google rotates class names, so
+# the first match wins and a structural attribute (jsname/role) is preferred over a class.
+_GOOGLE_JOBS_UDM = "8"
+_GOOGLE_JOBS_CARD_SELECTORS = (
+    "div[jsname='OCDbef']",
+    "div.GoEOPd",
+    "li.iFjolb",
+    "div[role='listitem']",
+)
+_GOOGLE_JOBS_TITLE_SELECTORS = ("div.tNxQIb", "div.PUpOsf", "div[role='heading']", "h3")
+_GOOGLE_JOBS_COMPANY_SELECTORS = ("div.a3jPc", "div.MKCbgd", "div.vNEEBe")
+_GOOGLE_JOBS_LOCATION_SELECTORS = ("div.FqK3wc", "div.Qk80nd", "div.oc1tfd")
+_GOOGLE_JOBS_DETAIL_SELECTORS = (
+    "div.XFOJCe",
+    "div[jsname='bN97Pc']",
+    "div.KLsYvd",
+    "div.Yflw0c",
+)
+_GOOGLE_JOBS_APPLY_SELECTORS = ("a.brKmxb",)
+# Google answers "no postings" with a sentence, not an empty list; that is a real zero result,
+# not a markup change. Curly apostrophes are normalised before matching.
+_GOOGLE_JOBS_EMPTY_PHRASE = "any 'jobs' matches"
+_GOOGLE_BLOCK_URL_MARKERS = ("/sorry/", "consent.google.com")
+_GOOGLE_BLOCK_BODY_MARKERS = ("unusual traffic", "not a robot", "before you continue")
+
+
+def build_google_jobs_url(query: str, location: Optional[str] = None) -> str:
+    """
+    Builds the Google for Jobs SERP URL.
+
+    `udm=8` is the parameter Google currently honours. Callers also pass a query that already
+    names its location ("... jobs in India") *and* a `location`, so the location is only
+    appended when the query does not already carry one — otherwise Google is asked for
+    "... jobs in India in India" and answers with nothing.
+    """
+    search_terms = (query or "").strip()
+    loc = (location or "").strip()
+    if loc and not _query_mentions_location(search_terms, loc):
+        search_terms = f"{search_terms} in {loc}"
+    return f"https://www.google.com/search?q={urllib.parse.quote(search_terms)}&udm={_GOOGLE_JOBS_UDM}"
+
+
+def _query_mentions_location(query: str, location: str) -> bool:
+    lowered = (query or "").lower()
+    if " in " in f" {lowered} ":
+        return True
+    return bool(location) and location.lower() in lowered
+
+
+def _google_jobs_browser_options() -> Tuple[bool, Dict[str, Any]]:
+    """
+    Returns (headless, launch kwargs) for the Google Jobs browser.
+
+    `chrome-headless-shell` gets an empty Jobs vertical from Google, so the default is a real
+    window. `new_headless` opts into full Chromium's headless mode instead.
+    """
+    from backend.config import GOOGLE_JOBS_BROWSER_MODE
+
+    if GOOGLE_JOBS_BROWSER_MODE == "new_headless":
+        return True, {"channel": "chromium"}
+    return False, {}
+
+
+def _google_jobs_body_text(page) -> str:
+    try:
+        text = page.inner_text("body")
+    except Exception:
+        return ""
+    return text if isinstance(text, str) else ""
+
+
+def _is_blocked_page(page) -> bool:
+    """True when Google served a consent wall or the "unusual traffic" interstitial."""
+    try:
+        current_url = page.url or ""
+    except Exception:
+        current_url = ""
+    if not isinstance(current_url, str):
+        current_url = ""
+    if any(marker in current_url for marker in _GOOGLE_BLOCK_URL_MARKERS):
+        return True
+    body = _google_jobs_body_text(page).lower()
+    return any(marker in body for marker in _GOOGLE_BLOCK_BODY_MARKERS)
+
+
+def _jobs_vertical_empty(page) -> bool:
+    """True when Google explicitly reported zero postings for this query."""
+    body = (
+        _google_jobs_body_text(page)
+        .lower()
+        .replace("\u2019", "'")
+        .replace("\u2018", "'")
+    )
+    return _GOOGLE_JOBS_EMPTY_PHRASE in body
+
+
+def _jobs_mode_dropped(page) -> bool:
+    """True when the redirect stripped `udm=8`, leaving a plain web SERP."""
+    try:
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(page.url or "").query)
+    except Exception:
+        return False
+    return _GOOGLE_JOBS_UDM not in params.get("udm", [])
+
+
+def _first_text(scope, selectors: Tuple[str, ...]) -> str:
+    for selector in selectors:
+        try:
+            el = scope.query_selector(selector)
+        except Exception:
+            continue
+        if not el:
+            continue
+        try:
+            text = (el.inner_text() or "").strip()
+        except Exception:
+            continue
+        if text:
+            return text
+    return ""
+
+
+def _absolute_job_url(href: str) -> str:
+    """Normalises a job link to an absolute external URL, unwrapping Google redirects."""
+    href = (href or "").strip()
+    if not href:
+        return ""
+    if href.startswith("/goto?url="):
+        # Opaque per-posting redirect token. The destination cannot be resolved client-side,
+        # but the token is the only stable per-posting identifier the jobs panel exposes.
+        return f"https://www.google.com{href}"
+    if href.startswith("/url?"):
+        from backend.scraper import unwrap_google_redirect_url
+
+        href = unwrap_google_redirect_url(f"https://www.google.com{href}")
+    if not href.startswith("http"):
+        return ""
+    host = urllib.parse.urlparse(href).netloc.lower()
+    if not host or "google." in host:
+        return ""
+    return href
+
+
+def _read_detail_pane(page) -> str:
+    """Reads the right-hand JD pane text, preferring the canonical description block."""
+    best = ""
+    for selector in _GOOGLE_JOBS_DETAIL_SELECTORS:
+        try:
+            el = page.query_selector(selector)
+            if not el:
+                continue
+            text = (el.inner_text() or "").strip()
+        except Exception:
+            continue
+        if not isinstance(text, str) or not text:
+            continue
+        if len(text) > len(best):
+            best = text
+        if selector == _GOOGLE_JOBS_DETAIL_SELECTORS[0] and len(best) >= 80:
+            return best
+    return best
+
+
+def _read_apply_url(page) -> str:
+    """Reads the detail pane's "Apply on <source>" link as the canonical job URL."""
+    for selector in _GOOGLE_JOBS_APPLY_SELECTORS:
+        try:
+            elements = page.query_selector_all(selector)
+        except Exception:
+            continue
+        for el in elements[:6]:
+            try:
+                label = (el.inner_text() or "").strip()
+            except Exception:
+                label = ""
+            if not isinstance(label, str):
+                continue
+            if label and "apply" not in label.lower():
+                continue
+            try:
+                href = el.get_attribute("href") or ""
+            except Exception:
+                href = ""
+            url = _absolute_job_url(href)
+            if url:
+                return url
+    return ""
+
+
+def _scroll(page) -> None:
+    """Advances the left job list by one viewport (bounded by the caller's cap)."""
+    try:
+        page.mouse.wheel(0, 2400)
+    except Exception:
+        pass
+    try:
+        page.wait_for_timeout(1200)
+    except Exception:
+        pass
+
 
 def fetch_google_jobs_playwright(
     playwright_instance,
@@ -1900,75 +2102,45 @@ def fetch_google_jobs_playwright(
     outcome: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Navigates Google for Jobs (ibp=htl;jobs) in the persistent browser session.
+    Navigates Google for Jobs (`udm=8`) in the persistent browser session.
 
     Bounded pagination: scrolls the left job list until ``max_results`` or no growth (hard cap
     of ``_GOOGLE_JOBS_MAX_SCROLLS`` scrolls). Detail extraction: selects each card and reads the
     right-hand JD pane into ``description`` (the field the scorer consumes), instead of a one-line
     snippet. ``outcome`` (optional dict) is filled with one of ``fetched`` / ``browser_busy`` /
-    ``dom_changed`` / ``zero_results`` so the runner can report honest per-query status.
+    ``blocked`` / ``not_jobs_mode`` / ``dom_changed`` / ``zero_results``, plus the resolved URL,
+    browser mode and a body signature so markup drift is diagnosable from the operation log.
+
+    ``headless`` is accepted for signature compatibility but the browser mode is owned by
+    ``GOOGLE_JOBS_BROWSER_MODE``: Google serves an empty Jobs vertical to headless-shell.
     """
-    def _set_outcome(value: str) -> None:
+    def _set(key: str, value: Any) -> None:
         if outcome is not None:
-            outcome["outcome"] = value
+            outcome[key] = value
 
     if not query or not query.strip():
-        _set_outcome("zero_results")
+        _set("outcome", "zero_results")
         return []
 
-    search_terms = query.strip()
-    if location and location.strip():
-        search_terms = f"{search_terms} in {location.strip()}"
-
-    encoded_query = urllib.parse.quote(search_terms)
-    url = f"https://www.google.com/search?q={encoded_query}&ibp=htl;jobs"
-
-    card_selector = (
-        "li.iFjolb, div.PwjeAc, div.gWSBe, div[data-encoded-docid]"
-    )
-    fallback_card_selector = (
-        "div.d5F0ib, div.KLsYvd, div[jsname='bN97Pc'], div.sp-c, div.s8bAkb, div[data-docid]"
-    )
-    detail_selectors = (
-        "div.KLsYvd", "div[jsname='bN97Pc']", "div.Yflw0c", "div#tlBfW",
-        "div[role='main']", "div.HBvxfe",
-    )
-
-    def _read_detail_pane(page) -> str:
-        """Reads the right-hand JD pane text (longest plausible block)."""
-        best = ""
-        for sel in detail_selectors:
-            try:
-                el = page.query_selector(sel)
-                if not el:
-                    continue
-                text = el.inner_text()
-                if isinstance(text, str) and len(text.strip()) > len(best):
-                    best = text.strip()
-            except Exception:
-                continue
-        return best
-
-    def _scroll(page) -> None:
-        """Advances the left job list by one viewport (bounded by the caller's cap)."""
-        try:
-            page.mouse.wheel(0, 2400)
-        except Exception:
-            pass
-        try:
-            page.wait_for_timeout(1200)
-        except Exception:
-            pass
+    url = build_google_jobs_url(query, location)
+    headless_mode, launch_kwargs = _google_jobs_browser_options()
+    _set("url", url)
+    _set("browser_mode", "new_headless" if launch_kwargs else "headful")
 
     jobs: List[Dict[str, Any]] = []
     seen_titles = set()
     dom_changed = False
+    blocked = False
+    jobs_vertical_empty = False
+    not_jobs_mode = False
     try:
         try:
-            context = get_persistent_browser_context(playwright_instance, headless=headless)
+            context = get_persistent_browser_context(
+                playwright_instance, headless=headless_mode, **launch_kwargs
+            )
         except Exception as ctx_err:
             if "BrowserProfileBusy" in type(ctx_err).__name__:
-                _set_outcome("browser_busy")
+                _set("outcome", "browser_busy")
             raise
         page = context.new_page()
         if pacer is not None:
@@ -1987,19 +2159,40 @@ def fetch_google_jobs_playwright(
         except Exception:
             pass
 
+        card_selector = _GOOGLE_JOBS_CARD_SELECTORS[0]
         try:
             page.wait_for_selector(card_selector, timeout=8000)
         except Exception:
-            dom_changed = True
-            logger.warning(
-                "Google Jobs main-list selector timed out (DOM may have changed); "
-                "continuing with whatever is rendered."
-            )
+            if _is_blocked_page(page):
+                blocked = True
+                logger.warning(
+                    "Google Jobs fetch blocked (consent wall or 'unusual traffic' interstitial)."
+                )
+            elif _jobs_vertical_empty(page):
+                jobs_vertical_empty = True
+            elif _jobs_mode_dropped(page):
+                not_jobs_mode = True
+                logger.warning(
+                    "Google Jobs redirect dropped udm=8; landed on a plain web SERP."
+                )
+            else:
+                dom_changed = True
+                logger.warning(
+                    "Google Jobs main-list selector timed out (DOM may have changed); "
+                    "continuing with whatever is rendered."
+                )
+
+        _set("body_signature", _google_jobs_body_text(page)[:120].replace("\n", " "))
 
         for scroll_idx in range(_GOOGLE_JOBS_MAX_SCROLLS):
-            cards = page.query_selector_all(card_selector) or page.query_selector_all(
-                fallback_card_selector
-            )
+            cards = []
+            for selector in _GOOGLE_JOBS_CARD_SELECTORS:
+                try:
+                    cards = page.query_selector_all(selector)
+                except Exception:
+                    cards = []
+                if cards:
+                    break
             if not cards:
                 break
             before = len(seen_titles)
@@ -2007,24 +2200,17 @@ def fetch_google_jobs_playwright(
                 if len(jobs) >= max_results:
                     break
                 try:
-                    title_el = card.query_selector("div.BjJfJf, div.PUpOsf, div[role='heading'], h2, a.title") or card.query_selector("h3, .t-bold")
-                    title = title_el.inner_text().strip() if title_el else ""
+                    title = _first_text(card, _GOOGLE_JOBS_TITLE_SELECTORS)
                     if not title or len(title) < 3:
                         continue
                     if title.lower() in seen_titles:
                         continue
                     seen_titles.add(title.lower())
 
-                    company_el = card.query_selector("div.vNEEBe, div.wvy6fc, span.company, div.company") or card.query_selector(".s8bAkb, .MK9DJe")
-                    company = company_el.inner_text().strip() if company_el else "Target Employer"
-
-                    loc_el = card.query_selector("div.Qk80nd, div.oc1tfd, span.location") or card.query_selector(".Qk80nd")
-                    location_str = loc_el.inner_text().strip() if loc_el else "Remote / Various"
-
-                    link_el = card.query_selector("a[href]")
-                    apply_url = link_el.get_attribute("href") if link_el else url
-                    if apply_url and not apply_url.startswith("http"):
-                        apply_url = f"https://www.google.com{apply_url}"
+                    company = _first_text(card, _GOOGLE_JOBS_COMPANY_SELECTORS) or "Target Employer"
+                    # The location line reads "Anywhere • via Pinterest Careers"; keep the place.
+                    location_str = _first_text(card, _GOOGLE_JOBS_LOCATION_SELECTORS)
+                    location_str = location_str.split("\u2022")[0].strip() or "Remote / Various"
 
                     # Detail extraction: open the card, read the JD pane into `description`.
                     try:
@@ -2033,11 +2219,20 @@ def fetch_google_jobs_playwright(
                     except Exception:
                         pass
                     description = _read_detail_pane(page)
+                    apply_url = _read_apply_url(page)
+                    if not apply_url:
+                        # Some layouts keep a direct link on the card instead of the pane.
+                        try:
+                            link_el = card.query_selector("a[href]")
+                            apply_url = _absolute_job_url(
+                                link_el.get_attribute("href") if link_el else ""
+                            )
+                        except Exception:
+                            apply_url = ""
+                    apply_url = apply_url or url
 
                     if not description:
-                        snippet_el = card.query_selector("div.HBvxfe, span.WbZuDe, div.Yflw0c") or card.query_selector("div.Vb0Rqe")
-                        snippet = snippet_el.inner_text().strip() if snippet_el else ""
-                        description = snippet or f"Google for Jobs opening: {title} at {company}"
+                        description = f"Google for Jobs opening: {title} at {company}"
 
                     jobs.append({
                         "title": title,
@@ -2066,7 +2261,7 @@ def fetch_google_jobs_playwright(
                         pass
 
         # Organic-results fallback if the jobs widget rendered nothing.
-        if not jobs:
+        if not jobs and not blocked and not not_jobs_mode:
             organic_cards = page.query_selector_all("div.g, div.MjjYud, div[data-hveid]")
             for org in organic_cards[:max_results]:
                 try:
@@ -2075,10 +2270,14 @@ def fetch_google_jobs_playwright(
                     snippet_el = org.query_selector("div[data-sncf], div.VwiC3b")
 
                     title_text = title_el.inner_text().strip() if title_el else ""
-                    href = link_el.get_attribute("href") if link_el else ""
+                    # Google wraps every result as a relative /url?q= redirect, so the href must
+                    # be unwrapped before it can be judged external (and before ingestion).
+                    href = _absolute_job_url(
+                        link_el.get_attribute("href") if link_el else ""
+                    )
                     snip = snippet_el.inner_text().strip() if snippet_el else ""
 
-                    if title_text and href and "google.com" not in href:
+                    if title_text and href:
                         comp = "Direct Employer"
                         if " - " in title_text:
                             comp = title_text.split(" - ")[-1].strip()
@@ -2114,12 +2313,17 @@ def fetch_google_jobs_playwright(
             deduped.append(j)
 
     if deduped:
-        _set_outcome("fetched")
-    elif dom_changed:
-        _set_outcome("dom_changed")
+        _set("outcome", "fetched")
+    elif blocked:
+        _set("outcome", "blocked")
+    elif not_jobs_mode:
+        _set("outcome", "not_jobs_mode")
+    elif jobs_vertical_empty or not dom_changed:
+        _set("outcome", "zero_results")
     else:
-        _set_outcome("zero_results")
+        _set("outcome", "dom_changed")
     return deduped[:max_results]
+
 
 
 def fetch_google_jobs_followed_queries_playwright(

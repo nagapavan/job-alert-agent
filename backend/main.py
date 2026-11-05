@@ -6057,7 +6057,7 @@ def scrape_google_jobs_endpoint(
     req: Optional[GoogleJobsScrapeRequest] = None, db: Session = Depends(get_db)
 ):
     """
-    Scrapes Google for Jobs (ibp=htl;jobs) and SERP Schema.org JobPosting listings
+    Scrapes Google for Jobs (`udm=8`) and SERP Schema.org JobPosting listings
     across multiple configured followed queries.
     Performs cross-source deduplication, ATS portal learning, zero-token filtering,
     match alignment scoring, and automated 384-d vector embeddings indexing.
@@ -7562,6 +7562,12 @@ def _execute_external_sync(
 # -------------------------------------------------------------
 
 
+# Preference-derived Google Jobs queries fan out one-per-location; both caps keep a scheduled
+# run bounded (requests are paced and Google rate-limits aggressively).
+_GOOGLE_JOBS_MAX_LOCATIONS = 3
+_GOOGLE_JOBS_MAX_PREF_QUERIES = 6
+
+
 def _run_google_jobs_task_runner(
     queries: Optional[List[str]] = None,
     location: str = "India",
@@ -7577,6 +7583,7 @@ def _run_google_jobs_task_runner(
     # How many queries actually returned raw postings. Zero across all queries means the
     # fetcher produced nothing, which is NOT the same as "no new roles to add".
     queries_with_results = 0
+    blocked_count = 0
     # Per-query outcome: fetched | browser_busy | dom_changed | robots_blocked | zero_results.
     per_query_outcomes: List[Dict[str, Any]] = []
     # Route Google Jobs browser navigation through the shared HostPacer (delay + jitter + ceiling).
@@ -7591,21 +7598,28 @@ def _run_google_jobs_task_runner(
             titles = [
                 t.strip() for t in (pref.target_titles or "").split(",") if t.strip()
             ]
+            # One query per title x location. Concatenating every city into a single phrase
+            # ("jobs in A, B, C, ..., Z") is not a searchable query, so Google answers nothing.
             locs = [
-                c.strip()
-                for c in f"{pref.target_country or ''},{pref.target_cities or ''}".split(
-                    ","
-                )
-                if c.strip()
+                c.strip() for c in (pref.target_cities or "").split(",") if c.strip()
             ]
-            loc_phrase = f" in {', '.join(dict.fromkeys(locs))}" if locs else ""
+            if not locs and (pref.target_country or "").strip():
+                locs = [pref.target_country.strip()]
+            locs = list(dict.fromkeys(locs))[:_GOOGLE_JOBS_MAX_LOCATIONS]
             remote_suffix = (
                 " remote" if (pref.work_mode or "").lower() == "remote" else ""
             )
-            pref_queries = [
-                normalize_google_query(f"{t} jobs{loc_phrase}{remote_suffix}")
-                for t in titles
-            ]
+            pref_queries: List[str] = []
+            for title in titles:
+                for loc in locs or [""]:
+                    phrase = f" in {loc}" if loc else ""
+                    pref_queries.append(
+                        normalize_google_query(f"{title} jobs{phrase}{remote_suffix}")
+                    )
+                    if len(pref_queries) >= _GOOGLE_JOBS_MAX_PREF_QUERIES:
+                        break
+                if len(pref_queries) >= _GOOGLE_JOBS_MAX_PREF_QUERIES:
+                    break
             queries = _normalize_google_queries(pref_queries) or load_google_searches()
 
         if not queries:
@@ -7664,10 +7678,29 @@ def _run_google_jobs_task_runner(
                     q_outcome = q_outcome_info.get("outcome") or (
                         "fetched" if raw_jobs else "zero_results"
                     )
+                    if q_outcome in ("blocked", "not_jobs_mode"):
+                        blocked_count += 1
                     per_query_outcomes.append(
-                        {"query": q_str[:80], "outcome": q_outcome, "count": len(raw_jobs)}
+                        {
+                            "query": q_str[:80],
+                            "outcome": q_outcome,
+                            "count": len(raw_jobs),
+                            "url": q_outcome_info.get("url"),
+                            "browser_mode": q_outcome_info.get("browser_mode"),
+                            "body_signature": q_outcome_info.get("body_signature"),
+                        }
                     )
-                    if q_outcome == "dom_changed":
+                    if q_outcome == "blocked":
+                        logger.warning(
+                            f"[Google Jobs] Blocked by Google for '{q_str}' "
+                            "(consent wall or unusual-traffic interstitial)."
+                        )
+                    elif q_outcome == "not_jobs_mode":
+                        logger.warning(
+                            f"[Google Jobs] Redirect dropped the jobs mode for '{q_str}'; "
+                            "landed on a plain web SERP."
+                        )
+                    elif q_outcome == "dom_changed":
                         logger.warning(
                             f"[Google Jobs] DOM selector miss for '{q_str}' (dom_changed); "
                             "Google may have changed the jobs panel markup."
@@ -7758,6 +7791,12 @@ def _run_google_jobs_task_runner(
             channel_status.record(
                 gjo_outcomes, "google_jobs", channel_status.ERROR,
                 f"all {total_steps} queries raised",
+            )
+        elif blocked_count:
+            channel_status.record(
+                gjo_outcomes, "google_jobs", channel_status.ERROR,
+                f"{blocked_count}/{total_steps} queries blocked by Google "
+                "(consent wall or unusual-traffic interstitial)",
             )
         elif queries_with_results == 0:
             channel_status.record(

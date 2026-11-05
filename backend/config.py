@@ -506,6 +506,13 @@ CHROME_PROFILE_DIR = Path(os.environ.get(
     str(Path.home() / ".job-alert-agent" / "chrome_profile")
 ))
 
+# Browser mode for the Google for Jobs fetcher.
+# - "headful": a real browser window. Google serves an empty Jobs vertical ("no 'Jobs'
+#   matches") to chrome-headless-shell, so headless collection returns 0 postings.
+# - "new_headless": full Chromium in new headless mode (channel="chromium"). Invisible, but
+#   not verified against Google's bot checks on every release.
+GOOGLE_JOBS_BROWSER_MODE = os.environ.get("GOOGLE_JOBS_BROWSER_MODE", "headful").strip().lower()
+
 
 def _migrate_legacy_chrome_profile():
     """
