@@ -70,7 +70,8 @@ JD_HEADINGS: Dict[str, Tuple[str, ...]] = {
         "about us", "about the company", "about the team", "about our company",
         "who we are", "company overview", "our story", "our mission", "our vision",
         "why join us", "life at", "welcome to", "about the job", "about this role",
-        "about the position",
+        "about the position", "position overview", "job overview", "role overview",
+        "position summary",
     ),
     # Company perks / offer prose. These headings introduce no candidate requirements,
     # so they are masked before the JD skill scan (see match_classifier). Without this,
@@ -203,6 +204,11 @@ def normalize_heading(line: str) -> str:
     for the same reason (``💻 WHAT YOU'LL BE DOING``).
     """
     text = (line or "").translate(_QUOTE_FOLD).strip()
+    # Markdown heading markers: ATS feeds (JSON-LD descriptions in particular) ship headings as
+    # "## Minimum Qualifications" / "### Nice to Have". Left in place, the exact-match gate in
+    # `_looks_like_heading` fails, every section collapses into the leading "required" span, and
+    # nice-to-have items are scored as must-haves.
+    text = re.sub(r"^#{1,6}\s*", "", text)
     text = text.lstrip("".join(BULLET_CHARS)).strip()
     text = _strip_leading_symbols(text).strip()
     text = _TRAILING_PUNCT_RE.sub("", text)
