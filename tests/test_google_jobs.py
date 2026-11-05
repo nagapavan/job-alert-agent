@@ -216,11 +216,10 @@ def test_fetch_google_jobs_playwright():
     )
 
     mock_card.query_selector.side_effect = lambda sel: {
-        "div.BjJfJf, div.PUpOsf, div[role='heading'], h2, a.title": mock_title,
-        "div.vNEEBe, div.wvy6fc, span.company, div.company": mock_comp,
-        "div.Qk80nd, div.oc1tfd, span.location": mock_loc,
+        "div.tNxQIb": mock_title,
+        "div.a3jPc": mock_comp,
+        "div.FqK3wc": mock_loc,
         "a[href]": mock_link,
-        "div.HBvxfe, span.WbZuDe, div.Yflw0c": mock_snippet,
     }.get(sel, None)
 
     mock_page.query_selector_all.return_value = [mock_card]
@@ -256,9 +255,9 @@ def test_fetch_google_jobs_playwright_reads_detail_pane():
     mock_link = MagicMock()
     mock_link.get_attribute.return_value = "https://acme.example/jobs/1"
     mock_card.query_selector.side_effect = lambda sel: {
-        "div.BjJfJf, div.PUpOsf, div[role='heading'], h2, a.title": mock_title,
-        "div.vNEEBe, div.wvy6fc, span.company, div.company": mock_comp,
-        "div.Qk80nd, div.oc1tfd, span.location": mock_loc,
+        "div.tNxQIb": mock_title,
+        "div.a3jPc": mock_comp,
+        "div.FqK3wc": mock_loc,
         "a[href]": mock_link,
     }.get(sel, None)
 
@@ -269,7 +268,7 @@ def test_fetch_google_jobs_playwright_reads_detail_pane():
         "Full JD body: responsibilities, requirements, and qualifications. " * 3
     )
     mock_page.query_selector.side_effect = lambda sel: (
-        detail if sel in ("div.KLsYvd", "div[jsname='bN97Pc']") else None
+        detail if sel in ("div.XFOJCe", "div[jsname='bN97Pc']") else None
     )
 
     with patch(
@@ -308,9 +307,9 @@ def test_fetch_google_jobs_playwright_pagination_is_bounded(monkeypatch):
         link = MagicMock()
         link.get_attribute.return_value = "https://acme.example/jobs/1"
         card.query_selector.side_effect = lambda sel: {
-            "div.BjJfJf, div.PUpOsf, div[role='heading'], h2, a.title": t,
-            "div.vNEEBe, div.wvy6fc, span.company, div.company": c,
-            "div.Qk80nd, div.oc1tfd, span.location": l,
+            "div.tNxQIb": t,
+            "div.a3jPc": c,
+            "div.FqK3wc": l,
             "a[href]": link,
         }.get(sel, None)
         return card
@@ -332,6 +331,178 @@ def test_fetch_google_jobs_playwright_pagination_is_bounded(monkeypatch):
     # With the cap at 2 scrolls, at most 2 pages of cards are read.
     assert len(jobs) <= 2
     assert mock_page.mouse.wheel.call_count <= 2
+
+
+def test_build_google_jobs_url_uses_udm_and_avoids_double_location():
+    """The legacy ibp=htl;jobs is dropped by a redirect; udm=8 is what Google honours."""
+    from backend.playwright_app import build_google_jobs_url
+
+    url = build_google_jobs_url("Principal Engineer jobs in Bangalore", "India")
+    assert "udm=8" in url
+    assert "ibp=htl" not in url
+    # The query already names its location, so it must not be appended a second time.
+    assert "in%20India" not in url
+    assert "jobs%20in%20Bangalore" in url
+
+    url2 = build_google_jobs_url("Staff Engineer", "India")
+    assert "Staff%20Engineer%20in%20India" in url2
+
+
+def test_fetch_google_jobs_playwright_reports_blocked():
+    """A consent wall / unusual-traffic interstitial is `blocked`, not `dom_changed`."""
+    mock_p = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_context.new_page.return_value = mock_page
+    mock_page.url = "https://www.google.com/sorry/index?continue=https%3A%2F%2Fwww.google.com"
+    mock_page.inner_text.return_value = "Our systems have detected unusual traffic from your computer network."
+    mock_page.query_selector.return_value = None
+    mock_page.query_selector_all.return_value = []
+    mock_page.wait_for_selector.side_effect = Exception("timeout")
+
+    outcome = {}
+    with patch(
+        "backend.playwright_app.get_persistent_browser_context",
+        return_value=mock_context,
+    ):
+        jobs = fetch_google_jobs_playwright(mock_p, "Engineer", outcome=outcome)
+
+    assert jobs == []
+    assert outcome["outcome"] == "blocked"
+    assert outcome["browser_mode"] == "headful"
+
+
+def test_fetch_google_jobs_playwright_reports_zero_results_for_empty_jobs_vertical():
+    """Google's explicit "no Jobs matches" sentence is a genuine zero, not markup drift."""
+    mock_p = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_context.new_page.return_value = mock_page
+    mock_page.url = "https://www.google.com/search?q=engineer&udm=8"
+    mock_page.inner_text.return_value = (
+        "It looks like there aren\u2019t any \u2018Jobs\u2019 matches on this topic"
+    )
+    mock_page.query_selector.return_value = None
+    mock_page.query_selector_all.return_value = []
+    mock_page.wait_for_selector.side_effect = Exception("timeout")
+
+    outcome = {}
+    with patch(
+        "backend.playwright_app.get_persistent_browser_context",
+        return_value=mock_context,
+    ):
+        jobs = fetch_google_jobs_playwright(mock_p, "Engineer", outcome=outcome)
+
+    assert jobs == []
+    assert outcome["outcome"] == "zero_results"
+
+
+def test_fetch_google_jobs_playwright_reports_not_jobs_mode():
+    """A redirect that strips udm=8 lands on a web SERP and is reported as such."""
+    mock_p = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_context.new_page.return_value = mock_page
+    mock_page.url = "https://www.google.com/search?q=engineer"
+    mock_page.inner_text.return_value = "Some web results"
+    mock_page.query_selector.return_value = None
+    mock_page.query_selector_all.return_value = []
+    mock_page.wait_for_selector.side_effect = Exception("timeout")
+
+    outcome = {}
+    with patch(
+        "backend.playwright_app.get_persistent_browser_context",
+        return_value=mock_context,
+    ):
+        jobs = fetch_google_jobs_playwright(mock_p, "Engineer", outcome=outcome)
+
+    assert jobs == []
+    assert outcome["outcome"] == "not_jobs_mode"
+
+
+def test_organic_fallback_unwraps_google_redirect_and_skips_google_hosts():
+    """Organic results are relative /url?q= redirects; only external targets are ingested."""
+    mock_p = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_context.new_page.return_value = mock_page
+    mock_page.url = "https://www.google.com/search?q=engineer&udm=8"
+    mock_page.inner_text.return_value = "web results"
+
+    def make_org(title, href):
+        org = MagicMock()
+        title_el = MagicMock()
+        title_el.inner_text.return_value = title
+        link_el = MagicMock()
+        link_el.get_attribute.return_value = href
+        org.query_selector.side_effect = lambda sel: {
+            "h3, a h3": title_el,
+            "a[href]": link_el,
+            "div[data-sncf], div.VwiC3b": None,
+        }.get(sel, None)
+        return org
+
+    external = make_org(
+        "Staff Platform Engineer - Cloudflare",
+        "/url?q=https%3A%2F%2Fcareers.cloudflare.com%2Fjobs%2F1&sa=U",
+    )
+    internal = make_org("Google Careers", "/search?q=engineer")
+
+    def qsa(sel):
+        if sel == "div.g, div.MjjYud, div[data-hveid]":
+            return [external, internal]
+        return []
+
+    mock_page.query_selector_all.side_effect = qsa
+    mock_page.query_selector.return_value = None
+
+    outcome = {}
+    with patch(
+        "backend.playwright_app.get_persistent_browser_context",
+        return_value=mock_context,
+    ):
+        jobs = fetch_google_jobs_playwright(mock_p, "Engineer", outcome=outcome)
+
+    assert len(jobs) == 1
+    assert jobs[0]["url"] == "https://careers.cloudflare.com/jobs/1"
+    assert jobs[0]["company"] == "Cloudflare"
+    assert outcome["outcome"] == "fetched"
+
+
+def test_read_apply_url_prefers_external_apply_link():
+    """The detail pane's "Apply on <source>" anchor supplies the canonical job URL."""
+    from backend.playwright_app import _read_apply_url
+
+    apply_el = MagicMock()
+    apply_el.inner_text.return_value = "Apply on Pinterest Careers"
+    apply_el.get_attribute.return_value = (
+        "/url?q=https%3A%2F%2Fcareers.pinterest.com%2Fjob%2F123&sa=U"
+    )
+    google_el = MagicMock()
+    google_el.inner_text.return_value = "Apply"
+    google_el.get_attribute.return_value = "https://www.google.com/preferences"
+
+    page = MagicMock()
+    page.query_selector_all.return_value = [google_el, apply_el]
+
+    assert _read_apply_url(page) == "https://careers.pinterest.com/job/123"
+
+
+def test_read_apply_url_keeps_opaque_goto_token():
+    """Current markup exposes /goto?url=<token>; it is the per-posting identifier."""
+    from backend.playwright_app import _read_apply_url
+
+    apply_el = MagicMock()
+    apply_el.inner_text.return_value = "Apply on Indeed"
+    apply_el.get_attribute.return_value = "/goto?url=CAES0gEBxCJF179x_YyRKw9GDeOS"
+
+    page = MagicMock()
+    page.query_selector_all.return_value = [apply_el]
+
+    assert (
+        _read_apply_url(page)
+        == "https://www.google.com/goto?url=CAES0gEBxCJF179x_YyRKw9GDeOS"
+    )
 
 
 def test_fetch_google_jobs_followed_queries_playwright():
@@ -665,10 +836,77 @@ def test_google_jobs_runner_reports_browser_busy(mock_get_db, mock_fetch_pw, db_
     assert details["per_query_outcomes"][0]["outcome"] == "browser_busy"
 
 
+@patch("backend.main.fetch_google_jobs_playwright")
+@patch("backend.main.get_db")
+def test_google_jobs_runner_reports_blocked_as_failed(
+    mock_get_db, mock_fetch_pw, db_session
+):
+    """A Google consent/traffic block fails the run instead of looking like an empty scan."""
+    from backend.database import OperationLog
+    from backend.main import _run_google_jobs_task_runner
+
+    mock_get_db.return_value = iter([db_session])
+
+    def blocked(*args, **kwargs):
+        outcome = kwargs.get("outcome")
+        if outcome is not None:
+            outcome["outcome"] = "blocked"
+            outcome["url"] = "https://www.google.com/search?q=engineer&udm=8"
+            outcome["browser_mode"] = "headful"
+            outcome["body_signature"] = "Our systems have detected unusual traffic"
+        return []
+
+    mock_fetch_pw.side_effect = blocked
+
+    result = _run_google_jobs_task_runner(
+        queries=["Backend Engineer jobs"], location="India"
+    )
+    assert result["jobs_found"] == 0
+
+    log = (
+        db_session.query(OperationLog)
+        .filter(OperationLog.operation_type == "google_jobs_background_scan")
+        .order_by(OperationLog.id.desc())
+        .first()
+    )
+    assert log.status == "Failed"
+    details = json.loads(log.details_json)
+    assert details["per_query_outcomes"][0]["outcome"] == "blocked"
+    assert details["per_query_outcomes"][0]["browser_mode"] == "headful"
+    assert "blocked by Google" in log.summary
+
+
+@patch("backend.main.fetch_google_jobs_playwright")
+@patch("backend.main.get_db")
+def test_google_jobs_runner_fans_out_one_query_per_location(
+    mock_get_db, mock_fetch_pw, db_session
+):
+    """Cities become separate queries instead of one unsearchable comma list."""
+    from backend.database import get_user_preferences
+    from backend.main import _GOOGLE_JOBS_MAX_PREF_QUERIES, _run_google_jobs_task_runner
+
+    pref = get_user_preferences(db_session)
+    pref.target_titles = "Backend Engineer, Platform Engineer"
+    pref.target_cities = "Bengaluru, Hyderabad, Pune, Chennai, Noida"
+    pref.target_country = "India"
+    pref.work_mode = "all"
+    db_session.commit()
+
+    mock_get_db.return_value = iter([db_session])
+    mock_fetch_pw.return_value = []
+
+    _run_google_jobs_task_runner(location="India")
+
+    called_queries = [c.kwargs["query"] for c in mock_fetch_pw.call_args_list]
+    assert 0 < len(called_queries) <= _GOOGLE_JOBS_MAX_PREF_QUERIES
+    assert all("," not in q for q in called_queries)
+    assert any("Bengaluru" in q for q in called_queries)
+    assert any("Hyderabad" in q for q in called_queries)
+
+
 # -------------------------------------------------------------
 # Integration Tests: Gmail Alerts Sync Endpoint (Deprecated)
 # -------------------------------------------------------------
-
 
 def test_extract_company_and_role_from_email_header(monkeypatch):
     from backend.scraper import extract_company_and_role_from_email_header
