@@ -9214,7 +9214,6 @@ def _deterministic_match(
             if r.status in ("met", "partial", "missing")
         ]
         met_count = sum(1 for r in known_reqs if r.status == "met")
-        partial_count = sum(1 for r in known_reqs if r.status == "partial")
         unverified = [
             r.text
             for r in assessment.requirements
@@ -9231,8 +9230,9 @@ def _deterministic_match(
             f"Matched {met_count} of {len(known_reqs)} requirements "
             f"({', '.join(coverage_bits)})."
         )
-        if partial_count > 0:
-            feedback += f" {partial_count} requirement{'s' if partial_count != 1 else ''} met partially — see Partial Coverage below."
+        # No partial-coverage sentence here: the count would have to match the panel's
+        # `partials` list (must-have only, capped, minus entries padded into strengths), and
+        # any "see below" wording is wrong in at least one of the two renderers.
         # Surface technology-tenure comparisons so the user can judge borderline cases.
         tenure_notes = []
         for r in assessment.requirements:
