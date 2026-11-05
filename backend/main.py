@@ -1675,19 +1675,25 @@ def update_embedding_settings_endpoint(payload: EmbeddingSettingsIn):
 @app.post("/api/settings/embeddings/download", response_model=EmbeddingSettingsOut)
 def download_embedding_model():
     """
-    Downloads/warms the local ONNX model by running a single embedding. Enables
-    downloads for the call so the model is fetched, then reports cache status.
+    Downloads/warms the local ONNX model by embedding a probe text. Enables downloads for
+    the call so the model is fetched, then reports cache status.
     """
     from backend import embeddings
     from backend.config import get_embedding_settings
 
     settings = dict(get_embedding_settings())
-    settings["allow_download"] = True
-    settings["backend"] = "standalone"
     try:
-        embeddings.embed_text("warmup", settings=settings)
-    except Exception as e:
-        logger.warning(f"Embedding model warmup failed: {e}")
+        backend = embeddings.OnnxEmbeddingBackend(
+            model_id=settings["model"],
+            cache_dir=embeddings.get_embedding_settings_cache_dir(),
+            allow_download=True,
+        )
+        backend.embed(["warmup"])
+    except Exception as e:  # noqa: BLE001 - surfaced to the caller as a failed download
+        logger.warning(f"Embedding model download failed: {e}")
+        raise HTTPException(
+            status_code=502, detail=f"Embedding model download failed: {e}"
+        ) from e
     return _embedding_settings_out()
 
 

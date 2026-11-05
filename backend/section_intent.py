@@ -294,16 +294,19 @@ def _embedding_label(line: str, domain: str) -> str:
     try:
         from backend import embeddings
 
-        # A non-semantic backend (hash) would produce meaningless similarity.
-        if embeddings.active_backend_name() == "hash":
-            return "unknown"
-
         labels: List[str] = []
         vectors: List[List[float]] = []
         for label, samples in exemplars.items():
             for sample in samples:
                 labels.append(label)
                 vectors.append(embeddings.embed_text(sample))
+
+        # A non-semantic backend (hash) would produce meaningless similarity. Decided from
+        # the vector actually produced, because configuration alone cannot tell whether a
+        # configured backend served the request.
+        stamp = embeddings.last_embed_stamp()
+        if not stamp or stamp[0] == "hash":
+            return "unknown"
 
         query = embeddings.embed_text(text)
         scored = sorted(

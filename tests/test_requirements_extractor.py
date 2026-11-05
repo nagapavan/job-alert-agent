@@ -154,3 +154,48 @@ class TestMarkupStripping:
         if (tmp_path / "candidates.json").exists():
             keys = json.loads((tmp_path / "candidates.json").read_text())["counts"]
             assert not any("<" in k or ">" in k or "font-size" in k for k in keys)
+
+
+class TestEmbeddingEvidenceTier:
+    """The embedding tier must not credit similarity computed by the hash fallback (#100)."""
+
+    def test_hash_backend_never_credits_semantic_overlap(self, monkeypatch):
+        from backend import embeddings
+        from backend.embeddings import HashEmbeddingBackend
+
+        monkeypatch.setattr(
+            embeddings, "resolve_backends", lambda settings=None: [HashEmbeddingBackend()]
+        )
+
+        supported, score, how = rx.resume_supports(
+            "event driven architecture",
+            "Managed payroll reconciliation for a regional retailer.",
+        )
+
+        assert supported is False
+        assert score == 0.0
+        assert how == "none"
+
+    def test_semantic_backend_still_reaches_the_embedding_tier(self, monkeypatch):
+        from backend import embeddings
+
+        class _FakeSemantic:
+            name = "standalone"
+            model_id = "fake-model"
+            dim = 384
+
+            def available(self):
+                return True
+
+            def embed(self, texts):
+                return [[1.0] + [0.0] * 383 for _ in texts]
+
+        monkeypatch.setattr(embeddings, "resolve_backends", lambda settings=None: [_FakeSemantic()])
+
+        supported, score, how = rx.resume_supports(
+            "event driven architecture",
+            "Managed payroll reconciliation for a regional retailer.",
+        )
+
+        assert supported is True
+        assert how == "embedding"
