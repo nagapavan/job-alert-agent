@@ -8655,6 +8655,53 @@ def rescore_job(job_id: int, db: Session = Depends(get_db)):
     return _job_out(db, job)
 
 
+RESCORE_COMMIT_BATCH = 25
+
+
+def _commit_rescore_batch(db: Session, batch: List[tuple]) -> tuple:
+    """Commit one batch of re-scored jobs, tolerating rows deleted mid-run (issue #74).
+
+    ``batch`` is a list of ``(job_id, method)`` for jobs mutated in this session but not yet
+    committed. A job deleted by another writer (job pruning, the LinkedIn sync's auto-prune) would
+    make its ``UPDATE ... WHERE id=?`` match zero rows and raise ``StaleDataError``, rolling back
+    the whole run. Those rows are detected *before* the flush and expunged instead.
+
+    Returns ``(committed, deterministic, llm_fallback, deleted, failed)``.
+    """
+    pending_ids = [job_id for job_id, _method in batch]
+    # no_autoflush: the existence check must not flush the pending UPDATEs first, or the stale row
+    # raises exactly the error this helper exists to avoid.
+    with db.no_autoflush:
+        existing = {
+            row[0]
+            for row in db.query(Job.id).filter(Job.id.in_(pending_ids)).all()
+        }
+
+    deleted = 0
+    for job_id, _method in batch:
+        if job_id in existing:
+            continue
+        deleted += 1
+        obj = db.identity_map.get((Job, job_id))
+        if obj is not None:
+            db.expunge(obj)
+
+    try:
+        db.commit()
+    except Exception as commit_err:
+        # Bounded loss: roll back this batch only; the caller keeps going with the next one.
+        db.rollback()
+        logger.warning(
+            f"match_rescore: batch commit failed for {len(batch)} job(s), continuing: {commit_err}"
+        )
+        return 0, 0, 0, deleted, len(batch) - deleted
+
+    committed = len(batch) - deleted
+    deterministic = sum(1 for job_id, method in batch if job_id in existing and method == "classifier_v1")
+    llm_fallback = committed - deterministic
+    return committed, deterministic, llm_fallback, deleted, 0
+
+
 def _run_match_rescore_task_runner(
     cancel_token: Optional[CancellationToken] = None,
     progress_cb: Optional[Callable] = None,
@@ -8664,7 +8711,10 @@ def _run_match_rescore_task_runner(
 ) -> Dict[str, Any]:
     """Background re-score of existing jobs (deterministic engine first, bounded LLM fallback)."""
     db = next(get_db())
-    rescored = failed = 0
+    # Batched commits (issue #74): expire-on-commit would re-query every loaded row after each
+    # batch, and a row deleted by another writer would then raise on attribute access.
+    db.expire_on_commit = False
+    rescored = failed = deleted_skipped = 0
     deterministic = llm_fallback = 0
     started = datetime.datetime.now(datetime.timezone.utc)
     try:
@@ -8711,46 +8761,65 @@ def _run_match_rescore_task_runner(
             )
         jobs = query.order_by(Job.created_at.desc()).limit(limit).all()
 
+        batch: List[tuple] = []
+
+        def _flush_batch() -> None:
+            nonlocal rescored, failed, deleted_skipped, deterministic, llm_fallback
+            if not batch:
+                return
+            committed, det, llm, deleted, batch_failed = _commit_rescore_batch(db, batch)
+            rescored += committed
+            deterministic += det
+            llm_fallback += llm
+            deleted_skipped += deleted
+            failed += batch_failed
+            batch.clear()
+
         for idx, job in enumerate(jobs):
             if cancel_token:
                 cancel_token.check()
             description = (job.description or job.title or "").strip()
             try:
-                result = _score_job_with_engine(
-                    db,
-                    resume_text,
-                    description,
-                    parsed_resume=parsed_resume,
-                    job_title=job.title or "",
-                )
+                # no_autoflush: the engine issues read queries; autoflushing here would flush the
+                # pending score updates mid-batch and resurrect the StaleDataError this fixes.
+                with db.no_autoflush:
+                    result = _score_job_with_engine(
+                        db,
+                        resume_text,
+                        description,
+                        parsed_resume=parsed_resume,
+                        job_title=job.title or "",
+                    )
                 if not result.scored:
                     failed += 1
                 else:
                     _apply_scoring_result(job, result, provenance)
-                    rescored += 1
-                    if result.method == "classifier_v1":
-                        deterministic += 1
-                    else:
-                        llm_fallback += 1
+                    batch.append((job.id, result.method))
             except Exception as job_err:
                 failed += 1
                 logger.debug(f"Re-score skipped for job {job.id}: {job_err}")
 
+            if len(batch) >= RESCORE_COMMIT_BATCH:
+                _flush_batch()
+
             if progress_cb:
                 progress_cb(
                     step=idx + 1,
-                    label=f"Re-scored {rescored} job(s), {failed} skipped.",
+                    label=(
+                        f"Re-scored {rescored} job(s), {failed} skipped, "
+                        f"{deleted_skipped} removed."
+                    ),
                     items_found=rescored,
                     total_steps=len(jobs),
                 )
             if idx < len(jobs) - 1:
                 time.sleep(0.3)
 
-        db.commit()
+        _flush_batch()
 
         logger.info(
             f"match_rescore: deterministic={deterministic} llm_fallback={llm_fallback} "
-            f"unscored={failed} total={len(jobs)}"
+            f"unscored={failed} deleted={deleted_skipped} total={len(jobs)}"
         )
 
         try:
@@ -8760,7 +8829,8 @@ def _run_match_rescore_task_runner(
                     status="Completed" if not failed else "Partial",
                     summary=(
                         f"Re-scored {rescored} job(s): {deterministic} deterministic, "
-                        f"{llm_fallback} LLM fallback; {failed} skipped."
+                        f"{llm_fallback} LLM fallback; {failed} skipped, "
+                        f"{deleted_skipped} removed during the run."
                     ),
                     details_json=sanitize_log_details(
                         {
@@ -8768,6 +8838,8 @@ def _run_match_rescore_task_runner(
                             "deterministic": deterministic,
                             "llm_fallback": llm_fallback,
                             "failed": failed,
+                            "deleted_skipped": deleted_skipped,
+                            "batch_size": RESCORE_COMMIT_BATCH,
                             "limit": limit,
                             "started_at": started.isoformat(),
                         }
@@ -8787,6 +8859,7 @@ def _run_match_rescore_task_runner(
             "jobs_found": rescored,
             "deterministic": deterministic,
             "llm_fallback": llm_fallback,
+            "deleted_skipped": deleted_skipped,
         }
     finally:
         db.close()

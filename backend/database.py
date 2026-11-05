@@ -604,21 +604,60 @@ def is_company_excluded(name: str, domain: str, db) -> bool:
 engine = None
 SessionLocal = None
 
+
+def _sqlite_connect_args(url: str) -> dict:
+    """Connection args for a SQLite URL (issue #74).
+
+    ``timeout`` is the driver-level busy wait; it complements the ``busy_timeout`` pragma set on
+    every connection so a writer waits for a competing writer instead of raising immediately.
+    """
+    if "sqlite" not in url:
+        return {}
+    return {"connect_args": {"check_same_thread": False, "timeout": 30}}
+
+
+def _enable_sqlite_pragmas(target_engine) -> None:
+    """WAL + a long busy timeout on every SQLite connection (issue #74).
+
+    Background tasks share one SQLite file (the task engine runs up to 4 concurrently), and the
+    default ``journal_mode=delete`` with a 5s busy timeout made a long re-score collide with
+    discovery writes. WAL lets readers proceed during a write; the timeout lets a writer wait
+    instead of failing with "database is locked".
+    """
+    if target_engine.dialect.name != "sqlite":
+        return
+    from sqlalchemy import event
+
+    @event.listens_for(target_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.execute("PRAGMA journal_mode=WAL")
+        except Exception as exc:  # pragma: no cover - read-only or in-memory databases
+            logger.debug(f"Could not apply SQLite pragmas: {exc}")
+        finally:
+            cursor.close()
+
+
 def init_db(custom_url: str = None):
     global engine, SessionLocal
     target_url = custom_url or DATABASE_URL
     
     if not custom_url:
         try:
-            test_engine = create_engine(target_url, pool_pre_ping=True)
+            test_engine = create_engine(
+                target_url, pool_pre_ping=True, **_sqlite_connect_args(target_url)
+            )
             with test_engine.connect() as conn:
                 pass
             engine = test_engine
         except Exception:
-            engine = create_engine(SQLITE_URL, connect_args={"check_same_thread": False})
+            engine = create_engine(SQLITE_URL, **_sqlite_connect_args(SQLITE_URL))
     else:
-        connect_args = {"check_same_thread": False} if "sqlite" in target_url else {}
-        engine = create_engine(target_url, connect_args=connect_args)
+        engine = create_engine(target_url, **_sqlite_connect_args(target_url))
+
+    _enable_sqlite_pragmas(engine)
 
     # Try creating vector extension if PostgreSQL
     if engine.dialect.name == "postgresql":
