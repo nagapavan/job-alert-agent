@@ -69,7 +69,34 @@ class JobAgentRuntimeAdapter {
     this.geminiNanoSession = null;
     this.nanoState = "unknown"; // available | downloadable | downloading | unavailable | unsupported | timeout | unknown
     this.nanoReady = Promise.resolve(); // settles once the initial on-device probe finishes
+    this._initInFlight = null; // in-flight init(), awaited by cold-start analysis calls
     this._nanoListeners = [];
+    this._modeListeners = [];
+  }
+
+  // Subscribe to execution-mode changes (user switch or automatic correction on load).
+  onModeChange(callback) {
+    if (typeof callback !== "function") return () => {};
+    this._modeListeners.push(callback);
+    return () => {
+      this._modeListeners = this._modeListeners.filter((cb) => cb !== callback);
+    };
+  }
+
+  _notifyModeChange() {
+    for (const cb of this._modeListeners) {
+      try {
+        cb(this.mode);
+      } catch (e) {
+        console.warn("Mode listener failed:", e);
+      }
+    }
+  }
+
+  // A reachable backend serves every request when on-device AI cannot: selecting standalone mode
+  // must never disable a working API.
+  _backendUsable() {
+    return this.isConnected && (this.mode === "connected" || !this.geminiNanoSession);
   }
 
   // Subscribe to `nanoState` changes (fires as the background probe progresses).
@@ -104,6 +131,11 @@ class JobAgentRuntimeAdapter {
   }
 
   async init() {
+    this._initInFlight = this._runInit();
+    return this._initInFlight;
+  }
+
+  async _runInit() {
     const data = await chrome.storage.local.get(["backendUrl", "apiKey", "mode"]);
     if (data.backendUrl) this.backendUrl = data.backendUrl;
     if (data.apiKey) this.apiKey = data.apiKey;
@@ -116,7 +148,16 @@ class JobAgentRuntimeAdapter {
     // broker, and that must never freeze the status badge (it previously left the panel stuck on
     // "Checking…"). State changes are broadcast via onNanoStateChange; `nanoReady` is kept so
     // callers that need the session can await the bounded probe.
-    this.nanoReady = this.initGeminiNano();
+    this.nanoReady = this.initGeminiNano().then(() => {
+      // A persisted on-device mode is only valid while a session actually exists. Leaving it
+      // selected with no session dead-ends every analysis while a healthy backend sits unused.
+      if (this.mode === "standalone" && !this.geminiNanoSession) {
+        this.mode = "connected";
+        chrome.storage.local.set({ mode: this.mode });
+        this._notifyModeChange();
+      }
+      return this.nanoState;
+    });
     return this.isConnected;
   }
 
@@ -221,6 +262,7 @@ class JobAgentRuntimeAdapter {
   async setMode(mode) {
     this.mode = mode;
     await chrome.storage.local.set({ mode });
+    this._notifyModeChange();
   }
 
   async setApiKey(apiKey) {
@@ -239,7 +281,7 @@ class JobAgentRuntimeAdapter {
   // Profile & Q&A Memory Synchronization
   // -------------------------------------------------------------
   async fetchCandidateProfile() {
-    if (this.mode === "connected" && this.isConnected) {
+    if (this._backendUsable()) {
       try {
         const resp = await fetch(`${this.backendUrl}/api/candidate/profile`, {
           method: "GET",
@@ -282,8 +324,21 @@ class JobAgentRuntimeAdapter {
   // -------------------------------------------------------------
   async analyzeJobMatch(jobTitle, company, jobDescription, resumeText) {
     let backendError = null;
+    // Standalone mode is only meaningful once the on-device probe has settled: on a cold panel
+    // "not probed yet" used to be indistinguishable from "unavailable" and failed without trying.
+    if (!this.geminiNanoSession) {
+      try {
+        if (this._initInFlight) await this._initInFlight;
+        await this.nanoReady;
+      } catch (e) {
+        console.warn("On-device AI probe failed:", e);
+      }
+    }
+    // A reachable backend wins over a missing on-device session: an unavailable Nano must never
+    // dead-end an analysis the API can serve.
+    const useBackend = this._backendUsable();
     // Mode A: Connected FastAPI — structured JSON match analysis (single source of truth)
-    if (this.mode === "connected" && this.isConnected) {
+    if (useBackend) {
       try {
         // Only forward genuine resume text; ignore a JSON candidate-profile blob so the
         // backend uses its authoritative active resume instead.
@@ -350,11 +405,13 @@ class JobAgentRuntimeAdapter {
       }
     }
 
-    // Never fabricate a score. Surface an explicit, retryable failure instead.
-    return this._matchUnavailableResult(
+    // Never fabricate a score. Surface an explicit, retryable failure that names the cause.
+    const reason =
       backendError ||
-        "No AI model was available to evaluate this role. Connect the backend or enable on-device AI, then re-process."
-    );
+      (this.isConnected
+        ? "The backend is connected but could not score this posting, and on-device AI is not available. Re-process, or enable on-device AI in Settings."
+        : "The backend is unreachable and on-device AI is not available. Start the backend or enable on-device AI, then re-process.");
+    return this._matchUnavailableResult(reason);
   }
 
   _matchUnavailableResult(message) {
@@ -459,7 +516,7 @@ class JobAgentRuntimeAdapter {
     const targetCompany = isGenericCompany ? "" : company.trim();
 
     // Mode A: Connected FastAPI backend (grounded anti-slop with LLM-Judge)
-    if (this.mode === "connected" && this.isConnected) {
+    if (this._backendUsable()) {
       try {
         const resp = await fetch(`${this.backendUrl}/api/qa/grounded-pitch`, {
           method: "POST",
@@ -572,7 +629,7 @@ class JobAgentRuntimeAdapter {
     if (!telemetryData || !telemetryData.fields) return;
 
     // Send to backend if connected
-    if (this.mode === "connected" && this.isConnected) {
+    if (this._backendUsable()) {
       try {
         await fetch(`${this.backendUrl}/api/forms/telemetry`, {
           method: "POST",
@@ -605,7 +662,7 @@ class JobAgentRuntimeAdapter {
   // 3. AI Career Copilot Chat
   // -------------------------------------------------------------
   async sendCopilotMessage(message, history = []) {
-    if (this.mode === "connected" && this.isConnected) {
+    if (this._backendUsable()) {
       try {
         const resp = await fetch(`${this.backendUrl}/api/chat/assistant`, {
           method: "POST",

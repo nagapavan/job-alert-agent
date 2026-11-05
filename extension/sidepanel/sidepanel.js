@@ -62,13 +62,30 @@ document.addEventListener("DOMContentLoaded", async () => {
     statusLabel.innerText = rt.nanoState === "available" ? "API offline → Nano" : "API offline";
   }
 
+  // On-device AI states in which no session can be created, so the mode can never produce a result.
+  const NANO_UNAVAILABLE_STATES = ["unsupported", "unavailable", "timeout"];
+
   function updateModeSwitchUi() {
     const mode = window.jobAgentRuntime.mode || "connected";
+    const nanoBlocked = NANO_UNAVAILABLE_STATES.includes(window.jobAgentRuntime.nanoState);
     document.querySelectorAll(".sp-mode-btn").forEach((btn) => {
+      const isOnDevice = btn.dataset.mode === "standalone";
       btn.classList.toggle("active", btn.dataset.mode === mode);
+      if (isOnDevice) {
+        // Keep the current mode clickable so a stale persisted value can still be corrected,
+        // but never let the user switch *into* a mode that cannot answer.
+        btn.disabled = nanoBlocked && mode !== "standalone";
+        btn.title = nanoBlocked
+          ? `On-device AI unavailable (${window.jobAgentRuntime.nanoState}). Enable it in Settings, or use the Local API.`
+          : "";
+      }
     });
     const select = document.getElementById("cfg-mode");
-    if (select) select.value = mode;
+    if (select) {
+      select.value = mode;
+      const onDeviceOption = select.querySelector('option[value="standalone"]');
+      if (onDeviceOption) onDeviceOption.disabled = nanoBlocked && mode !== "standalone";
+    }
   }
 
   async function refreshConnectionStatus() {
@@ -108,6 +125,14 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Re-render the badge/status whenever the background on-device probe advances.
   window.jobAgentRuntime.onNanoStateChange(() => {
     renderNanoStatus();
+    updateModeSwitchUi();
+    renderRuntimeBadge();
+  });
+
+  // Follow execution-mode changes, including the automatic correction on load when a persisted
+  // on-device mode has no session behind it.
+  window.jobAgentRuntime.onModeChange(() => {
+    updateModeSwitchUi();
     renderRuntimeBadge();
   });
 
