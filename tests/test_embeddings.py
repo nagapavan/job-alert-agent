@@ -218,7 +218,7 @@ class TestEmbeddingSettingsApi:
 
 
 class TestBackendReporting:
-    """active_backend_name() must describe what would actually serve an embed call (#100)."""
+    """active_backend_name() reports what would actually serve an embed call."""
 
     @staticmethod
     def _settings(backend="auto", server_url=""):
@@ -230,8 +230,6 @@ class TestBackendReporting:
                             {"key": "", "at": 0.0, "name": ""})
 
     def test_unreachable_external_reports_hash(self, monkeypatch):
-        # Regression: available() is hardcoded True, so the chain used to report "external"
-        # while every call fell through to the hash vectorizer.
         monkeypatch.setattr(embeddings, "_probe_external", lambda backend: False)
         self._reset_probe(monkeypatch)
         assert embeddings.active_backend_name(self._settings("external")) == "hash"

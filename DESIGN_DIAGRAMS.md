@@ -292,6 +292,17 @@ flowchart LR
   unreachable because the hash backend sits inside the chain.
 - `scripts/reembed_all.py` rebuilds vectors into the current space: batched, resumable, skips rows
   already stamped with the target model, refuses to write hashes unless `--allow-hash`.
+- **Session lifecycle (issue #106).** One `(tokenizer, InferenceSession, input names)` triple per
+  `(model_id, cache_dir, allow_download)` lives in `_ONNX_SESSIONS` for the life of the process, and
+  `resolve_backends()` memoizes the backend chain per settings tuple (returned as a fresh list).
+  Creating a session per embed call re-parsed the model (~85 ms per text) and churned native thread
+  pools; a cached session runs a 384-d forward pass in ~2 ms. `encode_batch` + `session.run` are
+  serialized by `_EMBED_LOCK` because the pair is shared across threads.
+- `_disable_onnx_telemetry()` runs before the first session. ORT 1.21+ ships Microsoft's 1DS
+  telemetry client: it makes an outbound call nobody configured and **aborts the process at exit** on
+  macOS (`recursive_mutex lock failed`, microsoft/onnxruntime#24579). `requirements.txt` pins
+  `onnxruntime==1.24.1`, whose macOS arm64 wheel has no telemetry client at all (0 `PosixTelemetry`
+  symbols vs 75 in 1.30.0) and is the oldest release with a CPython 3.14 wheel.
 
 Consequence: vectors from different backends are never silently compared. Rows written before the
 stamp existed stay `NULL` and are exactly what the re-embed script selects.

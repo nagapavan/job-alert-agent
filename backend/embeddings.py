@@ -188,9 +188,8 @@ def _onnx_deps_available() -> bool:
         return False
 
 
-# ONNX Runtime is expensive to initialise, and its telemetry teardown aborts the process on macOS
-# (microsoft/onnxruntime#24579), so exactly one session is created per model for the life of the
-# process and telemetry is switched off before the first one exists.
+# One session per model for the process lifetime; telemetry is disabled before the first (see
+# docs/DESIGN_DIAGRAMS.md embeddings section).
 _ONNX_SESSIONS: dict = {}
 _ONNX_SESSION_LOCK = threading.Lock()
 _ONNX_TELEMETRY_DISABLED = False
@@ -210,7 +209,6 @@ def _disable_onnx_telemetry() -> None:
         _ONNX_TELEMETRY_DISABLED = True
     except Exception as exc:  # noqa: BLE001 - telemetry must never block embedding
         logger.debug("Could not disable ONNX Runtime telemetry: %s", exc)
-
 
 
 class OnnxEmbeddingBackend:
@@ -309,8 +307,6 @@ class OnnxEmbeddingBackend:
         import numpy as np
 
         self._ensure_loaded()
-        # One tokenizer and one session are shared across threads, so encode + run together are
-        # serialized; a 384-d forward pass is milliseconds, so contention is negligible.
         with _EMBED_LOCK:
             encodings = self._tokenizer.encode_batch(
                 [(t or "")[:_TRUNCATE_CHARS] for t in texts]
@@ -327,22 +323,17 @@ class OnnxEmbeddingBackend:
         return [_l2_normalize(row.tolist()) for row in cls_vectors]
 
 
-
 # ---------------------------------------------------------------------------
 # Chain resolution & public entrypoints
 # ---------------------------------------------------------------------------
 
-# Serializes tokenizer use + session.run, since one session/tokenizer pair is shared process-wide.
+# Serializes tokenizer use + session.run for the shared process-wide session.
 _EMBED_LOCK = threading.Lock()
 
-# Backend objects are singletons per settings tuple: rebuilding them per call also rebuilt the
-# ONNX session, which cost ~85 ms per text (issue #106).
 _CHAIN_CACHE: dict = {}
 _CHAIN_LOCK = threading.Lock()
 
-# Identity of the vectors produced most recently on this thread. Rows are stamped from it so
-# they record the backend that actually embedded them, not the one configuration asked for:
-# the chain degrades silently when a model is missing or a server is down.
+# Identity of the vectors produced most recently on this thread; rows are stamped from it.
 _EMBED_STATE = threading.local()
 
 _HASH_WARNED = False
@@ -377,11 +368,7 @@ def _warn_hash_fallback(reason: Optional[Exception]) -> None:
 
 
 def resolve_backends(settings: Optional[dict] = None) -> List[EmbeddingBackend]:
-    """Return the ordered backend chain for the current (or supplied) settings.
-
-    The chain is memoized per settings tuple: building it used to construct new backend objects
-    (and therefore a new ONNX session) on every embedding call.
-    """
+    """Return the ordered backend chain for the current (or supplied) settings (memoized)."""
     s = settings or get_embedding_settings()
     key = (
         s.get("backend", "auto"),
@@ -389,6 +376,7 @@ def resolve_backends(settings: Optional[dict] = None) -> List[EmbeddingBackend]:
         bool(s.get("allow_download")),
         s.get("server_url") or "",
         s.get("server_model") or "",
+        str(get_embedding_settings_cache_dir()),
     )
     with _CHAIN_LOCK:
         chain = _CHAIN_CACHE.get(key)

@@ -1,8 +1,8 @@
 """Run policy for the Google Jobs channel: block cooldown and query rotation.
 
 Google answers automated traffic with an anti-bot interstitial (``/sorry/index?continue=...``)
-once it decides an egress address is suspicious. Retrying immediately cannot succeed and makes
-the reputation worse, so a block now starts a cooldown instead of being logged per query.
+once it decides an egress address is suspicious. Retrying immediately cannot succeed, so a block
+starts a cooldown.
 
 Query rotation spreads the query set across runs: each run scans a bounded subset starting at a
 persisted cursor, so coverage is complete over several runs rather than in one burst.

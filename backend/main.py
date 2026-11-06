@@ -7600,8 +7600,6 @@ def _run_google_jobs_task_runner(
     try:
         from backend import google_jobs_state
 
-        # A block is not retryable: stop hitting Google until the cooldown expires and say so
-        # explicitly instead of reporting a meaningless zero.
         cooldown = google_jobs_state.cooldown_reason()
         if cooldown:
             gjo_outcomes = []
@@ -7676,8 +7674,6 @@ def _run_google_jobs_task_runner(
             ]
 
         queries = _normalize_google_queries(queries)
-        # Rotate through the query set instead of firing every query each run: a blocked egress
-        # address cannot afford a burst, and full coverage is reached over several runs.
         queries, total_queries = google_jobs_state.select_queries(queries)
         total_steps = len(queries)
         active_resume = db.query(Resume).filter(Resume.is_active == True).first()
@@ -7745,8 +7741,6 @@ def _run_google_jobs_task_runner(
                             f"[Google Jobs] Blocked by Google for '{q_str}' "
                             "(consent wall or unusual-traffic interstitial)."
                         )
-                        # A block is not query-specific: stop immediately and cool down rather
-                        # than burning the remaining queries against the same wall.
                         google_jobs_state.record_block(f"blocked on query '{q_str[:60]}'")
                         break
                     elif q_outcome == "not_jobs_mode":
