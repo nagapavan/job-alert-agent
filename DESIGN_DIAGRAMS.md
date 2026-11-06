@@ -189,6 +189,26 @@ flowchart TD
     Dedup -->|Existing Listing| DBLog
 ```
 
+### 5.1 Block cooldown & query rotation (issue #104)
+
+Google answers automated traffic with its anti-bot interstitial (`/sorry/index?continue=...`). A
+block is neither query-specific nor retryable, so the runner treats it as a circuit-breaker event
+rather than a per-query log line:
+
+| Concern | Behaviour |
+| :--- | :--- |
+| First `blocked` outcome | Stop the query loop immediately; the remaining queries are not attempted |
+| Cooldown | Persisted deadline in `data/google_jobs_state.json`; `GOOGLE_JOBS_COOLDOWN_HOURS` (default 168 h) |
+| While cooling down | The runner exits **before** opening a browser, records `cooling_down`, and reports the deadline |
+| Query rotation | Each run scans `GOOGLE_JOBS_QUERIES_PER_RUN` (default 3) queries from a persisted cursor that wraps, so the full set is covered over several runs |
+| Successful run | Clears the cooldown and advances the cursor |
+| Default | `google_jobs` is opt-in (`DEFAULT_FEATURE_FLAGS`), and the SPA hides the channel tile when disabled |
+
+Policy module: `backend/google_jobs_state.py` (`cooling_down_until`, `cooldown_reason`,
+`record_block`, `record_run`, `select_queries`). Outcome vocabulary in `backend/channel_status.py`
+gains `cooling_down`, so the Operations log distinguishes "waiting out a block" from "ran and
+found nothing".
+
 ---
 
 ## 6. External ATS Portal Learning & Decoded Direct Scraping
@@ -246,6 +266,36 @@ flowchart LR
     end
 ```
 
+### 8.1 Backend chain, honest reporting and vector stamps (issue #100)
+
+```mermaid
+flowchart LR
+    Text["Text to embed"] --> Chain{"resolve_backends()"}
+    Chain -->|"1. cached / allowed"| Onnx["standalone ONNX\nbge-small-en-v1.5"]
+    Chain -->|"2. server reachable"| Ext["external\nOpenAI-compatible /v1/embeddings"]
+    Chain -->|"3. always available"| Hash["hash\nmd5 word buckets (lexical only)"]
+    Onnx & Ext & Hash --> Stamp["last_embed_stamp()\n(backend, model) — thread-local"]
+    Stamp --> Flush["before_flush listener\nembedding_model + embedding_dim"]
+    Flush --> Rows[("jobs · resumes · resume_chunks\napplication_question_answers\ndismissed_job_patterns")]
+    Stamp --> Guard["resume_supports / section_intent\nskip the semantic tier when the\nvector came from hash"]
+```
+
+- `active_backend_name()` **probes** a real embed (2 s timeout, 30 s cache) instead of trusting
+  `available()`: `ExternalEmbeddingBackend.available()` returns `True` without contacting the server,
+  which previously made the status endpoint report `external` while every call fell through to hash.
+- `last_embed_stamp()` records the `(backend, model)` that produced the newest vector on the calling
+  thread; the hot-path guards decide from that stamp, never from configuration.
+- Every vector-bearing table carries `embedding_model` / `embedding_dim`, written by a single
+  `before_flush` listener from the backend that actually served the embed. A caller that stamps
+  explicitly (the re-embed script) is not overwritten.
+- Hash fallback logs **once per process with the reason**; the previous "defensive only" block was
+  unreachable because the hash backend sits inside the chain.
+- `scripts/reembed_all.py` rebuilds vectors into the current space: batched, resumable, skips rows
+  already stamped with the target model, refuses to write hashes unless `--allow-hash`.
+
+Consequence: vectors from different backends are never silently compared. Rows written before the
+stamp existed stay `NULL` and are exactly what the re-embed script selects.
+
 ---
 
 ## 9. Single Unified Hybrid Chrome Extension Architecture (Task 8.6)
@@ -254,8 +304,23 @@ flowchart LR
 flowchart TD
     Ext["Single Unified Chrome Extension (Side Panel & Full Tab App)"] --> Detect{"Is Job Agent Backend (localhost:8000) Active?"}
     Detect -->|Yes| ModeA["🚀 Mode A: Connected Agent Mode\n• Background Playwright multi-page automation\n• LinkedIn Alert & Saved Jobs sync\n• SQLite / PostgreSQL pgvector storage\n• Local LM Studio / Ollama / Cloud LLM Router"]
-    Detect -->|No / Standalone| ModeB["🛡️ Mode B: Standalone Zero-Backend Mode\n• 100% on-device inside Chrome\n• Chrome Built-in Gemini Nano (window.ai.languageModel)\n• Active tab live DOM scraping & autofill\n• chrome.storage.local candidate profile & Q&A bank"]
+    Detect -->|No / Standalone| ModeB["🛡️ Mode B: Standalone Zero-Backend Mode\n• 100% on-device inside Chrome\n• Chrome Built-in Gemini Nano (LanguageModel API)\n• Active tab live DOM scraping & autofill\n• chrome.storage.local candidate profile & Q&A bank"]
 ```
+
+### 9.1 Execution-mode rules (issue #101)
+
+On-device mode is a fallback, not a substitute for a working API:
+
+- `_backendUsable()` = `isConnected && (mode === "connected" || no Nano session)`. Every
+  backend-gated flow (match analysis, profile sync, grounded pitch, form telemetry, copilot chat)
+  uses it, so selecting standalone mode never disables a reachable backend.
+- `analyzeJobMatch` awaits the in-flight `init()` and the bounded on-device probe before concluding
+  Nano is unavailable — a cold panel must not mistake "not probed yet" for "unavailable".
+- A persisted `mode: "standalone"` with no session is reverted to `connected` once the probe settles,
+  and the SPA disables the On-Device switch (and the Settings option) while `nanoState` is
+  `unsupported` / `unavailable` / `timeout`, with the reason in the tooltip.
+- Failure text names the cause (backend unreachable vs connected-but-unscorable) instead of a
+  generic "no AI model available".
 
 ---
 

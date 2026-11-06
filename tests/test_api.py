@@ -1414,12 +1414,12 @@ def test_qa_memory_and_dismissed_patterns_api():
 # User Preferences, Opt-in Feature Flags & BYOK Settings
 # -------------------------------------------------------------
 def test_user_preferences_roundtrip_and_feature_flags():
-    # Defaults: ATS + Google on, LinkedIn/Gmail off (opt-in)
+    # Defaults: ATS on; Google Jobs, LinkedIn and Gmail are opt-in (off)
     res = client.get("/api/preferences")
     assert res.status_code == 200
     data = res.json()
     assert data["features"]["ats_portals"] is True
-    assert data["features"]["google_jobs"] is True
+    assert data["features"]["google_jobs"] is False
     assert data["features"]["linkedin_sync"] is False
     assert "linkedin_sync" in data["available_features"]
     # High-comfort public-API portals on; unofficial/ambiguous portals opt-in (off).

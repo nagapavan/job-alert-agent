@@ -7592,6 +7592,47 @@ def _run_google_jobs_task_runner(
     google_pacer = build_pacer()
 
     try:
+        from backend import google_jobs_state
+
+        # A block is not retryable: stop hitting Google until the cooldown expires and say so
+        # explicitly instead of reporting a meaningless zero.
+        cooldown = google_jobs_state.cooldown_reason()
+        if cooldown:
+            gjo_outcomes = []
+            channel_status.record(
+                gjo_outcomes, "google_jobs", channel_status.COOLING_DOWN, cooldown
+            )
+            gjo_status = channel_status.aggregate_status(gjo_outcomes)
+            if progress_cb:
+                progress_cb(
+                    step=1,
+                    label=f"Skipped: {cooldown}",
+                    items_found=0,
+                    total_steps=1,
+                )
+            db.add(
+                OperationLog(
+                    operation_type="google_jobs_background_scan",
+                    status=gjo_status,
+                    summary=f"Google Jobs Scan: skipped — {cooldown}",
+                    details_json=sanitize_log_details(
+                        {"channels": gjo_outcomes, "cooldown_reason": cooldown}
+                    ),
+                    jobs_count=0,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                )
+            )
+            db.commit()
+            return {
+                "queries_scanned": 0,
+                "jobs_found": 0,
+                "filtered_out_of_preference": 0,
+                "errors_count": 0,
+                "status": gjo_status,
+                "skipped": "cooling_down",
+            }
+
         if not queries or len(queries) == 0:
             # Derive queries from persisted user preferences first, then followed queries.
             pref = get_user_preferences(db)
@@ -7629,6 +7670,9 @@ def _run_google_jobs_task_runner(
             ]
 
         queries = _normalize_google_queries(queries)
+        # Rotate through the query set instead of firing every query each run: a blocked egress
+        # address cannot afford a burst, and full coverage is reached over several runs.
+        queries, total_queries = google_jobs_state.select_queries(queries)
         total_steps = len(queries)
         active_resume = db.query(Resume).filter(Resume.is_active == True).first()
         resume_text = (
@@ -7695,6 +7739,10 @@ def _run_google_jobs_task_runner(
                             f"[Google Jobs] Blocked by Google for '{q_str}' "
                             "(consent wall or unusual-traffic interstitial)."
                         )
+                        # A block is not query-specific: stop immediately and cool down rather
+                        # than burning the remaining queries against the same wall.
+                        google_jobs_state.record_block(f"blocked on query '{q_str[:60]}'")
+                        break
                     elif q_outcome == "not_jobs_mode":
                         logger.warning(
                             f"[Google Jobs] Redirect dropped the jobs mode for '{q_str}'; "
@@ -7786,6 +7834,9 @@ def _run_google_jobs_task_runner(
                 total_steps=total_steps,
             )
 
+        if not blocked_count:
+            google_jobs_state.record_run(len(queries), total_queries)
+
         gjo_outcomes = []
         if errors_count >= total_steps:
             channel_status.record(
@@ -7793,10 +7844,16 @@ def _run_google_jobs_task_runner(
                 f"all {total_steps} queries raised",
             )
         elif blocked_count:
+            until = google_jobs_state.cooling_down_until()
+            deadline = (
+                f"; cooling down until {until.strftime('%Y-%m-%d %H:%M UTC')}"
+                if until
+                else ""
+            )
             channel_status.record(
                 gjo_outcomes, "google_jobs", channel_status.ERROR,
                 f"{blocked_count}/{total_steps} queries blocked by Google "
-                "(consent wall or unusual-traffic interstitial)",
+                f"(consent wall or unusual-traffic interstitial){deadline}",
             )
         elif queries_with_results == 0:
             channel_status.record(
@@ -7826,6 +7883,7 @@ def _run_google_jobs_task_runner(
                         "filtered_out_of_preference": filtered_count,
                         "queries_with_results": queries_with_results,
                         "queries_failed": errors_count,
+                        "queries_available": total_queries,
                         "per_query_outcomes": per_query_outcomes,
                         "channels": gjo_outcomes,
                     }

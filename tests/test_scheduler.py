@@ -27,7 +27,11 @@ class TestPeriodicScheduler:
         assert updated.is_enabled is True
 
     @patch("backend.main._run_google_jobs_task_runner")
-    def test_run_job_now_triggers_background_task(self, mock_runner):
+    def test_run_job_now_triggers_background_task(self, mock_runner, monkeypatch):
+        # Google Jobs is opt-in; this test exercises the scheduled task, not the flag gate.
+        import backend.database as dbmod
+
+        monkeypatch.setattr(dbmod, "is_feature_enabled", lambda db, feature: True)
         mock_runner.return_value = {"jobs_found": 5}
         task_id = scheduler.run_job_now("sched_google_jobs")
         assert task_id is not None
@@ -150,8 +154,10 @@ def test_status_from_result_mapping():
 @patch("backend.main._run_google_jobs_task_runner")
 def test_scheduled_run_finalizes_completed_status(mock_runner, monkeypatch, tmp_path):
     """Completion replaces RUNNING with COMPLETED and records the item count."""
+    import backend.database as dbmod
     import backend.scheduler as sched_mod
 
+    monkeypatch.setattr(dbmod, "is_feature_enabled", lambda db, feature: True)
     monkeypatch.setattr(sched_mod, "SCHEDULER_CONFIG_FILE", tmp_path / "sched.json")
     mock_runner.return_value = {"jobs_found": 7}
     scheduler.run_job_now("sched_google_jobs")
@@ -162,8 +168,10 @@ def test_scheduled_run_finalizes_completed_status(mock_runner, monkeypatch, tmp_
 
 @patch("backend.main._run_google_jobs_task_runner")
 def test_scheduled_run_finalizes_failed_status(mock_runner, monkeypatch, tmp_path):
+    import backend.database as dbmod
     import backend.scheduler as sched_mod
 
+    monkeypatch.setattr(dbmod, "is_feature_enabled", lambda db, feature: True)
     monkeypatch.setattr(sched_mod, "SCHEDULER_CONFIG_FILE", tmp_path / "sched.json")
     mock_runner.side_effect = RuntimeError("boom")
     scheduler.run_job_now("sched_google_jobs")
@@ -174,8 +182,10 @@ def test_scheduled_run_finalizes_failed_status(mock_runner, monkeypatch, tmp_pat
 @patch("backend.main._run_google_jobs_task_runner")
 def test_scheduled_run_finalizes_skipped_status(mock_runner, monkeypatch, tmp_path):
     """A runner that declines (e.g. browser profile busy) must not be reported as COMPLETED."""
+    import backend.database as dbmod
     import backend.scheduler as sched_mod
 
+    monkeypatch.setattr(dbmod, "is_feature_enabled", lambda db, feature: True)
     monkeypatch.setattr(sched_mod, "SCHEDULER_CONFIG_FILE", tmp_path / "sched.json")
     mock_runner.return_value = {"jobs_found": 0, "skipped": "browser_profile_busy"}
     scheduler.run_job_now("sched_google_jobs")

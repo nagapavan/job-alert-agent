@@ -337,6 +337,25 @@ Run: `./.venv/bin/pytest -q tests/test_scraper.py tests/test_application_trackin
   - Note: Google's `robots.txt` disallows `/search`, so the direct Google-for-Jobs HTML fetch is
     skipped when robots is respected. Use the opt-in JobSpy source or the browser-session fetcher
     as alternatives.
+  - **Anti-bot blocking is expected, not exceptional (issue #104).** Google serves
+    `/sorry/index?continue=...` once an egress address looks automated. The runner detects it as the
+    `blocked` outcome, stops the query loop on the first hit, and persists a cooldown
+    (`GOOGLE_JOBS_COOLDOWN_HOURS`, default 168 h) in `data/google_jobs_state.json`. While cooling
+    down it exits before opening a browser and records `cooling_down` with the deadline. Queries
+    rotate (`GOOGLE_JOBS_QUERIES_PER_RUN`, default 3) from a persisted cursor, so the set is covered
+    across runs instead of in one burst. `google_jobs` is **opt-in** by default.
+  - **Do not attempt to defeat the interstitial.** Programmatically solving a CAPTCHA violates
+    Google's terms and escalates the block; rotating IPs to evade it is equally out of scope.
+    Supported alternatives for Google-sourced discovery:
+    - **Gemini API grounding with Google Search** — per-query billed (5,000 free search queries per
+      month across Gemini 3.x, then $14 per 1,000). Returns grounded answers with citations, **not**
+      a scrapeable SERP, so it suits "which companies are hiring X" and not job-card ingestion.
+    - **Third-party SERP APIs** (SerpAPI, Serper, Brave Search API, Tavily, Exa) — they absorb the
+      anti-bot problem; wire one behind the same fetcher interface if a SERP is genuinely needed.
+    - The **Custom Search JSON API is closed to new customers** (existing customers must migrate by
+      2027-01-01), so it is not a viable new integration.
+    - No model choice — Gemma included — changes any of this: the block happens before content is
+      served, so a local model cannot read past it.
 - **Legacy repair:** `python -m backend.scripts.repair_linkedin_saved_jobs [--apply]` repairs
   malformed LinkedIn saved-job rows ingested before the collapsed-card parser fix (dry-run by
   default).
