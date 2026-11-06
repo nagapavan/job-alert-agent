@@ -188,6 +188,31 @@ def _onnx_deps_available() -> bool:
         return False
 
 
+# ONNX Runtime is expensive to initialise, and its telemetry teardown aborts the process on macOS
+# (microsoft/onnxruntime#24579), so exactly one session is created per model for the life of the
+# process and telemetry is switched off before the first one exists.
+_ONNX_SESSIONS: dict = {}
+_ONNX_SESSION_LOCK = threading.Lock()
+_ONNX_TELEMETRY_DISABLED = False
+
+
+def _disable_onnx_telemetry() -> None:
+    """Turn off ONNX Runtime's 1DS telemetry: no outbound call, no teardown abort."""
+    global _ONNX_TELEMETRY_DISABLED
+    if _ONNX_TELEMETRY_DISABLED:
+        return
+    try:
+        import onnxruntime as ort
+
+        disable = getattr(ort, "disable_telemetry_events", None)
+        if callable(disable):
+            disable()
+        _ONNX_TELEMETRY_DISABLED = True
+    except Exception as exc:  # noqa: BLE001 - telemetry must never block embedding
+        logger.debug("Could not disable ONNX Runtime telemetry: %s", exc)
+
+
+
 class OnnxEmbeddingBackend:
     """In-process ONNX sentence-embedding backend (CPU).
 
@@ -235,62 +260,85 @@ class OnnxEmbeddingBackend:
         return self._cached(_ONNX_MODEL_FILE) and self._cached(_ONNX_TOKENIZER_FILE)
 
     # -- loading ----------------------------------------------------------
+    def _session_key(self):
+        return (self.model_id, str(self.cache_dir), bool(self.allow_download))
+
     def _ensure_loaded(self) -> None:
         if self._session is not None:
             return
-        with self._lock:
+        with _ONNX_SESSION_LOCK:
             if self._session is not None:
                 return
-            import onnxruntime as ort
-            from huggingface_hub import hf_hub_download
-            from tokenizers import Tokenizer
+            key = self._session_key()
+            loaded = _ONNX_SESSIONS.get(key)
+            if loaded is None:
+                loaded = self._load()
+                _ONNX_SESSIONS[key] = loaded
+            self._tokenizer, self._session, self._input_names = loaded
 
-            local_only = not self.allow_download
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            model_path = hf_hub_download(
-                self.model_id,
-                _ONNX_MODEL_FILE,
-                cache_dir=str(self.cache_dir),
-                local_files_only=local_only,
-            )
-            tokenizer_path = hf_hub_download(
-                self.model_id,
-                _ONNX_TOKENIZER_FILE,
-                cache_dir=str(self.cache_dir),
-                local_files_only=local_only,
-            )
-            tokenizer = Tokenizer.from_file(tokenizer_path)
-            tokenizer.enable_padding()
-            tokenizer.enable_truncation(max_length=_MAX_SEQ_LENGTH)
-            self._tokenizer = tokenizer
-            self._session = ort.InferenceSession(
-                model_path, providers=["CPUExecutionProvider"]
-            )
-            self._input_names = {i.name for i in self._session.get_inputs()}
-            logger.info("Loaded local ONNX embedding model %s", self.model_id)
+    def _load(self):
+        """Build the (tokenizer, session, input names) triple for this model."""
+        _disable_onnx_telemetry()
+        import onnxruntime as ort
+        from huggingface_hub import hf_hub_download
+        from tokenizers import Tokenizer
+
+        local_only = not self.allow_download
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        model_path = hf_hub_download(
+            self.model_id,
+            _ONNX_MODEL_FILE,
+            cache_dir=str(self.cache_dir),
+            local_files_only=local_only,
+        )
+        tokenizer_path = hf_hub_download(
+            self.model_id,
+            _ONNX_TOKENIZER_FILE,
+            cache_dir=str(self.cache_dir),
+            local_files_only=local_only,
+        )
+        tokenizer = Tokenizer.from_file(tokenizer_path)
+        tokenizer.enable_padding()
+        tokenizer.enable_truncation(max_length=_MAX_SEQ_LENGTH)
+        session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        input_names = {i.name for i in session.get_inputs()}
+        logger.info("Loaded local ONNX embedding model %s", self.model_id)
+        return tokenizer, session, input_names
 
     def embed(self, texts: Sequence[str]) -> List[List[float]]:
         import numpy as np
 
         self._ensure_loaded()
-        encodings = self._tokenizer.encode_batch([(t or "")[:_TRUNCATE_CHARS] for t in texts])
-        input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
-        attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
-        feed = {"input_ids": input_ids, "attention_mask": attention_mask}
-        if "token_type_ids" in self._input_names:
-            feed["token_type_ids"] = np.zeros_like(input_ids)
-        outputs = self._session.run(None, feed)
+        # One tokenizer and one session are shared across threads, so encode + run together are
+        # serialized; a 384-d forward pass is milliseconds, so contention is negligible.
+        with _EMBED_LOCK:
+            encodings = self._tokenizer.encode_batch(
+                [(t or "")[:_TRUNCATE_CHARS] for t in texts]
+            )
+            input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
+            attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
+            feed = {"input_ids": input_ids, "attention_mask": attention_mask}
+            if "token_type_ids" in self._input_names:
+                feed["token_type_ids"] = np.zeros_like(input_ids)
+            outputs = self._session.run(None, feed)
         hidden = outputs[0]
         # BGE models use CLS pooling (first token) followed by L2 normalization.
         cls_vectors = hidden[:, 0, :]
         return [_l2_normalize(row.tolist()) for row in cls_vectors]
 
 
+
 # ---------------------------------------------------------------------------
 # Chain resolution & public entrypoints
 # ---------------------------------------------------------------------------
 
+# Serializes tokenizer use + session.run, since one session/tokenizer pair is shared process-wide.
 _EMBED_LOCK = threading.Lock()
+
+# Backend objects are singletons per settings tuple: rebuilding them per call also rebuilt the
+# ONNX session, which cost ~85 ms per text (issue #106).
+_CHAIN_CACHE: dict = {}
+_CHAIN_LOCK = threading.Lock()
 
 # Identity of the vectors produced most recently on this thread. Rows are stamped from it so
 # they record the backend that actually embedded them, not the one configuration asked for:
@@ -328,10 +376,29 @@ def _warn_hash_fallback(reason: Optional[Exception]) -> None:
     )
 
 
-
 def resolve_backends(settings: Optional[dict] = None) -> List[EmbeddingBackend]:
-    """Return the ordered backend chain for the current (or supplied) settings."""
+    """Return the ordered backend chain for the current (or supplied) settings.
+
+    The chain is memoized per settings tuple: building it used to construct new backend objects
+    (and therefore a new ONNX session) on every embedding call.
+    """
     s = settings or get_embedding_settings()
+    key = (
+        s.get("backend", "auto"),
+        s.get("model") or "",
+        bool(s.get("allow_download")),
+        s.get("server_url") or "",
+        s.get("server_model") or "",
+    )
+    with _CHAIN_LOCK:
+        chain = _CHAIN_CACHE.get(key)
+        if chain is None:
+            chain = _build_chain(s)
+            _CHAIN_CACHE[key] = chain
+    return list(chain)
+
+
+def _build_chain(s: dict) -> List[EmbeddingBackend]:
     backend = s.get("backend", "auto")
     model = s.get("model") or "Xenova/bge-small-en-v1.5"
     allow_download = bool(s.get("allow_download"))
