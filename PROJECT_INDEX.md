@@ -30,6 +30,8 @@ Quick-lookup reference for locating where changes should be made.
 - `embed_texts` / `embed_text` — the only embedding entry point other modules should use; returns L2-normalized vectors.
 - `last_embed_stamp()` — thread-local `(backend, model)` of the vector just produced; hot paths use it to decide whether semantic matching is trustworthy (a hash vector is not).
 - `active_backend_name` / `probe_backend_name` — real capability probe (short timeout, 30 s cache) rather than trusting `available()`; `local_model_cached` reports ONNX cache state for the Settings UI.
+- **Singletons (issue #106):** one `(tokenizer, InferenceSession)` per `(model_id, cache_dir, allow_download)` for the life of the process — a per-call session cost ~85 ms (model re-parse) and churned native thread pools; `resolve_backends()` memoizes the chain per settings tuple; `encode_batch` + `session.run` are serialized by `_EMBED_LOCK`.
+- `_disable_onnx_telemetry()` — calls `onnxruntime.disable_telemetry_events()` before the first session. ORT's 1DS telemetry client makes an unconfigured outbound call and aborts the process at exit on macOS (microsoft/onnxruntime#24579). `requirements.txt` pins `onnxruntime==1.24.1`, whose macOS arm64 wheel contains no telemetry client.
 - Backends: `OnnxEmbeddingBackend`, `ExternalEmbeddingBackend`, `HashEmbeddingBackend`, protocol `EmbeddingBackend`.
 - Config `EMBEDDING_BACKEND`/`EMBEDDING_MODEL`/`EMBEDDING_SERVER_URL`/`EMBEDDING_ALLOW_DOWNLOAD`; persisted to `data/embedding_settings.json`.
 

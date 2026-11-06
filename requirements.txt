@@ -23,7 +23,9 @@ pycountry==26.2.16
 # On Python 3.14+, pre-built wheels may not be available; fallback heuristic is always active
 # Optional local embedding backend (in-process ONNX). Degrades to the built-in
 # deterministic hash fallback when absent, so the app runs fully offline without it.
-onnxruntime>=1.17.0
+# macOS arm64 pins 1.24.1: its wheel lacks the ORT telemetry client that aborts at exit in 1.30.0.
+onnxruntime==1.24.1; sys_platform == "darwin" and platform_machine == "arm64"
+onnxruntime>=1.17.0; sys_platform != "darwin" or platform_machine != "arm64"
 tokenizers>=0.15.0
 huggingface_hub>=0.23.0
 

@@ -218,7 +218,7 @@ class TestEmbeddingSettingsApi:
 
 
 class TestBackendReporting:
-    """active_backend_name() must describe what would actually serve an embed call (#100)."""
+    """active_backend_name() reports what would actually serve an embed call."""
 
     @staticmethod
     def _settings(backend="auto", server_url=""):
@@ -230,8 +230,6 @@ class TestBackendReporting:
                             {"key": "", "at": 0.0, "name": ""})
 
     def test_unreachable_external_reports_hash(self, monkeypatch):
-        # Regression: available() is hardcoded True, so the chain used to report "external"
-        # while every call fell through to the hash vectorizer.
         monkeypatch.setattr(embeddings, "_probe_external", lambda backend: False)
         self._reset_probe(monkeypatch)
         assert embeddings.active_backend_name(self._settings("external")) == "hash"
@@ -318,3 +316,76 @@ class TestDownloadEndpoint:
         assert res.status_code == 502
         assert "hub unreachable" in res.json()["detail"]
 
+
+class TestOnnxSingletons:
+    """One session per model, telemetry off, memoized chain (issue #106)."""
+
+    def test_telemetry_disabled_once_before_loading(self, monkeypatch):
+        import onnxruntime as ort
+
+        calls = []
+        monkeypatch.setattr(embeddings, "_ONNX_TELEMETRY_DISABLED", False)
+        monkeypatch.setattr(ort, "disable_telemetry_events", lambda: calls.append(1))
+
+        embeddings._disable_onnx_telemetry()
+        embeddings._disable_onnx_telemetry()
+
+        assert calls == [1]
+        assert embeddings._ONNX_TELEMETRY_DISABLED is True
+
+    def test_session_is_loaded_once_per_model(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(embeddings, "_ONNX_SESSIONS", {})
+        loads = []
+
+        def fake_load(backend):
+            loads.append(backend.model_id)
+            return ("tok", object(), {"input_ids"})
+
+        monkeypatch.setattr(embeddings.OnnxEmbeddingBackend, "_load", fake_load)
+
+        first = OnnxEmbeddingBackend("model-a", tmp_path)
+        second = OnnxEmbeddingBackend("model-a", tmp_path)
+        first._ensure_loaded()
+        second._ensure_loaded()
+
+        assert loads == ["model-a"]
+        assert first._session is second._session
+        assert first._tokenizer == "tok"
+
+    def test_different_models_get_different_sessions(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(embeddings, "_ONNX_SESSIONS", {})
+        loads = []
+        monkeypatch.setattr(
+            embeddings.OnnxEmbeddingBackend,
+            "_load",
+            lambda backend: (loads.append(backend.model_id) or ("tok", object(), set())),
+        )
+
+        OnnxEmbeddingBackend("model-a", tmp_path)._ensure_loaded()
+        OnnxEmbeddingBackend("model-b", tmp_path)._ensure_loaded()
+
+        assert loads == ["model-a", "model-b"]
+
+    def test_chain_is_memoized_per_settings(self, monkeypatch):
+        monkeypatch.setattr(embeddings, "_CHAIN_CACHE", {})
+        hash_settings = {"backend": "hash", "model": "x", "allow_download": False,
+                         "server_url": "", "server_model": ""}
+        external_settings = {"backend": "external", "model": "x", "allow_download": False,
+                             "server_url": "http://localhost:1234/v1", "server_model": "m"}
+
+        first = resolve_backends(hash_settings)
+        second = resolve_backends(hash_settings)
+        other = resolve_backends(external_settings)
+
+        assert first[0] is second[0]
+        assert other[0] is not first[0]
+
+    def test_returned_chain_list_cannot_corrupt_the_cache(self, monkeypatch):
+        monkeypatch.setattr(embeddings, "_CHAIN_CACHE", {})
+        settings = {"backend": "hash", "model": "x", "allow_download": False,
+                    "server_url": "", "server_model": ""}
+
+        chain = resolve_backends(settings)
+        chain.clear()
+
+        assert resolve_backends(settings) != []

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Re-embed stored vectors into the current embedding space (issue #100).
+"""Re-embed stored vectors into the current embedding space.
 
 Vectors from different embedding backends are not comparable, so a model change (or a period
 spent on the hash fallback) leaves rows stranded in a previous vector space. This script walks

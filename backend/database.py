@@ -823,7 +823,7 @@ def init_db(custom_url: str = None):
                 if "talking_points" not in col_names:
                     conn.execute(text("ALTER TABLE companies ADD COLUMN talking_points TEXT;"))
 
-        # Vector-space identity for every table that stores embeddings (issue #100).
+        # Vector-space identity for every table that stores embeddings.
         for vector_table in (
             "jobs",
             "resumes",
