@@ -36,6 +36,9 @@ Where to look for the deep-dive topics:
 | Agentic reasoning / autonomy / harness | [`AGENTIC_ARCHITECTURE.md`](../AGENTIC_ARCHITECTURE.md) §1–5 |
 | ATS portals, filters & requisition probing | [`ATS_PORTALS.md`](ATS_PORTALS.md) |
 | Polite crawling (robots/AI files + pacing) & Workday | [`POLITE_CRAWLING_AND_WORKDAY.md`](POLITE_CRAWLING_AND_WORKDAY.md); [`ATS_GENERIC_ENGINE_PLAN.md`](ATS_GENERIC_ENGINE_PLAN.md) |
+| Google Jobs block cooldown & query rotation | [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §5.1; [`ATS_PORTALS.md`](ATS_PORTALS.md) §9 |
+| Embedding backend chain, vector stamps & re-embed | [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §8.1; [`PROJECT_INDEX.md`](../PROJECT_INDEX.md) → `backend/embeddings.py` |
+| Extension execution-mode fallback (API vs on-device) | [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §9.1; [`extension/README.md`](../extension/README.md) |
 | Structured match analysis & interview prep | [`PROJECT_INDEX.md`](../PROJECT_INDEX.md); [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §20 |
 | One-shot "Sync All" orchestration | [`SYNC_ALL_PLAN.md`](SYNC_ALL_PLAN.md) |
 | Log rotation & operation-log retention | [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §1; [`README.md`](../README.md) §Observability |

@@ -84,6 +84,31 @@ def isolate_llm_settings_file(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolate_google_jobs_state(tmp_path, monkeypatch):
+    """
+    Keeps the Google Jobs cooldown/rotation state out of the workspace so a test that
+    simulates a block cannot put the real instance into a week-long cooldown.
+    """
+    monkeypatch.setattr(
+        "backend.google_jobs_state.STATE_PATH", tmp_path / "google_jobs_state.json"
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
+def isolate_database_session_local(monkeypatch):
+    """
+    Points the module-level SessionLocal at the in-memory test database.
+
+    Background components (the scheduler's feature/consent gate, log pruning) open their own
+    sessions instead of taking the ``get_db`` dependency, so without this they read the live
+    workspace database — which made scheduler tests depend on the operator's real feature flags.
+    """
+    monkeypatch.setattr("backend.database.SessionLocal", TestingSessionLocal)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def neutralize_robots(monkeypatch):
     """
     Keeps tests hermetic and offline: robots.txt fetches return empty (allow-all) and the

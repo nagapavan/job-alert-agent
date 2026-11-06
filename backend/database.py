@@ -447,7 +447,7 @@ DEFAULT_EXCLUDED_COMPANIES = "amazon"
 DEFAULT_FEATURE_FLAGS = {
     # ---- Master discovery channels ----
     "ats_portals": True,
-    "google_jobs": True,
+    "google_jobs": False,
     "linkedin_sync": False,   # session-based LinkedIn DOM automation (ToS / account risk)
     "gmail_sync": False,      # reads Gmail (opt-in, privacy-scoped)
     # ---- Per-portal ATS scanners (public, documented APIs) ----

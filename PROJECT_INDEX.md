@@ -28,9 +28,18 @@ Quick-lookup reference for locating where changes should be made.
 **Responsibility:** Pluggable embedding backends behind a fixed 384-d contract.
 - `resolve_backends(settings)` — ordered local-first chain: `standalone` (in-process ONNX `bge-small-en-v1.5`) → `external` (OpenAI-compatible `/v1/embeddings`) → `hash` (deterministic last resort).
 - `embed_texts` / `embed_text` — the only embedding entry point other modules should use; returns L2-normalized vectors.
-- `active_backend_name` / `local_model_cached` — status reporting for the Settings UI.
+- `last_embed_stamp()` — thread-local `(backend, model)` of the vector just produced; hot paths use it to decide whether semantic matching is trustworthy (a hash vector is not).
+- `active_backend_name` / `probe_backend_name` — real capability probe (short timeout, 30 s cache) rather than trusting `available()`; `local_model_cached` reports ONNX cache state for the Settings UI.
 - Backends: `OnnxEmbeddingBackend`, `ExternalEmbeddingBackend`, `HashEmbeddingBackend`, protocol `EmbeddingBackend`.
 - Config `EMBEDDING_BACKEND`/`EMBEDDING_MODEL`/`EMBEDDING_SERVER_URL`/`EMBEDDING_ALLOW_DOWNLOAD`; persisted to `data/embedding_settings.json`.
+
+### `backend/google_jobs_state.py`
+**Responsibility:** Run policy for the Google Jobs channel (block cooldown + query rotation).
+- `cooling_down_until` / `cooldown_reason` — persisted deadline after Google served its anti-bot interstitial.
+- `record_block` / `record_run` — start a cooldown on the first block; clear it and advance the cursor on a clean run.
+- `select_queries` — rotating subset (`GOOGLE_JOBS_QUERIES_PER_RUN`, default 3) so coverage is spread across runs.
+- State: `data/google_jobs_state.json` (`blocked_until`, `query_cursor`, `last_run_at`); cooldown length `GOOGLE_JOBS_COOLDOWN_HOURS` (default 168).
+
 
 ### `backend/section_intent.py`
 **Responsibility:** Single source of truth for heading/section intent (replaced three duplicated detectors).
@@ -518,10 +527,28 @@ es.onmessage = (e) => updateProgressBar(JSON.parse(e.data));
 ```javascript
 // runtime-adapter.js: Connected Mode (backend) vs Standalone (Gemini Nano)
 const adapter = new RuntimeAdapter();
-await adapter.initGeminiNano();                    // window.ai.languageModel (on-device fallback)
+await adapter.initGeminiNano();                    // LanguageModel API (on-device fallback)
 const pitch = await adapter.generateGroundedPitch(question, company, role);
 
 // content/ats-autofill.js: safe-mode fill + form telemetry
 chrome.storage.local.get(["candidateProfile", "localQABank"], (res) => { /* fill fields */ });
 ```
+
+On-device mode never disables a reachable backend: `_backendUsable()` gates every backend call on
+`isConnected && (mode === "connected" || no Nano session)`, `analyzeJobMatch` awaits the bounded
+probe on a cold panel, and a persisted `standalone` mode is reverted to `connected` when no session
+exists. The SPA disables the On-Device switch while Nano cannot answer.
+
+### `scripts/reembed_all.py` — rebuild vectors into the current embedding space
+
+```bash
+./.venv/bin/python scripts/reembed_all.py --dry-run     # report per-table scope
+./.venv/bin/python scripts/reembed_all.py               # batched, resumable, 50 rows/commit
+```
+
+Walks `jobs`, `resumes`, `resume_chunks`, `application_question_answers` and
+`dismissed_job_patterns`; skips rows already stamped with the target `embedding_model`; refuses to
+overwrite vectors with hash output unless `--allow-hash`; supports `--tables`, `--limit`,
+`--batch-size`.
+
 

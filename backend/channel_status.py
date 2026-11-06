@@ -15,6 +15,7 @@ SKIPPED_FLAG = "skipped_flag"  # deliberately not requested / disabled by the op
 NOT_CONNECTED = "not_connected"  # credentials missing or revoked
 DEPENDENCY_MISSING = "dependency_missing"  # optional package/service not available
 DEGRADED_ZERO = "degraded_zero"  # ran but a known precondition failed, so 0 is meaningless
+COOLING_DOWN = "cooling_down"  # waiting out a block; the reason carries the deadline
 ERROR = "error"  # raised
 
 # Outcomes that mean "this channel did what it was asked". Everything else is a

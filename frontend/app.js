@@ -4018,6 +4018,13 @@ function applyFeatureFlags(flags) {
         const el = document.getElementById(id);
         if (el) el.style.display = featureFlags[feat] ? "" : "none";
     });
+    // Channel tiles in the discovery panel must follow the same flags: a disabled channel that
+    // still renders a "Scan" button invites a click that the backend will refuse.
+    const channelTiles = { google_jobs: "channel-google-jobs" };
+    Object.entries(channelTiles).forEach(([feat, id]) => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = featureFlags[feat] ? "" : "none";
+    });
     // (b) LinkedIn-free fallback hint: reassure that LinkedIn roles are still discoverable.
     const liHint = document.getElementById("linkedin-free-hint");
     if (liHint) {

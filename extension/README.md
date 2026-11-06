@@ -35,6 +35,21 @@ A **Single Unified Hybrid Chrome Extension** that gives candidates an in-browser
 ### 3. Hybrid Dual-Mode Runtime
 - **Mode A: Connected Agent Mode**: Connects to the local FastAPI backend (`http://localhost:8000`), leveraging PostgreSQL/SQLite, dynamic model routing, and the semantic cache.
 - **Mode B: Standalone Zero-Backend Mode**: Runs 100% on-device inside Chrome using the built-in Chrome Prompt API (global `LanguageModel`, powered by Gemini Nano) and `chrome.storage.local`, without needing the backend server running. On first use the model may need a one-time download, triggered from **Profile → Runtime & Agent Mode → Enable On-Device AI (Nano)**.
+- **On-device mode never disables a reachable backend.** When the selected mode is On-Device but no Nano session exists, every request falls back to the API, the bounded on-device probe is awaited on a cold panel, and a persisted On-Device selection is reverted to Local API. The On-Device switch is disabled while Nano reports `unsupported` / `unavailable` / `timeout`.
+
+### 4. API key requirement (extension origins are never trusted)
+
+The backend firewall accepts same-origin browser sessions and loopback callers **without an origin
+header**. A side panel always sends `Origin: chrome-extension://<id>`, so it must authenticate with
+the API key:
+
+1. Read the key from the repository root: `cat .api_key` (created on first run, `chmod 600`).
+2. Side panel → **Profile → API key** → paste → Save.
+
+Without it, `/api/health` still succeeds (the badge shows "Connected (API)") while every
+authenticated call returns **401**. Alternatively, allowlist the extension ID via the
+`ALLOWED_EXTENSION_IDS` environment variable to trust that specific origin.
+
 
 ---
 
