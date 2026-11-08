@@ -126,7 +126,6 @@ from backend.playwright_app import (
     fetch_google_jobs_playwright,
     fetch_linkedin_job_details,
     get_persistent_browser_context,
-    launch_assisted_application_session,
     scan_and_sync_hirist_applications,
     scan_and_sync_linkedin_saved_jobs,
     scan_linkedin_job_alerts,
@@ -725,10 +724,23 @@ class ScrapeResponse(BaseModel):
     message: str
 
 
+class ApplyMaterial(BaseModel):
+    """Everything the browser needs to apply, returned instead of launching one server-side."""
+
+    job_id: int
+    title: str
+    company: str = ""
+    url: str
+    cover_letter: str = ""
+    tailored_points: str = ""
+    cold_msg: str = ""
+
+
 class ApplyResponse(BaseModel):
     job_id: int
     status: str
     message: str
+    apply: ApplyMaterial
 
 
 class BulkApplyRequest(BaseModel):
@@ -740,6 +752,7 @@ class BulkApplyRequest(BaseModel):
 class BulkApplyResponse(BaseModel):
     message: str
     applied_job_ids: List[int]
+    jobs: List[ApplyMaterial] = Field(default_factory=list)
 
 
 class ExternalSyncRequest(BaseModel):
@@ -2878,18 +2891,6 @@ def clear_background_tasks():
 # -------------------------------------------------------------
 
 
-def get_active_resume_file_path() -> Optional[str]:
-    """Finds the local active resume document on disk for automated form attachment."""
-    resumes_dir = BASE_DIR / "data" / "resumes"
-    if not resumes_dir.exists():
-        return None
-    for ext in ["pdf", "txt", "md"]:
-        f = resumes_dir / f"active_resume.{ext}"
-        if f.exists():
-            return str(f)
-    return None
-
-
 @app.post(
     "/api/resume/upload", response_model=ResumeOut, status_code=status.HTTP_201_CREATED
 )
@@ -4383,8 +4384,11 @@ def stop_linkedin_sync():
 @app.post("/api/jobs/{job_id}/apply", response_model=ApplyResponse)
 def trigger_assisted_apply(job_id: int, db: Session = Depends(get_db)):
     """
-    Launches an interactive Playwright session with the dedicated Chrome profile
-    to assist with application filling and display the helper overlay panel.
+    Prepares an assisted application and returns the materials the browser needs.
+
+    The application itself opens in the browser the user is already working in (see
+    frontend/app.js and extension/content/dashboard-bridge.js); this endpoint never
+    launches a browser, so it cannot contend with the discovery profile lock.
     Implements Just-In-Time (JIT) material generation if cover letter/tailored points are missing.
     """
     job = db.query(Job).filter(Job.id == job_id).first()
@@ -4396,18 +4400,16 @@ def trigger_assisted_apply(job_id: int, db: Session = Depends(get_db)):
             status_code=400, detail="Job does not have an application URL."
         )
 
-    # Load active resume parsed data
+    # Load active resume text (materials generation only; form fields are filled in-browser)
     active_resume = (
         db.query(Resume)
         .filter(Resume.is_active == True)
         .order_by(Resume.created_at.desc())
         .first()
     )
-    resume_data = {}
     resume_text = ""
     if active_resume and active_resume.parsed_json_encrypted:
         try:
-            resume_data = json.loads(decrypt_data(active_resume.parsed_json_encrypted))
             resume_text = decrypt_data(active_resume.content_encrypted)
         except Exception:
             pass
@@ -4477,31 +4479,19 @@ def trigger_assisted_apply(job_id: int, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(job)
 
-    resume_file_path = get_active_resume_file_path()
-
-    # Launch Playwright session in background thread
-    def run_browser():
-        try:
-            launch_assisted_application_session(
-                url=job.url,
-                resume_data=resume_data,
-                cover_letter=job.cover_letter_draft or "",
-                tailored_points=job.tailored_resume_points or "",
-                cold_msg=job.cold_message_draft or "",
-                job_id=job.id,
-                resume_file_path=resume_file_path,
-                headless=False,
-            )
-        except Exception as e:
-            logger.error(f"Error running assisted apply browser session: {e}")
-
-    thread = threading.Thread(target=run_browser, daemon=True)
-    thread.start()
-
     return ApplyResponse(
         job_id=job.id,
         status="Applied",
-        message=f"Assisted application browser tab opened for '{job.title}' and marked as 'Applied'.",
+        message=f"Application materials ready for '{job.title}'. Apply in your browser.",
+        apply=ApplyMaterial(
+            job_id=job.id,
+            title=job.title,
+            company=job.company.name if job.company else "",
+            url=job.url,
+            cover_letter=job.cover_letter_draft or "",
+            tailored_points=job.tailored_resume_points or "",
+            cold_msg=job.cold_message_draft or "",
+        ),
     )
 
 
@@ -4539,8 +4529,9 @@ def confirm_job_submission(job_id: int, db: Session = Depends(get_db)):
 @app.post("/api/jobs/bulk-apply", response_model=BulkApplyResponse)
 def trigger_bulk_apply(req: BulkApplyRequest, db: Session = Depends(get_db)):
     """
-    Opens multiple selected job postings as tabs inside the single Chrome window,
-    triggers automated deep form-filling on each, and marks all selected jobs as 'Applied'.
+    Prepares materials for multiple selected job postings and marks them 'Applied'.
+    The browser opens them as tabs in one window (extension) or the user opens them
+    manually (fallback); no browser is launched server-side.
     """
     if not req.job_ids:
         raise HTTPException(status_code=400, detail="No job IDs provided.")
@@ -4548,23 +4539,6 @@ def trigger_bulk_apply(req: BulkApplyRequest, db: Session = Depends(get_db)):
     jobs = db.query(Job).filter(Job.id.in_(req.job_ids)).all()
     if not jobs:
         raise HTTPException(status_code=404, detail="No matching jobs found.")
-
-    active_resume = (
-        db.query(Resume)
-        .filter(Resume.is_active == True)
-        .order_by(Resume.created_at.desc())
-        .first()
-    )
-    resume_data = {}
-    resume_text = ""
-    if active_resume and active_resume.parsed_json_encrypted:
-        try:
-            resume_data = json.loads(decrypt_data(active_resume.parsed_json_encrypted))
-            resume_text = decrypt_data(active_resume.content_encrypted)
-        except Exception:
-            pass
-
-    resume_file_path = get_active_resume_file_path()
 
     applied_ids = []
     jobs_to_launch = []
@@ -4612,31 +4586,21 @@ def trigger_bulk_apply(req: BulkApplyRequest, db: Session = Depends(get_db)):
 
     db.commit()
 
-    def run_bulk_browser():
-        from backend.playwright_app import BrowserSessionManager
-
-        manager = BrowserSessionManager.get_instance()
-        for j in jobs_to_launch:
-            try:
-                manager.open_job_tab(
-                    job_id=j["id"],
-                    url=j["url"],
-                    resume_data=resume_data,
-                    cover_letter=j["cover_letter"],
-                    tailored_points=j["tailored_points"],
-                    cold_msg=j["cold_msg"],
-                    resume_file_path=resume_file_path,
-                    headless=False,
-                )
-                time.sleep(0.4)
-            except Exception as e:
-                pass
-
-    threading.Thread(target=run_bulk_browser, daemon=True).start()
-
     return BulkApplyResponse(
-        message=f"Successfully opened {len(applied_ids)} job application tab(s) in Chrome and updated status to 'Applied'.",
+        message=f"Application materials ready for {len(applied_ids)} job(s). Apply in your browser.",
         applied_job_ids=applied_ids,
+        jobs=[
+            ApplyMaterial(
+                job_id=j["id"],
+                title=j["title"],
+                company=j["company"],
+                url=j["url"],
+                cover_letter=j["cover_letter"],
+                tailored_points=j["tailored_points"],
+                cold_msg=j["cold_msg"],
+            )
+            for j in jobs_to_launch
+        ],
     )
 
 

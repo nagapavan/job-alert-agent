@@ -36,11 +36,21 @@
         "https://*.greenhouse.io/*",
         "https://*.lever.co/*",
         "https://*.ashbyhq.com/*",
-        "https://*.myworkdayjobs.com/*"
+        "https://*.myworkdayjobs.com/*",
+        "https://*.smartrecruiters.com/*",
+        "https://*.icims.com/*",
+        "https://*.workable.com/*",
+        "https://*.taleo.net/*",
+        "https://*.jobvite.com/*"
       ],
       "js": ["content/ats-autofill.js"],
       "css": ["content/ats-autofill.css"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": ["http://localhost:8000/*", "http://127.0.0.1:8000/*"],
+      "js": ["content/dashboard-bridge.js"],
+      "run_at": "document_start"
     }
   ]
 }

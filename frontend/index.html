@@ -98,8 +98,8 @@
                         <span class="btn-icon">📜</span> Operations Log
                     </button>
                     <button id="btn-login-portals" class="btn btn-outline" onclick="openBrowserAuthModal()"
-                        title="Launch dedicated browser to sign in to LinkedIn and Job Portals">
-                        <span class="btn-icon">🔐</span> Login to Portals
+                        title="Sign in once so background discovery can read LinkedIn and Hirist">
+                        <span class="btn-icon">🔐</span> Discovery Login
                     </button>
                 </div>
             </header>
@@ -1821,17 +1821,18 @@
         <div class="modal-card modal-sm">
             <div class="modal-header">
                 <div class="modal-title-group">
-                    <h3>🔐 Dedicated Browser Profile Login</h3>
-                    <p class="modal-subtitle">Log in to your accounts once. Cookies & sessions persist automatically in
-                        <code>.chrome_profile</code>.
+                    <h3>🔐 Discovery Login</h3>
+                    <p class="modal-subtitle">Sign in once to LinkedIn / Hirist. Cookies & sessions persist in
+                        <code>.chrome_profile</code> for background discovery.
                     </p>
                 </div>
                 <button class="modal-close" onclick="closeBrowserAuthModal()">&times;</button>
             </div>
             <div style="padding: 10px 0; display: flex; flex-direction: column; gap: 12px;">
                 <p style="font-size: 13px; color: #a6adc8; line-height: 1.5;">
-                    The agent uses an isolated, secure Chrome profile to read your LinkedIn job recommendations, sync
-                    saved applications, and perform Assisted Apply.
+                    Background discovery reads LinkedIn saved jobs, recommendations and Hirist status through
+                    an isolated Chrome profile. Assisted Apply no longer uses this profile — applications open
+                    in your own browser, already signed in.
                 </p>
                 <div style="display: flex; flex-direction: column; gap: 10px;">
                     <button class="btn btn-outline"

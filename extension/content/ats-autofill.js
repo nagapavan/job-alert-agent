@@ -1822,6 +1822,159 @@
   });
 
   // -------------------------------------------------------------
+  // 5b. Assisted Apply Session (opened from the dashboard)
+  // -------------------------------------------------------------
+  // The dashboard opens the application in this tab and hands the service worker the
+  // materials. Only that flow renders the panel and auto-fills — a page the user reached
+  // on their own is never auto-filled. This is the only place that calls autofillForm()
+  // outside an explicit user gesture, and it is gated on apply data being present.
+
+  function applyPanelSection(title, text) {
+    if (!text) return null;
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "margin-bottom:10px;";
+    const head = document.createElement("div");
+    head.style.cssText =
+      "display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px;";
+    const label = document.createElement("span");
+    label.textContent = title;
+    label.style.cssText = "font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#a6adc8;";
+    const copy = document.createElement("button");
+    copy.textContent = "Copy";
+    copy.style.cssText =
+      "font-size:11px;padding:2px 8px;border-radius:5px;border:1px solid #45475a;background:#313244;color:#cdd6f4;cursor:pointer;";
+    copy.addEventListener("click", () => {
+      navigator.clipboard.writeText(text);
+      copy.textContent = "Copied";
+      setTimeout(() => { copy.textContent = "Copy"; }, 1500);
+    });
+    head.appendChild(label);
+    head.appendChild(copy);
+    const body = document.createElement("div");
+    body.textContent = text;
+    body.style.cssText =
+      "font-size:12px;line-height:1.5;color:#cdd6f4;white-space:pre-wrap;max-height:180px;overflow:auto;background:#181825;border:1px solid #313244;border-radius:6px;padding:8px;";
+    wrap.appendChild(head);
+    wrap.appendChild(body);
+    return wrap;
+  }
+
+  function renderApplyPanel(job) {
+    if (document.querySelector(".job-agent-apply-panel")) return;
+
+    const panel = document.createElement("div");
+    panel.className = "job-agent-apply-panel";
+    panel.style.cssText = [
+      "position:fixed", "right:18px", "bottom:18px", "width:380px", "max-height:80vh",
+      "overflow:auto", "z-index:2147483000", "background:#1e1e2e", "color:#cdd6f4",
+      "border:1px solid #45475a", "border-radius:12px", "padding:14px",
+      "box-shadow:0 12px 40px rgba(0,0,0,.45)",
+      "font-family:ui-sans-serif,system-ui,-apple-system,sans-serif"
+    ].join(";");
+
+    const header = document.createElement("div");
+    header.style.cssText = "display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:10px;";
+    const titleWrap = document.createElement("div");
+    const title = document.createElement("div");
+    title.textContent = job.title || "Application";
+    title.style.cssText = "font-size:14px;font-weight:700;color:#cdd6f4;";
+    const company = document.createElement("div");
+    company.textContent = job.company || "";
+    company.style.cssText = "font-size:12px;color:#a6adc8;";
+    titleWrap.appendChild(title);
+    titleWrap.appendChild(company);
+    const close = document.createElement("button");
+    close.textContent = "✕";
+    close.style.cssText = "border:none;background:transparent;color:#6c7086;font-size:15px;cursor:pointer;";
+    close.addEventListener("click", () => panel.remove());
+    header.appendChild(titleWrap);
+    header.appendChild(close);
+    panel.appendChild(header);
+
+    const hint = document.createElement("div");
+    hint.textContent = "Form auto-filled where possible. Attach your resume file manually — the browser does not allow it to be set for you.";
+    hint.style.cssText = "font-size:11px;line-height:1.45;color:#f9e2af;margin-bottom:10px;";
+    panel.appendChild(hint);
+
+    [["Cover letter", job.cover_letter],
+     ["Tailored resume points", job.tailored_points],
+     ["Recruiter message", job.cold_msg]].forEach(([label, text]) => {
+      const section = applyPanelSection(label, text);
+      if (section) panel.appendChild(section);
+    });
+
+    const footer = document.createElement("div");
+    footer.style.cssText = "display:flex;gap:8px;margin-top:6px;";
+
+    const fill = document.createElement("button");
+    fill.textContent = "Auto-fill form";
+    fill.style.cssText =
+      "flex:1;font-size:12px;padding:7px 10px;border-radius:7px;border:1px solid #45475a;background:#313244;color:#cdd6f4;cursor:pointer;";
+    fill.addEventListener("click", () => {
+      chrome.storage.local.get(
+        ["candidateProfile", "localQABank", "autofillOverwritePref"],
+        (result) => {
+          try {
+            const res = autofillForm(
+              result.candidateProfile || {},
+              result.localQABank || [],
+              Boolean(result.autofillOverwritePref)
+            );
+            fill.textContent = `Filled ${res.filledCount} fields`;
+          } catch (e) {
+            fill.textContent = "Auto-fill failed";
+          }
+          setTimeout(() => { fill.textContent = "Auto-fill form"; }, 2500);
+        }
+      );
+    });
+
+    const submitted = document.createElement("button");
+    submitted.textContent = "Mark as submitted";
+    submitted.style.cssText =
+      "flex:1;font-size:12px;padding:7px 10px;border-radius:7px;border:none;background:#a6e3a1;color:#11111b;font-weight:700;cursor:pointer;";
+    submitted.addEventListener("click", () => {
+      chrome.runtime.sendMessage({ type: "APPLY_SUBMITTED", jobId: job.job_id }, (resp) => {
+        const err = chrome.runtime.lastError;
+        submitted.textContent = !err && resp && resp.ok ? "✓ Submitted" : "Open the dashboard to confirm";
+        setTimeout(() => { submitted.textContent = "Mark as submitted"; }, 3000);
+      });
+    });
+
+    footer.appendChild(fill);
+    footer.appendChild(submitted);
+    panel.appendChild(footer);
+    document.body.appendChild(panel);
+  }
+
+  function initApplySession() {
+    try {
+      chrome.runtime.sendMessage({ type: "GET_APPLY_DATA" }, (resp) => {
+        if (chrome.runtime.lastError) return;
+        const job = resp && resp.data;
+        if (!job) return;
+        renderApplyPanel(job);
+        chrome.storage.local.get(
+          ["candidateProfile", "localQABank", "autofillOverwritePref"],
+          (result) => {
+            try {
+              autofillForm(
+                result.candidateProfile || {},
+                result.localQABank || [],
+                Boolean(result.autofillOverwritePref)
+              );
+            } catch (e) {
+              /* best-effort */
+            }
+          }
+        );
+      });
+    } catch (e) {
+      /* extension context unavailable */
+    }
+  }
+
+  // -------------------------------------------------------------
   // 6. SPA Dynamic DOM Observer
   // -------------------------------------------------------------
   // Invariant: this observer MUST only refresh the badge lifecycle. It must never call
@@ -1843,6 +1996,9 @@
   } else {
     updateBadgeLifecycle();
   }
+
+  // Assisted apply: only renders when the dashboard opened this tab with materials.
+  initApplySession();
 
   // Async, LinkedIn-aware extraction: on LinkedIn the job container is client-rendered,
   // so wait (bounded) for it to appear before extracting. This eliminates the race that

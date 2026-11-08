@@ -5,11 +5,10 @@ from unittest.mock import patch, MagicMock
 
 from conftest import test_client as client
 
-@patch("backend.main.launch_assisted_application_session")
 @patch("backend.main.generate_text")
 @patch("backend.main.gather_company_intelligence")
 @patch("backend.main.scrape_greenhouse_jobs")
-def test_full_application_lifecycle_e2e(mock_gh, mock_intel, mock_gen, mock_launch):
+def test_full_application_lifecycle_e2e(mock_gh, mock_intel, mock_gen):
     """
     End-to-End Test covering the full user flow:
     1. Resume Upload & ATS Parsing
@@ -82,10 +81,11 @@ def test_full_application_lifecycle_e2e(mock_gh, mock_intel, mock_gen, mock_laun
     assert job["status"] == "To Apply"
     assert job["is_ghost_job"] is False
 
-    # Step 5: Trigger Assisted Apply via Browser Profile
+    # Step 5: Prepare Assisted Apply materials (browser opens them client-side)
     apply_res = client.post(f"/api/jobs/{job_id}/apply")
     assert apply_res.status_code == 200
     assert apply_res.json()["status"] == "Applied"
+    assert apply_res.json()["apply"]["url"]
 
     # Step 6: Interview Prep RAG Chat
     mock_gen.return_value = "Highlight your experience with two-phase commit protocols and idempotency keys."
