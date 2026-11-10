@@ -467,24 +467,17 @@ def _leading_heading_phrase(unit: str) -> Optional[str]:
     return None
 
 
-def jd_section_spans(text: str) -> List[SectionSpan]:
-    """Split a JD into labelled spans. Text before the first heading is 'required'.
-
-    A description with no line breaks is segmented by sentence instead (issue #53), because a
-    flattened JD otherwise yields one unlabelled span and every preferred item is scored as a
-    must-have. Descriptions that still have line breaks keep the line-based behaviour
-    untouched — loosening it there reclassified hundreds of stored postings for no benefit.
-    """
-    text = text or ""
-    flattened = "\n" not in text
-    units = _sentence_spans(text) if flattened else _line_spans(text)
+def _build_spans(
+    text: str, units: Sequence[Tuple[int, int]], allow_leading_phrase: bool
+) -> List[SectionSpan]:
+    """Label a span list from pre-computed units."""
     spans: List[SectionSpan] = []
     current_label = "required"
     current_start = 0
     for start, end in units:
         unit = text[start:end]
         label = _line_heading_label(unit)
-        if label is None and flattened and start > 0:
+        if label is None and allow_leading_phrase and start > 0:
             label = _leading_heading_phrase(unit.strip())
         if label is not None:
             if start > current_start:
@@ -492,9 +485,11 @@ def jd_section_spans(text: str) -> List[SectionSpan]:
             current_label = label
             current_start = start
     spans.append(SectionSpan(current_label, current_start, len(text)))
-    if not flattened:
-        return [s for s in spans if s.end > s.start or not spans]
-    # A flattened JD can restate a heading; coalescing keeps the span list meaningful.
+    return spans
+
+
+def _merge_adjacent(spans: Sequence[SectionSpan]) -> List[SectionSpan]:
+    """Coalesce consecutive spans with the same label (a JD can restate a heading)."""
     merged: List[SectionSpan] = []
     for span in spans:
         if span.end <= span.start:
@@ -503,7 +498,43 @@ def jd_section_spans(text: str) -> List[SectionSpan]:
             merged[-1] = SectionSpan(span.label, merged[-1].start, span.end)
         else:
             merged.append(span)
-    return merged or [SectionSpan("required", 0, len(text))]
+    return merged
+
+
+def _long_lines_dominate(text: str) -> bool:
+    """True when most characters sit in lines too long to be headings.
+
+    Scraped JDs are frequently HTML-stripped into a few enormous "lines" (a whole paragraph
+    each) plus a handful of short metadata lines. `_looks_like_heading` rejects the long
+    ones, so the line pass cannot see the headings buried inside them.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    total = sum(len(line) for line in lines)
+    if not total:
+        return False
+    long_chars = sum(len(line) for line in lines if len(line) > _HEADING_CHAR_LIMIT)
+    return (long_chars / total) > 0.5
+
+
+def jd_section_spans(text: str) -> List[SectionSpan]:
+    """Split a JD into labelled spans. Text before the first heading is 'required'.
+
+    Line structure is used whenever it can detect headings. A description with no line
+    breaks is segmented by sentence (issue #53). A description whose lines are mostly too
+    long to be headings — the shape produced by HTML-stripping a posting — is segmented by
+    sentence too, but only when the line pass found nothing, so well-structured descriptions
+    keep their existing spans untouched (issue #108).
+    """
+    text = text or ""
+    if "\n" in text:
+        line_spans = _build_spans(text, _line_spans(text), allow_leading_phrase=False)
+        if len(line_spans) > 1 or not _long_lines_dominate(text):
+            return [s for s in line_spans if s.end > s.start or not line_spans]
+
+    sentence_spans = _build_spans(
+        text, _sentence_spans(text), allow_leading_phrase=True
+    )
+    return _merge_adjacent(sentence_spans) or [SectionSpan("required", 0, len(text))]
 
 
 def label_at(spans: Sequence[SectionSpan], offset: int) -> str:

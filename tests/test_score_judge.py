@@ -234,10 +234,7 @@ class TestRescore:
         before = rescore(_assessment(), {"skills": ["Python"]}, JD)
         audit = ScoreAudit(
             requirements=[
-                RequirementVerdict(
-                    text="Coding and delivery are core to who you are",
-                    verdict="not_a_requirement",
-                )
+                RequirementVerdict(text="Terraform", verdict="not_a_requirement")
             ]
         )
         after = rescore(

@@ -9256,10 +9256,14 @@ def _deterministic_match(
         score = classifier.predict(features)
 
         scoring_config = ScoringConfig.from_mapping(get_scoring_config(db))
+        # Same must-have floor as compute_match: a posting the candidate only half-qualifies
+        # for must not present as a high score off the secondary components (issue #108).
         gated = (
             features.must_count > 0
             and features.must_coverage < scoring_config.must_floor
         )
+        if gated:
+            score = min(score, scoring_config.cap_when_below_floor)
         over_qualified = features.over_qualified_flag > 0.5
         band, recommendation = band_and_recommendation(
             score, scoring_config, gated=gated, over_qualified=over_qualified
