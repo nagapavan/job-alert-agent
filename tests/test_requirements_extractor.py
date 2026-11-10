@@ -107,12 +107,12 @@ class TestResidualExtraction:
 
     def test_real_residual_skill_still_credited(self, monkeypatch, tmp_path):
         monkeypatch.setattr("backend.skill_taxonomy.CANDIDATES_PATH", tmp_path / "c.json")
-        jd = "Requirements:\n- Experience with event-driven architecture.\n"
+        jd = "Requirements:\n- Experience with event sourcing.\n"
         spans = si.jd_section_spans(jd)
         results = rx.extract_residual_requirements(
-            jd, spans, resume_text="Built event-driven architecture with Kafka."
+            jd, spans, resume_text="Built event sourcing pipelines with Kafka."
         )
-        assert [r["text"] for r in results] == ["event-driven architecture"]
+        assert [r["text"] for r in results] == ["event sourcing"]
 
 
 class TestMarkupStripping:
