@@ -266,7 +266,7 @@ function initEventListeners() {
     if (modalApplyBtn) {
         modalApplyBtn.addEventListener("click", () => {
             if (state.activeJobModal) {
-                launchPlaywrightApply(state.activeJobModal.id);
+                launchApply(state.activeJobModal.id);
             }
         });
     }
@@ -2202,7 +2202,7 @@ function renderJobFeed(jobs) {
                     <button class="btn btn-outline btn-sm" onclick="openJobDetailsModal(${job.id})">
                         📋 Intel & Prep
                     </button>
-                    <button class="btn ${isApplied ? 'btn-outline' : 'btn-primary'} btn-sm" onclick="launchPlaywrightApply(${job.id})" title="${isApplied ? 'Re-open application portal' : 'Apply via assisted browser'}">
+                    <button class="btn ${isApplied ? 'btn-outline' : 'btn-primary'} btn-sm" onclick="launchApply(${job.id})" title="${isApplied ? 'Re-open application portal' : 'Apply in your browser'}">
                         ${isApplied ? '🚀 Reopen ↗' : '🚀 Apply ↗'}
                     </button>
                 </div>
@@ -2336,10 +2336,10 @@ async function bulkApplySelectedJobs() {
         return;
     }
 
-    const confirmed = confirm(`Launch single-window multi-tab application session for ${ids.length} selected job(s)?`);
+    const confirmed = confirm(`Open ${ids.length} application(s) in one window, to work through in sequence?`);
     if (!confirmed) return;
 
-    showToast(`🚀 Launching ${ids.length} job application tab(s) in Chrome...`);
+    showToast(`🚀 Preparing ${ids.length} application(s)...`);
     startFastQueuePolling();
     try {
         const res = await fetch(`${API_BASE}/api/jobs/bulk-apply`, {
@@ -2349,11 +2349,18 @@ async function bulkApplySelectedJobs() {
         });
         const data = await res.json();
         if (res.ok) {
-            showToast(data.message || `Launched ${ids.length} application tabs!`);
+            const jobs = data.jobs || [];
+            const result = await openApplyInBrowser(jobs);
+            if (result.ok) {
+                showToast(`🚀 Opened ${jobs.length} application tab(s) in one window.`);
+            } else {
+                openApplyFallback(jobs);
+                showToast("Opened the applications and materials (extension not available).");
+            }
             await fetchJobs();
             clearJobSelection();
         } else {
-            showToast(`⚠️ ${data.detail || data.message || "Failed to launch bulk application"}`);
+            showToast(`⚠️ ${data.detail || data.message || "Failed to prepare bulk application"}`);
         }
     } catch (e) {
         showToast("⚠️ Could not connect to agent backend.");
@@ -2538,7 +2545,7 @@ function renderTrackerList() {
                             ↺ Un-Dismiss
                         </button>
                     ` : `
-                        <button class="btn btn-primary btn-sm" onclick="launchPlaywrightApply(${job.id})">
+                        <button class="btn btn-primary btn-sm" onclick="launchApply(${job.id})">
                             🚀 Apply ↗
                         </button>
                     `}
@@ -4875,7 +4882,159 @@ async function triggerSyncAll() {
 }
 
 let isApplyingJob = false;
-async function launchPlaywrightApply(jobId) {
+let extensionBridgeReady = false;
+
+// The extension's dashboard bridge announces itself on load. Absence of that message is
+// what tells us to fall back to window.open + the materials drawer.
+window.addEventListener("message", (event) => {
+    if (event.source !== window || !event.data) return;
+    if (event.data.source !== "job-alert-agent-extension") return;
+    if (event.data.type === "EXTENSION_READY") {
+        extensionBridgeReady = true;
+    } else if (event.data.type === "APPLY_SUBMITTED" && event.data.jobId) {
+        confirmSubmission(event.data.jobId);
+    }
+});
+
+function openApplyInBrowser(jobs) {
+    return new Promise((resolve) => {
+        if (!jobs || jobs.length === 0) {
+            resolve({ ok: false, error: "no_jobs" });
+            return;
+        }
+        const requestId = `apply_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        let settled = false;
+        const onResult = (event) => {
+            if (event.source !== window || !event.data) return;
+            if (event.data.source !== "job-alert-agent-extension") return;
+            if (event.data.type !== "OPEN_APPLY_RESULT" || event.data.requestId !== requestId) return;
+            settled = true;
+            window.removeEventListener("message", onResult);
+            resolve(event.data);
+        };
+        window.addEventListener("message", onResult);
+        window.postMessage(
+            { source: "job-alert-agent", type: "OPEN_APPLY", requestId, payload: { jobs } },
+            "*"
+        );
+        setTimeout(() => {
+            if (settled) return;
+            window.removeEventListener("message", onResult);
+            resolve({ ok: false, error: "extension_unavailable" });
+        }, 900);
+    });
+}
+
+function openApplyFallback(jobs) {
+    jobs.forEach((job) => {
+        if (job && job.url) window.open(job.url, "_blank");
+    });
+    openMaterialsDrawer(jobs);
+}
+
+async function confirmSubmission(jobId) {
+    try {
+        await fetch(`${API_BASE}/api/jobs/${jobId}/confirm-submission`, { method: "POST" });
+        showToast("✅ Submission confirmed.");
+        await fetchJobs();
+    } catch (e) {
+        showToast("⚠️ Could not record submission confirmation.");
+    }
+}
+
+function closeMaterialsDrawer() {
+    const el = document.getElementById("materials-drawer");
+    if (el) el.remove();
+}
+
+// Fallback when the extension is not installed: the tabs are open, and the materials
+// live here so the user can copy them. Also used as the "Reopen" surface.
+function openMaterialsDrawer(jobs) {
+    closeMaterialsDrawer();
+    if (!jobs || jobs.length === 0) return;
+
+    const drawer = document.createElement("div");
+    drawer.id = "materials-drawer";
+    drawer.style.cssText = [
+        "position:fixed", "right:20px", "bottom:20px", "width:420px", "max-height:78vh",
+        "overflow:auto", "z-index:9999", "background:#1e1e2e", "color:#cdd6f4",
+        "border:1px solid #45475a", "border-radius:12px", "padding:16px",
+        "box-shadow:0 16px 48px rgba(0,0,0,.5)", "font-size:13px"
+    ].join(";");
+
+    const header = document.createElement("div");
+    header.style.cssText = "display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;";
+    const heading = document.createElement("strong");
+    heading.textContent = jobs.length > 1
+        ? `Application materials (${jobs.length})`
+        : "Application materials";
+    const closeBtn = document.createElement("button");
+    closeBtn.textContent = "✕";
+    closeBtn.style.cssText = "border:none;background:transparent;color:#6c7086;font-size:16px;cursor:pointer;";
+    closeBtn.addEventListener("click", closeMaterialsDrawer);
+    header.appendChild(heading);
+    header.appendChild(closeBtn);
+    drawer.appendChild(header);
+
+    const note = document.createElement("p");
+    note.textContent = "Attach your resume file manually in the application form.";
+    note.style.cssText = "font-size:11px;color:#f9e2af;margin:0 0 10px 0;";
+    drawer.appendChild(note);
+
+    jobs.forEach((job) => {
+        const block = document.createElement("div");
+        block.style.cssText = "margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid #313244;";
+
+        const title = document.createElement("div");
+        title.textContent = job.title || "Application";
+        title.style.cssText = "font-weight:700;margin-bottom:2px;";
+        const company = document.createElement("div");
+        company.textContent = job.company || "";
+        company.style.cssText = "font-size:11px;color:#a6adc8;margin-bottom:8px;";
+        block.appendChild(title);
+        block.appendChild(company);
+
+        [
+            ["Cover letter", job.cover_letter],
+            ["Tailored resume points", job.tailored_points],
+            ["Recruiter message", job.cold_msg]
+        ].forEach(([label, text]) => {
+            if (!text) return;
+            const row = document.createElement("div");
+            row.style.cssText = "margin-bottom:8px;";
+            const labelEl = document.createElement("div");
+            labelEl.textContent = label;
+            labelEl.style.cssText = "font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#a6adc8;margin-bottom:3px;";
+            const body = document.createElement("div");
+            body.textContent = text;
+            body.style.cssText = "white-space:pre-wrap;line-height:1.45;max-height:140px;overflow:auto;background:#181825;border:1px solid #313244;border-radius:6px;padding:8px;";
+            const copyBtn = document.createElement("button");
+            copyBtn.textContent = "Copy";
+            copyBtn.style.cssText = "margin-top:4px;font-size:11px;padding:2px 8px;border-radius:5px;border:1px solid #45475a;background:#313244;color:#cdd6f4;cursor:pointer;";
+            copyBtn.addEventListener("click", () => {
+                navigator.clipboard.writeText(text);
+                copyBtn.textContent = "Copied";
+                setTimeout(() => { copyBtn.textContent = "Copy"; }, 1500);
+            });
+            row.appendChild(labelEl);
+            row.appendChild(body);
+            row.appendChild(copyBtn);
+            block.appendChild(row);
+        });
+
+        const confirmBtn = document.createElement("button");
+        confirmBtn.textContent = "Mark as submitted";
+        confirmBtn.style.cssText = "font-size:11px;padding:5px 10px;border-radius:6px;border:none;background:#a6e3a1;color:#11111b;font-weight:700;cursor:pointer;";
+        confirmBtn.addEventListener("click", () => confirmSubmission(job.job_id));
+        block.appendChild(confirmBtn);
+
+        drawer.appendChild(block);
+    });
+
+    document.body.appendChild(drawer);
+}
+
+async function launchApply(jobId) {
     if (isApplyingJob) {
         showToast("⏳ Opening application session, please wait...");
         return;
@@ -4883,15 +5042,22 @@ async function launchPlaywrightApply(jobId) {
     isApplyingJob = true;
     startFastQueuePolling();
     try {
-        showToast("🚀 Launching Chrome assisted application window...");
+        showToast("🚀 Preparing application materials...");
         const res = await fetch(`${API_BASE}/api/jobs/${jobId}/apply`, { method: "POST" });
         const data = await res.json();
-        if (res.ok) {
-            showToast(data.message || "Assisted application window opened and marked as 'Applied'!");
-            await fetchJobs();
-        } else {
-            showToast(`⚠️ ${data.detail || data.message || "Could not launch application window"}`);
+        if (!res.ok) {
+            showToast(`⚠️ ${data.detail || data.message || "Could not prepare the application"}`);
+            return;
         }
+        const jobs = [data.apply];
+        const result = await openApplyInBrowser(jobs);
+        if (result.ok) {
+            showToast(`🚀 Opening '${data.apply.title}' in your browser.`);
+        } else {
+            openApplyFallback(jobs);
+            showToast("Opened the application and materials (extension not available).");
+        }
+        await fetchJobs();
     } catch (e) {
         showToast("⚠️ Could not connect to agent backend.");
     } finally {
@@ -5424,7 +5590,7 @@ window.clearBatchSelection = clearBatchSelection;
 window.openJobDetails = openJobDetails;
 window.updateJobStatus = updateJobStatus;
 window.deleteJob = deleteJob;
-window.launchPlaywrightApply = launchPlaywrightApply;
+window.launchApply = launchApply;
 window.setFeedTab = setFeedTab;
 window.toggleShortlistJob = toggleShortlistJob;
 window.dismissJob = dismissJob;
@@ -5717,11 +5883,11 @@ function clearCopilotHistory() {
 }
 
 async function copilotApplyJob(jobId) {
-    showToast(`⚡ Launching assisted application session...`);
-    await launchPlaywrightApply(jobId);
+    showToast(`⚡ Preparing assisted application...`);
+    await launchApply(jobId);
     copilotHistory.push({
         role: "assistant",
-        content: `🚀 Launched Assisted Application session in Chrome for job #${jobId}. Status updated to **Applied**.`
+        content: `🚀 Opened the assisted application for job #${jobId} in your browser. Status updated to **Applied**.`
     });
     saveCopilotHistory();
     renderCopilotMessages();

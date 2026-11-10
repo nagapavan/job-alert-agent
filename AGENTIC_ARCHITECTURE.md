@@ -92,7 +92,8 @@ flowchart TD
 2. **Concurrency, Pacing & Resource Protection**:
    - Manages inference queue to prevent GPU memory thrashing on local hardware (e.g. 1 worker with 0.2s cooling on local LM Studio/Ollama; scaling to 8 concurrent workers on cloud APIs).
 3. **Execution Sandboxing & Isolation**:
-   - Isolates browser profiles (`~/.job-alert-agent/chrome_profile/`) to prevent session leakage.
+   - Isolates the discovery browser profile (`~/.job-alert-agent/chrome_profile/`) to prevent session leakage.
+   - Keeps user-facing applications in the user's own browser, where their portal logins already live.
    - Restricts background tasks from unmonitored external network flooding (e.g., rate-limit protection).
 4. **State & Memory Management**:
    - Working memory (active dashboard state, filters, active modal job).

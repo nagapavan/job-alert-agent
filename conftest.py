@@ -122,8 +122,8 @@ def neutralize_robots(monkeypatch):
 @pytest.fixture(autouse=True)
 def prevent_real_browser_spawns(tmp_path, monkeypatch):
     """
-    Globally mocks Playwright and BrowserSessionManager during test execution
-    to prevent real Chromium/Node processes from spawning and crashing when pytest exits.
+    Globally mocks Playwright during test execution to prevent real Chromium/Node
+    processes from spawning and crashing when pytest exits.
 
     Also isolates the persistent Chrome profile directory to a per-test temp path so the
     suite is hermetic even when a real browser currently holds the live profile lock
@@ -133,22 +133,7 @@ def prevent_real_browser_spawns(tmp_path, monkeypatch):
         "backend.playwright_app.CHROME_PROFILE_DIR", tmp_path / "chrome_profile"
     )
 
-    mock_instance = MagicMock()
-    mock_instance.open_job_tab = MagicMock(return_value=None)
-    mock_instance._ensure_context = MagicMock(return_value=MagicMock())
-
-    with (
-        patch(
-            "backend.playwright_app.BrowserSessionManager.get_instance",
-            return_value=mock_instance,
-        ),
-        patch(
-            "backend.playwright_app.launch_assisted_application_session",
-            return_value=None,
-        ),
-        patch("backend.main.launch_assisted_application_session", return_value=None),
-        patch("backend.main.sync_playwright", MagicMock()),
-    ):
+    with patch("backend.main.sync_playwright", MagicMock()):
         yield
 
 

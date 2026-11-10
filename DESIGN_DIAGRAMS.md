@@ -1251,7 +1251,7 @@ Single Python process (default), with several daemon threads. No external broker
 │  └──────────────────────────────┬──────────────────────────────────────┘  │
 │                                 ▼                                          │
 │  ┌── Playwright (sync) ────────────────────────────────────────────────┐  │
-│  │  one process-wide BrowserSessionManager -> persistent context        │  │
+│  │  discovery only (LinkedIn / Hirist / Google Jobs / Gmail fallback)   │  │
 │  │  ~/.job-alert-agent/chrome_profile/ (SingleInstance lock, 0700)      │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 └────────────────────────────────────────────────────────────────────────────┘

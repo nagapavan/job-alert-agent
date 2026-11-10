@@ -99,6 +99,6 @@ defaults. The resolver is offline and cached (no network calls).
 
 These live outside version control by design:
 
-- `~/.job-alert-agent/chrome_profile/` — isolated persistent browser profile (session cookies).
+- `~/.job-alert-agent/chrome_profile/` — isolated persistent browser profile for discovery (session cookies).
 - `data/` — user preferences, scheduler config, token stats, Gmail/LLM settings (encrypted secrets). Committed examples: [`data/location_aliases.json`](../data/location_aliases.json) and [`data/company_aliases.example.json`](../data/company_aliases.example.json). User-supplied `data/company_aliases.json` and `backend/companies_config.json` stay local/gitignored (the repo ships `backend/companies_config.example.json` as the generic default).
 - `logs/app.log` — structured JSON logs.

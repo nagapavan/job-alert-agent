@@ -11,9 +11,9 @@ An autonomous, security-first AI agent that tracks job alerts from target compan
    * Fallback support for OpenAI, Google Gemini, and Anthropic Claude.
    * Full JSON mode extraction for resume ATS parsing and qualification scoring.
 
-2. **Isolated Browser Profile (Zero OAuth Security Risk)**
-   * Uses a dedicated persistent browser profile directory (`~/.job-alert-agent/chrome_profile/`).
-   * No risky OAuth tokens or CDP security exposures; persistent session cookies for Gmail and LinkedIn.
+2. **Isolated Browser Profile for Discovery (Zero OAuth Security Risk)**
+   * Background discovery uses a dedicated persistent browser profile (`~/.job-alert-agent/chrome_profile/`).
+   * Assisted Apply does **not** use it — applications open in the browser you are already signed in to.
 
 3. **Due Diligence & Ghost Job Detection**
    * Verifies LinkedIn and third-party job alerts against direct company career portals.
@@ -86,7 +86,7 @@ An autonomous, security-first AI agent that tracks job alerts from target compan
 > **Storage & scaling note:** The default SQLite backend stores 384-d embeddings as JSON (`SafeVector`) and computes cosine similarity in Python, which is **O(n) per semantic query**. For large job databases, configure PostgreSQL with the `pgvector` extension (set `DATABASE_URL`) to use indexed vector search.
 * **AI & NLP**: Local Unsloth / Ollama / LM Studio router, L2-normalized deterministic vectorizer, LLM Priority Dispatch Queue.
 * **Scraping & Search**: BeautifulSoup4, DuckDuckGo HTML search, Greenhouse / Lever / Ashby / SmartRecruiters / Workable / Workday public job APIs, Google for Jobs scraper. Optional user-supplied employer aliases load from `data/company_aliases.json` (empty by default).
-* **Automation**: Playwright with dedicated persistent Chromium profile (`~/.job-alert-agent/chrome_profile/`).
+* **Automation**: Playwright with a dedicated persistent Chromium profile (`~/.job-alert-agent/chrome_profile/`) for discovery; assisted applications open as tabs in the user's own browser.
 * **Observability**: Structured JSON logging, Request Correlation Middleware (`X-Request-ID`), Token & Cost Analytics Tracker.
 * **Frontend**: Vanilla JS SPA, Chrome Extension (Manifest V3 Side Panel & Content Scripts), Glassmorphism Dark Mode UI.
 
@@ -222,7 +222,7 @@ This is **not legal advice**.
 ## 🔒 Security & Privacy
 
 * **Encryption at Rest**: Candidate resume text, parsed ATS profiles, and private application notes are encrypted using Fernet symmetric encryption with a local key file (`.key`, `chmod 600`).
-* **Profile Isolation**: All browser operations execute inside `~/.job-alert-agent/chrome_profile/`, keeping your primary browser accounts isolated and secure.
+* **Profile Isolation**: Background discovery runs inside `~/.job-alert-agent/chrome_profile/`, keeping your primary browser accounts isolated. Assisted Apply intentionally does the opposite: it opens in your own browser so existing portal logins are reused.
 * **Local-First Execution**: Works 100% offline and private when paired with local Unsloth or Ollama.
 * **No Fabrication**: match analysis and application-material generation never invent scores, cover letters, or outreach notes when a model is unavailable — they return an explicit error/empty result.
 * **User-Supplied Target List**: the repo ships only a generic `backend/companies_config.example.json`; your real target-company list (`backend/companies_config.json`) and optional `data/company_aliases.json` are local and gitignored.

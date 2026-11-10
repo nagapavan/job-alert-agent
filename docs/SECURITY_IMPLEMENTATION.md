@@ -135,13 +135,17 @@ Three critical secrets are managed locally:
 
 ---
 
-## 5. Browser Profile Isolation
+## 5. Browser Profile Isolation (discovery only)
 
-All browser automation (LinkedIn, Gmail, ATS portals) uses a **single persistent profile**:
+Background discovery (LinkedIn, Hirist, Google Jobs, Gmail browser fallback) uses a **single persistent profile**:
 
 - **Path**: `~/.job-alert-agent/chrome_profile/` (default; override via env)
 - **Permissions**: `0700` (user-only read/write/execute)
 - **Purpose**: Maintain login state without repeatedly authenticating
+
+**Assisted Apply is out of scope.** It opens in the user's own browser — as a tab the
+extension manages, or via `window.open` when the extension is absent — so the profile is
+never locked by an apply and no second login is required.
 
 **Concurrency safety**:
 

@@ -609,8 +609,7 @@ def test_trigger_jobs_scrape_pins_company_to_its_ats_board(
     assert not mock_wd.called
 
 
-@patch("backend.main.launch_assisted_application_session")
-def test_trigger_assisted_apply(mock_launch):
+def test_trigger_assisted_apply():
     comp = client.post("/api/companies", json={"name": "ApplyCorp"}).json()
     job = client.post(
         "/api/jobs",
@@ -623,7 +622,11 @@ def test_trigger_assisted_apply(mock_launch):
 
     apply_res = client.post(f"/api/jobs/{job['id']}/apply")
     assert apply_res.status_code == 200
-    assert apply_res.json()["status"] == "Applied"
+    body = apply_res.json()
+    assert body["status"] == "Applied"
+    # The endpoint returns materials; it must not launch a browser server-side.
+    assert body["apply"]["url"] == "https://careers.applycorp.com/job/1"
+    assert body["apply"]["job_id"] == job["id"]
 
     # Verify job status in DB is updated to Applied
     get_job = client.get(f"/api/jobs/{job['id']}").json()
@@ -631,8 +634,7 @@ def test_trigger_assisted_apply(mock_launch):
     assert get_job["applied_at"] is not None
 
 
-@patch("backend.playwright_app.BrowserSessionManager.open_job_tab")
-def test_bulk_apply(mock_open_tab):
+def test_bulk_apply():
     comp = client.post("/api/companies", json={"name": "BulkCorp"}).json()
     j1 = client.post(
         "/api/jobs",
@@ -657,6 +659,11 @@ def test_bulk_apply(mock_open_tab):
     assert bulk_res.status_code == 200
     data = bulk_res.json()
     assert len(data["applied_job_ids"]) == 2
+    # Materials are returned for the browser; nothing is launched server-side.
+    assert {j["url"] for j in data["jobs"]} == {
+        "https://example.com/1",
+        "https://example.com/2",
+    }
 
     # Verify both jobs are marked Applied
     assert client.get(f"/api/jobs/{j1['id']}").json()["status"] == "Applied"
