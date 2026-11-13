@@ -4056,6 +4056,23 @@ def _execute_ats_scrape(
             total_added += 1
             comp_added += 1
 
+        # Commit per company so the SQLite write lock is held for one portal fetch instead of the
+        # whole scan: a long run starved every other writer past the 30 s busy_timeout.
+        persist_error = None
+        try:
+            db.commit()
+        except Exception as commit_err:  # noqa: BLE001 - one failed batch must not abort the scan
+            persist_error = str(commit_err)[:200]
+            logger.warning(
+                f"Failed to persist scrape batch for '{comp.name}': {commit_err}"
+            )
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001 - recovery is best-effort
+                pass
+            total_added -= comp_added
+            comp_added = 0
+
         status_text = (
             "Success"
             if comp_added > 0
@@ -4072,6 +4089,12 @@ def _execute_ats_scrape(
         )
         if comp_raw_count == 0:
             diag_text = f"No public API listings returned for {comp.name} ({comp_portal_type}). May require direct portal login or SPA renderer."
+        if persist_error:
+            status_text = "Failed"
+            diag_text = (
+                f"Found {comp_raw_count} postings, none persisted: batch write failed "
+                f"({persist_error})."
+            )
 
         audit_records.append(
             {
@@ -5539,6 +5562,12 @@ def linkedin_last_sync(db: Session = Depends(get_db)):
     )
 
 
+# One LinkedIn saved-jobs scan at a time. The manual endpoint and the Sync-All stage share the
+# single-owner browser profile, and is_profile_in_use() only reflects a browser that already holds
+# it, so two callers entering together both pass that check (issue #114).
+_LINKEDIN_SCAN_LOCK = threading.Lock()
+
+
 @app.post("/api/linkedin/sync", response_model=LinkedInSyncResponse)
 def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
     """
@@ -5546,6 +5575,21 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
     Prunes stale unacted 'To Apply' alert jobs (>7 days old) while strictly preserving Shortlisted & Applied jobs.
     Prunes/unsaves any closed or expired jobs from the LinkedIn saved list and updates DB status.
     """
+    if not _LINKEDIN_SCAN_LOCK.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A LinkedIn saved-jobs scan is already running (manual sync or Sync All). "
+                "Wait for it to finish before starting another."
+            ),
+        )
+    try:
+        return _sync_linkedin_alerts_and_saved(db)
+    finally:
+        _LINKEDIN_SCAN_LOCK.release()
+
+
+def _sync_linkedin_alerts_and_saved(db: Session) -> LinkedInSyncResponse:
     if not is_feature_enabled(db, "linkedin_sync"):
         return LinkedInSyncResponse(
             total_processed=0,
@@ -7878,6 +7922,7 @@ def _run_linkedin_sync_task_runner(
     db_gen = get_db()
     db = next(db_gen)
     total_found = 0
+    scan_lock_held = False
     # Saved jobs are explicit user intent and bypass the preference gate; alerts/recommendations do not.
     pref_filter = PreferenceFilter.from_db(db)
     alerts_filtered = 0
@@ -7921,6 +7966,18 @@ def _run_linkedin_sync_task_runner(
                     total_steps=3,
                 )
             return {"jobs_found": 0, "skipped": "browser_profile_busy"}
+
+        # Mutual exclusion with a manual POST /api/linkedin/sync: both scans drive the same
+        # single-owner browser profile (issue #114).
+        if not _LINKEDIN_SCAN_LOCK.acquire(blocking=False):
+            if progress_cb:
+                progress_cb(
+                    step=3,
+                    label="Skipped: a LinkedIn scan is already running.",
+                    total_steps=3,
+                )
+            return {"jobs_found": 0, "skipped": "linkedin_sync_in_progress"}
+        scan_lock_held = True
 
         saved_count = 0
         # Review batch id for this background sync run: every job newly ingested is tagged so the
@@ -8213,6 +8270,8 @@ def _run_linkedin_sync_task_runner(
             "jobs_found": total_found,
         }
     finally:
+        if scan_lock_held:
+            _LINKEDIN_SCAN_LOCK.release()
         db.close()
 
 
@@ -8353,6 +8412,15 @@ def _run_sync_all_task_runner(
                     {"stage": key, "status": "failed", "detail": str(stage_err)[:300]}
                 )
                 logger.warning(f"[SyncAll] Stage '{key}' failed: {stage_err}")
+                # A stage that tripped a flush leaves the shared session in PendingRollbackError
+                # state, which would fail the run's own bookkeeping and report the whole task as
+                # FAILED even though the other stages ran.
+                try:
+                    db.rollback()
+                except Exception as rollback_err:  # noqa: BLE001 - recovery is best-effort
+                    logger.warning(
+                        f"[SyncAll] Rollback after stage '{key}' failed: {rollback_err}"
+                    )
 
         completed = sum(1 for s in summary if s["status"] == "completed")
         skipped = sum(1 for s in summary if s["status"] == "skipped")
@@ -8371,7 +8439,14 @@ def _run_sync_all_task_runner(
                 completion_tokens=0,
             )
         )
-        db.commit()
+        try:
+            db.commit()
+        except Exception as log_err:  # noqa: BLE001 - the stage summary is the deliverable
+            logger.warning(f"[SyncAll] Failed to persist sync_all OperationLog: {log_err}")
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001 - recovery is best-effort
+                pass
 
         if progress_cb:
             progress_cb(
