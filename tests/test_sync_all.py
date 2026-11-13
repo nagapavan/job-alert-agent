@@ -4,14 +4,22 @@ All network/browser stages are mocked; no external calls are made.
 """
 
 from unittest.mock import patch, MagicMock
+
 from fastapi.testclient import TestClient
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from backend.main import (
     app,
     _run_sync_all_task_runner,
+    _run_linkedin_sync_task_runner,
+    _execute_ats_scrape,
+    _LINKEDIN_SCAN_LOCK,
+    ScrapeRequest,
     ScrapeResponse,
     ExternalSyncResponse,
 )
+from backend.database import Company, OperationLog
 
 client = TestClient(app)
 
@@ -98,3 +106,153 @@ class TestSyncAllOrchestrator:
             _run_sync_all_task_runner()
 
         mock_li.assert_not_called()
+
+
+class TestSyncAllSessionHygiene:
+    """A stage error must not poison the shared session or the run's own bookkeeping (#114)."""
+
+    @patch("backend.main.is_feature_enabled", side_effect=lambda db, f: f == "ats_hirist")
+    @patch("backend.main.get_feature_flags")
+    @patch("backend.main._execute_external_sync")
+    @patch("backend.main._execute_ats_scrape")
+    def test_poisoned_stage_is_rolled_back_and_run_log_persisted(
+        self, mock_ats, mock_ext, mock_flags, _mock_flag, db_session
+    ):
+        mock_flags.return_value = {
+            "ats_portals": True,
+            "google_jobs": False,
+            "linkedin_sync": False,
+        }
+
+        def _poison_stage(_cb):
+            # A failed statement leaves the session needing a rollback (PendingRollbackError).
+            db_session.execute(text("INSERT INTO no_such_table VALUES (1)"))
+
+        mock_ats.side_effect = _poison_stage
+        mock_ext.return_value = ExternalSyncResponse(message="ok")
+
+        with patch("backend.main.get_db", return_value=_iter_db(db_session)):
+            result = _run_sync_all_task_runner()
+
+        assert result["status"] == "partial"
+        assert result["failed"] == 1
+        assert result["completed"] == 1
+
+        log = (
+            db_session.query(OperationLog)
+            .filter(OperationLog.operation_type == "sync_all")
+            .first()
+        )
+        assert log is not None
+        assert log.status == "Partial"
+
+    @patch("backend.main.is_feature_enabled", side_effect=lambda db, f: f == "ats_hirist")
+    @patch("backend.main.get_feature_flags")
+    @patch("backend.main._execute_external_sync")
+    @patch("backend.main._execute_ats_scrape")
+    def test_run_log_persist_failure_does_not_fail_the_run(
+        self, mock_ats, mock_ext, mock_flags, _mock_flag, db_session
+    ):
+        mock_flags.return_value = {
+            "ats_portals": True,
+            "google_jobs": False,
+            "linkedin_sync": False,
+        }
+        mock_ats.return_value = ScrapeResponse(
+            jobs_found=1, jobs_added=1, companies_updated=0, message="ok"
+        )
+        mock_ext.return_value = ExternalSyncResponse(message="ok")
+        real_commit = db_session.commit
+
+        def _commit_fails_on_run_log():
+            # Only the run's own OperationLog write fails; preference bookkeeping still commits.
+            pending = [
+                obj
+                for obj in db_session.new
+                if isinstance(obj, OperationLog) and obj.operation_type == "sync_all"
+            ]
+            if pending:
+                raise OperationalError(
+                    "INSERT", {}, Exception("database is locked")
+                )
+            return real_commit()
+
+        with patch("backend.main.get_db", return_value=_iter_db(db_session)), patch.object(
+            db_session, "commit", side_effect=_commit_fails_on_run_log
+        ):
+            result = _run_sync_all_task_runner()
+
+        assert result["status"] == "success"
+        assert result["completed"] == 2
+
+
+class TestLinkedInScanMutualExclusion:
+    """Only one LinkedIn saved-jobs scan may drive the single-owner browser profile (#114)."""
+
+    @patch("backend.main.has_consent", return_value=True)
+    @patch("backend.main.is_feature_enabled", return_value=True)
+    def test_manual_sync_returns_409_while_a_scan_runs(self, _flag, _consent):
+        assert _LINKEDIN_SCAN_LOCK.acquire(blocking=False)
+        try:
+            res = client.post("/api/linkedin/sync")
+        finally:
+            _LINKEDIN_SCAN_LOCK.release()
+
+        assert res.status_code == 409
+        assert "already running" in res.json()["detail"]
+
+    @patch("backend.playwright_app.is_profile_in_use", return_value=False)
+    @patch("backend.main.has_consent", return_value=True)
+    @patch("backend.main.is_feature_enabled", return_value=True)
+    def test_background_stage_skips_while_a_scan_runs(
+        self, _flag, _consent, _profile, db_session
+    ):
+        assert _LINKEDIN_SCAN_LOCK.acquire(blocking=False)
+        try:
+            with patch("backend.main.get_db", return_value=_iter_db(db_session)):
+                result = _run_linkedin_sync_task_runner()
+        finally:
+            _LINKEDIN_SCAN_LOCK.release()
+
+        assert result["skipped"] == "linkedin_sync_in_progress"
+        assert result["jobs_found"] == 0
+
+
+class TestAtsScrapeBatchCommits:
+    """The scrape must not hold the SQLite write lock for the whole company loop (#114)."""
+
+    @patch("backend.main.scrape_greenhouse_jobs")
+    def test_commits_once_per_company(self, mock_gh, db_session):
+        db_session.add_all(
+            [
+                Company(
+                    name="Acme",
+                    domain="acme.example",
+                    careers_url="https://boards.greenhouse.io/acme",
+                ),
+                Company(
+                    name="Globex",
+                    domain="globex.example",
+                    careers_url="https://boards.greenhouse.io/globex",
+                ),
+            ]
+        )
+        db_session.commit()
+        mock_gh.return_value = [
+            {
+                "title": "Senior Backend Engineer",
+                "url": "https://boards.greenhouse.io/acme/jobs/1",
+                "description": "Python and PostgreSQL.",
+                "location": "Remote",
+                "source": "Greenhouse",
+                "source_type": "Direct",
+            }
+        ]
+
+        with patch.object(db_session, "commit", wraps=db_session.commit) as mock_commit:
+            result = _execute_ats_scrape(ScrapeRequest(), db_session)
+
+        assert result.jobs_added == 2
+        # One batch commit per company plus the closing OperationLog write.
+        assert mock_commit.call_count >= 3
+

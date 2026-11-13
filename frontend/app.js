@@ -4768,9 +4768,12 @@ async function triggerLinkedInSync() {
     } catch (e) {
         if (e.name === "AbortError") {
             showToast("LinkedIn sync cancelled by user.");
+        } else if (e instanceof TypeError) {
+            // fetch() rejects with a TypeError when no response arrives at all (server restart or
+            // unreachable backend); echoing "Failed to fetch" tells the user nothing actionable.
+            showToast("⚠️ LinkedIn sync lost its connection — the backend restarted or is unreachable. Retry once it is back.");
         } else {
             showToast("⚠️ " + e.message);
-            alert("LinkedIn sync notice:\n" + e.message);
         }
     } finally {
         stopFastQueuePolling();
