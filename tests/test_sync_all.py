@@ -5,6 +5,9 @@ All network/browser stages are mocked; no external calls are made.
 
 from unittest.mock import patch, MagicMock
 
+import threading
+import time
+
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
@@ -13,13 +16,17 @@ from backend.main import (
     app,
     _run_sync_all_task_runner,
     _run_linkedin_sync_task_runner,
+    _run_queued_linkedin_scan,
     _execute_ats_scrape,
-    _LINKEDIN_SCAN_LOCK,
+    _LINKEDIN_SCAN_GATE,
+    CancellationToken,
+    LinkedInSyncResponse,
     ScrapeRequest,
     ScrapeResponse,
     ExternalSyncResponse,
 )
-from backend.database import Company, OperationLog
+from backend.database import Company, LinkedInScanRequest, OperationLog
+from backend import linkedin_scan_queue
 
 client = TestClient(app)
 
@@ -187,19 +194,32 @@ class TestSyncAllSessionHygiene:
 
 
 class TestLinkedInScanMutualExclusion:
-    """Only one LinkedIn saved-jobs scan may drive the single-owner browser profile (#114)."""
+    """Only one LinkedIn saved-jobs scan may drive the single-owner browser profile (#114/#115)."""
 
+    @patch("backend.main._submit_queued_linkedin_scan", return_value="tsk_queued01")
     @patch("backend.main.has_consent", return_value=True)
     @patch("backend.main.is_feature_enabled", return_value=True)
-    def test_manual_sync_returns_409_while_a_scan_runs(self, _flag, _consent):
-        assert _LINKEDIN_SCAN_LOCK.acquire(blocking=False)
+    def test_manual_sync_is_queued_while_a_scan_runs(
+        self, _flag, _consent, _submit, db_session
+    ):
+        assert _LINKEDIN_SCAN_GATE.try_acquire()
         try:
             res = client.post("/api/linkedin/sync")
         finally:
-            _LINKEDIN_SCAN_LOCK.release()
+            _LINKEDIN_SCAN_GATE.release()
 
-        assert res.status_code == 409
-        assert "already running" in res.json()["detail"]
+        assert res.status_code == 202
+        body = res.json()
+        assert body["queued"] is True
+        assert body["task_id"] == "tsk_queued01"
+        assert body["queue_position"] == 1
+        assert "queued" in body["message"].lower()
+
+        row = db_session.query(LinkedInScanRequest).first()
+        assert row is not None
+        assert row.status == linkedin_scan_queue.STATUS_QUEUED
+        assert row.origin == "manual"
+        assert row.id == body["request_id"]
 
     @patch("backend.playwright_app.is_profile_in_use", return_value=False)
     @patch("backend.main.has_consent", return_value=True)
@@ -207,15 +227,137 @@ class TestLinkedInScanMutualExclusion:
     def test_background_stage_skips_while_a_scan_runs(
         self, _flag, _consent, _profile, db_session
     ):
-        assert _LINKEDIN_SCAN_LOCK.acquire(blocking=False)
+        assert _LINKEDIN_SCAN_GATE.try_acquire()
         try:
             with patch("backend.main.get_db", return_value=_iter_db(db_session)):
                 result = _run_linkedin_sync_task_runner()
         finally:
-            _LINKEDIN_SCAN_LOCK.release()
+            _LINKEDIN_SCAN_GATE.release()
 
         assert result["skipped"] == "linkedin_sync_in_progress"
         assert result["jobs_found"] == 0
+
+
+class TestLinkedInScanQueue:
+    """A colliding manual scan is queued, runs when the gate frees, and survives a restart (#115)."""
+
+    def test_queue_positions_follow_arrival_order(self, db_session):
+        first = linkedin_scan_queue.enqueue(db_session, origin="manual")
+        second = linkedin_scan_queue.enqueue(db_session, origin="manual")
+
+        assert linkedin_scan_queue.queue_position(db_session, first.id) == 1
+        assert linkedin_scan_queue.queue_position(db_session, second.id) == 2
+
+    def test_gate_hands_ownership_to_waiters_in_arrival_order(self):
+        order = []
+        first_ready = threading.Event()
+        assert _LINKEDIN_SCAN_GATE.try_acquire()
+        try:
+            def _waiter(name, started):
+                started.set()
+                if _LINKEDIN_SCAN_GATE.acquire(timeout=5):
+                    order.append(name)
+                    _LINKEDIN_SCAN_GATE.release()
+
+            t1 = threading.Thread(target=_waiter, args=("first", first_ready))
+            t1.start()
+            first_ready.wait(5)
+            t2 = threading.Thread(target=_waiter, args=("second", threading.Event()))
+            t2.start()
+            time.sleep(0.2)  # let both waiters register in order
+        finally:
+            _LINKEDIN_SCAN_GATE.release()
+
+        t1.join(5)
+        t2.join(5)
+        assert order == ["first", "second"]
+
+    @patch("backend.main._sync_linkedin_alerts_and_saved")
+    def test_queued_request_runs_and_completes_when_gate_frees(
+        self, mock_sync, db_session
+    ):
+        row = linkedin_scan_queue.enqueue(db_session, origin="manual")
+        row_id = row.id
+        mock_sync.return_value = LinkedInSyncResponse(
+            total_processed=3,
+            recommendations_found=0,
+            recommendations_added=0,
+            saved_jobs_checked=3,
+            saved_jobs_added=1,
+            already_existing=2,
+            dismissed_filtered=0,
+            closed_jobs_pruned=0,
+            message="LinkedIn sync complete: scanned 3.",
+        )
+
+        with patch("backend.main.get_db", return_value=_iter_db(db_session)):
+            result = _run_queued_linkedin_scan(row_id)
+
+        assert result["saved_jobs_added"] == 1
+        db_session.expunge_all()
+        finished = db_session.get(LinkedInScanRequest, row_id)
+        assert finished.status == linkedin_scan_queue.STATUS_COMPLETED
+        assert "scanned 3" in finished.summary
+        # The gate must be free again for the next scan.
+        assert _LINKEDIN_SCAN_GATE.try_acquire()
+        _LINKEDIN_SCAN_GATE.release()
+
+    @patch("backend.main._sync_linkedin_alerts_and_saved")
+    def test_cancelled_waiter_never_scans(self, mock_sync, db_session):
+        row = linkedin_scan_queue.enqueue(db_session, origin="manual")
+        row_id = row.id
+        assert _LINKEDIN_SCAN_GATE.try_acquire()
+        try:
+            token = CancellationToken()
+            token.cancel()
+            with patch("backend.main.get_db", return_value=_iter_db(db_session)):
+                result = _run_queued_linkedin_scan(row_id, cancel_token=token)
+        finally:
+            _LINKEDIN_SCAN_GATE.release()
+
+        assert result["skipped"] == "cancelled_before_start"
+        mock_sync.assert_not_called()
+        db_session.expunge_all()
+        assert (
+            db_session.get(LinkedInScanRequest, row_id).status
+            == linkedin_scan_queue.STATUS_CANCELLED
+        )
+
+    def test_stop_cancels_queued_requests(self, db_session):
+        row = linkedin_scan_queue.enqueue(db_session, origin="manual")
+        row_id = row.id
+
+        res = client.post("/api/linkedin/sync/stop")
+
+        assert res.status_code == 200
+        assert "stopped" in res.json()["message"]
+        db_session.expunge_all()
+        assert (
+            db_session.get(LinkedInScanRequest, row_id).status
+            == linkedin_scan_queue.STATUS_CANCELLED
+        )
+
+    def test_restart_requeues_queued_and_retires_running_rows(self, db_session):
+        queued = linkedin_scan_queue.enqueue(db_session, origin="manual")
+        running = LinkedInScanRequest(
+            origin="manual", status=linkedin_scan_queue.STATUS_RUNNING
+        )
+        db_session.add(running)
+        db_session.commit()
+
+        requeued = linkedin_scan_queue.recover_stale_requests(db_session)
+
+        queued_id, running_id = queued.id, running.id
+        assert requeued == [queued_id]
+        db_session.expunge_all()
+        assert (
+            db_session.get(LinkedInScanRequest, running_id).status
+            == linkedin_scan_queue.STATUS_CANCELLED
+        )
+        assert (
+            db_session.get(LinkedInScanRequest, queued_id).status
+            == linkedin_scan_queue.STATUS_QUEUED
+        )
 
 
 class TestAtsScrapeBatchCommits:

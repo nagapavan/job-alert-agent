@@ -4759,6 +4759,13 @@ async function triggerLinkedInSync() {
             signal: linkedinSyncAbortController.signal
         });
         const data = await res.json();
+        if (res.status === 202) {
+            // A scan already owns the browser profile: this request was queued as a background
+            // task and starts on its own when the running scan finishes.
+            showToast(data.message || "LinkedIn sync queued behind a running scan.", 6000);
+            fetchTasksStatus(true);
+            return;
+        }
         if (!res.ok) {
             throw new Error(data.detail || data.message || "Failed to sync LinkedIn");
         }
