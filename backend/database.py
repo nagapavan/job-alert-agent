@@ -254,6 +254,27 @@ class OperationLog(Base):
     created_at = Column(DateTime, default=utc_now, index=True)
     timestamp = synonym("created_at")
 
+class LinkedInScanRequest(Base):
+    """Persisted single-flight queue for LinkedIn saved-jobs scans (issue #114).
+
+    One scan at a time may drive the single-owner browser profile. A request that arrives while
+    a scan is running is written here and executed by a background task when the gate frees, so
+    it survives a server restart instead of dying with the HTTP connection.
+    """
+
+    __tablename__ = "linkedin_scan_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    origin = Column(String(32), default="manual", nullable=False)  # manual | startup
+    status = Column(String(32), default="queued", index=True, nullable=False)
+    task_id = Column(String(64), nullable=True)
+    requested_at = Column(DateTime, default=utc_now, index=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    summary = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+
+
 class ApplicationQuestionAnswer(Base):
     """
     Semantic Memory for application essay and screener questions (e.g. Workday, Greenhouse, Lever).

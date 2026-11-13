@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
 from backend import channel_status
+from backend import linkedin_scan_queue
 from backend.ai_helper import TASK_PROFILES, TaskComplexity, get_model_for_tier
 from backend.config import (
     DEFAULT_LLM_PROVIDER,
@@ -235,6 +236,28 @@ def _startup_operation_log_maintenance():
             db.close()
     except Exception as e:
         logger.debug(f"Startup operation-log rotation skipped: {e}")
+
+
+@app.on_event("startup")
+def _recover_queued_linkedin_scans():
+    """Re-queue LinkedIn scans that were still waiting when the previous process exited (#115).
+
+    A row left 'queued' never started, so it is safe to run now; a row left 'running' is marked
+    cancelled by the recovery helper because its outcome is unknown.
+    """
+    try:
+        from backend.database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            request_ids = linkedin_scan_queue.recover_stale_requests(db)
+        finally:
+            db.close()
+        for request_id in request_ids:
+            logger.info(f"Re-queueing LinkedIn scan #{request_id} after restart.")
+            _submit_queued_linkedin_scan(request_id)
+    except Exception as e:  # noqa: BLE001 - recovery must never block startup
+        logger.debug(f"Startup LinkedIn queue recovery skipped: {e}")
 
 
 @app.on_event("shutdown")
@@ -4398,10 +4421,22 @@ def stop_jobs_scrape():
 
 
 @app.post("/api/linkedin/sync/stop")
-def stop_linkedin_sync():
-    """Signals the active LinkedIn sync background task to abort."""
+def stop_linkedin_sync(db: Session = Depends(get_db)):
+    """Signals the active LinkedIn sync to abort and cancels any queued (not yet started) scan."""
     linkedin_cancel_event.set()
-    return {"message": "LinkedIn sync process stopped."}
+    cancelled = 0
+    try:
+        for row in linkedin_scan_queue.cancel_pending(db):
+            cancelled += 1
+            if row.task_id:
+                task_engine.cancel_task(row.task_id)
+    except Exception as cancel_err:  # noqa: BLE001 - stopping the live scan still succeeds
+        logger.warning(f"Could not cancel queued LinkedIn scans: {cancel_err}")
+
+    message = "LinkedIn sync process stopped."
+    if cancelled:
+        message += f" {cancelled} queued scan(s) cancelled."
+    return {"message": message}
 
 
 @app.post("/api/jobs/{job_id}/apply", response_model=ApplyResponse)
@@ -5564,8 +5599,115 @@ def linkedin_last_sync(db: Session = Depends(get_db)):
 
 # One LinkedIn saved-jobs scan at a time. The manual endpoint and the Sync-All stage share the
 # single-owner browser profile, and is_profile_in_use() only reflects a browser that already holds
-# it, so two callers entering together both pass that check (issue #114).
-_LINKEDIN_SCAN_LOCK = threading.Lock()
+# it, so two callers entering together both pass that check (issue #114). A request that arrives
+# while the gate is held is queued rather than rejected (issue #115).
+_LINKEDIN_SCAN_GATE = linkedin_scan_queue.gate
+
+
+def _submit_queued_linkedin_scan(request_id: int) -> str:
+    """Queue a LinkedIn scan as a background task and stamp the task id on its row."""
+    task_id = task_engine.submit_task(
+        task_type="linkedin_sync",
+        task_name=f"LinkedIn sync (queued #{request_id})",
+        fn=_run_queued_linkedin_scan,
+        request_id=request_id,
+        total_steps=3,
+    )
+    try:
+        from backend.database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            linkedin_scan_queue.attach_task_id(db, request_id, task_id)
+        finally:
+            db.close()
+    except Exception as stamp_err:  # noqa: BLE001 - the id is display-only
+        logger.warning(
+            f"Could not stamp task id on queued LinkedIn scan #{request_id}: {stamp_err}"
+        )
+    return task_id
+
+
+def _run_queued_linkedin_scan(
+    request_id: int,
+    cancel_token: Optional[CancellationToken] = None,
+    progress_cb: Optional[Callable] = None,
+) -> Dict[str, Any]:
+    """Background entry point for a queued LinkedIn scan: wait for the gate, then scan."""
+    db_gen = get_db()
+    db = next(db_gen)
+    acquired = False
+    try:
+        if progress_cb:
+            progress_cb(
+                step=1,
+                label="Waiting for the running LinkedIn scan to finish...",
+                total_steps=3,
+            )
+
+        def _cancelled() -> bool:
+            return bool(cancel_token and cancel_token.is_cancelled)
+
+        acquired = _LINKEDIN_SCAN_GATE.acquire(should_cancel=_cancelled)
+        if not acquired:
+            linkedin_scan_queue.mark_finished(
+                db,
+                request_id,
+                linkedin_scan_queue.STATUS_CANCELLED,
+                summary="Cancelled before it started.",
+            )
+            return {"jobs_found": 0, "skipped": "cancelled_before_start"}
+
+        linkedin_scan_queue.mark_running(db, request_id)
+        if progress_cb:
+            progress_cb(
+                step=2,
+                label="Scanning LinkedIn saved jobs...",
+                items_found=0,
+                total_steps=3,
+            )
+
+        result = _sync_linkedin_alerts_and_saved(db)
+        linkedin_scan_queue.mark_finished(
+            db,
+            request_id,
+            linkedin_scan_queue.STATUS_COMPLETED,
+            summary=result.message,
+        )
+        if progress_cb:
+            progress_cb(
+                step=3,
+                label=result.message,
+                items_found=result.saved_jobs_added,
+                total_steps=3,
+            )
+        return {
+            "jobs_found": result.saved_jobs_added,
+            "total_processed": result.total_processed,
+            "saved_jobs_added": result.saved_jobs_added,
+            "message": result.message,
+        }
+    except Exception as scan_err:
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001 - recovery is best-effort
+            pass
+        try:
+            linkedin_scan_queue.mark_finished(
+                db,
+                request_id,
+                linkedin_scan_queue.STATUS_FAILED,
+                error=str(scan_err),
+            )
+        except Exception as mark_err:  # noqa: BLE001 - never mask the scan error
+            logger.warning(
+                f"Could not mark queued LinkedIn scan #{request_id} failed: {mark_err}"
+            )
+        raise
+    finally:
+        if acquired:
+            _LINKEDIN_SCAN_GATE.release()
+        db.close()
 
 
 @app.post("/api/linkedin/sync", response_model=LinkedInSyncResponse)
@@ -5574,19 +5716,50 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
     Syncs live LinkedIn subscribed job alerts, recommended openings, and saved jobs.
     Prunes stale unacted 'To Apply' alert jobs (>7 days old) while strictly preserving Shortlisted & Applied jobs.
     Prunes/unsaves any closed or expired jobs from the LinkedIn saved list and updates DB status.
+
+    When another scan already owns the browser profile the request is queued (202) instead of
+    rejected; it runs as a background task as soon as the running scan finishes.
     """
-    if not _LINKEDIN_SCAN_LOCK.acquire(blocking=False):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "A LinkedIn saved-jobs scan is already running (manual sync or Sync All). "
-                "Wait for it to finish before starting another."
-            ),
-        )
+    if _LINKEDIN_SCAN_GATE.try_acquire():
+        try:
+            return _sync_linkedin_alerts_and_saved(db)
+        finally:
+            _LINKEDIN_SCAN_GATE.release()
+
+    queued = linkedin_scan_queue.enqueue(db, origin="manual")
+    position = linkedin_scan_queue.queue_position(db, queued.id)
     try:
-        return _sync_linkedin_alerts_and_saved(db)
-    finally:
-        _LINKEDIN_SCAN_LOCK.release()
+        task_id = _submit_queued_linkedin_scan(queued.id)
+    except Exception as submit_err:  # noqa: BLE001 - report, never leave a dangling row
+        logger.warning(f"Could not queue LinkedIn scan #{queued.id}: {submit_err}")
+        linkedin_scan_queue.mark_finished(
+            db,
+            queued.id,
+            linkedin_scan_queue.STATUS_FAILED,
+            error=str(submit_err),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not queue the LinkedIn scan: {submit_err}",
+        )
+
+    logger.info(
+        f"LinkedIn scan queued as task {task_id} (request #{queued.id}, position {position})."
+    )
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "queued",
+            "queued": True,
+            "request_id": queued.id,
+            "task_id": task_id,
+            "queue_position": position,
+            "message": (
+                f"A LinkedIn scan is already running; this request is queued as task {task_id} "
+                f"(position {position}). It starts automatically when the current scan finishes."
+            ),
+        },
+    )
 
 
 def _sync_linkedin_alerts_and_saved(db: Session) -> LinkedInSyncResponse:
@@ -7968,8 +8141,9 @@ def _run_linkedin_sync_task_runner(
             return {"jobs_found": 0, "skipped": "browser_profile_busy"}
 
         # Mutual exclusion with a manual POST /api/linkedin/sync: both scans drive the same
-        # single-owner browser profile (issue #114).
-        if not _LINKEDIN_SCAN_LOCK.acquire(blocking=False):
+        # single-owner browser profile (issue #114). The stage skips rather than queues so a
+        # Sync All run never blocks for minutes behind a manual scan.
+        if not _LINKEDIN_SCAN_GATE.try_acquire():
             if progress_cb:
                 progress_cb(
                     step=3,
@@ -8271,7 +8445,7 @@ def _run_linkedin_sync_task_runner(
         }
     finally:
         if scan_lock_held:
-            _LINKEDIN_SCAN_LOCK.release()
+            _LINKEDIN_SCAN_GATE.release()
         db.close()
 
 
