@@ -132,14 +132,40 @@ class TestExtractMatchFeatures:
             rs.latest_seniority = original_seniority
 
     def test_education_match(self):
-        """Education mentioned in JD affects feature."""
-        jd_hints = {"education_mentioned": True}
-        features = extract_match_features(None, jd_hints, assessment=None)
-        assert features.education_match == 1.0
+        """Education is read from the requirement itself, never inferred from JD mention."""
+        # No assessment -> no education requirement -> excluded from scoring.
+        features = extract_match_features(None, {"education_mentioned": True}, assessment=None)
+        assert features.education_match == 0.0
+        assert features.education_mentioned is False
 
-        jd_hints = {"education_mentioned": False}
-        features = extract_match_features(None, jd_hints, assessment=None)
-        assert features.education_match == 0.5
+        from backend.match_scoring import RequirementAssessment, RequirementItem
+
+        def _edu(status):
+            return RequirementAssessment(
+                requirements=[
+                    RequirementItem(
+                        text="Education: bachelor",
+                        kind="education",
+                        category="must_have",
+                        status=status,
+                    )
+                ]
+            )
+
+        met = extract_match_features(None, {"education_mentioned": True}, assessment=_edu("met"))
+        assert met.education_mentioned is True
+        assert met.education_match == 1.0
+
+        missing = extract_match_features(
+            None, {"education_mentioned": True}, assessment=_edu("missing")
+        )
+        assert missing.education_match == 0.0
+
+        # A degree that cannot be verified is excluded rather than scored as a miss.
+        unknown = extract_match_features(
+            None, {"education_mentioned": True}, assessment=_edu("unknown")
+        )
+        assert unknown.education_mentioned is False
 
 
 class TestDeterministicAssessment:

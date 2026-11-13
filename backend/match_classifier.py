@@ -39,6 +39,10 @@ class MatchFeatures:
     over_qualified_flag: float  # 1 if over-qualified, 0 otherwise
     must_count: int  # absolute must-have count
     nice_count: int  # absolute nice-to-have count
+    # Presence flags: a component the JD does not define must leave the denominator rather
+    # than contribute a constant. Trailing defaults keep existing positional construction valid.
+    seniority_known: bool = True
+    education_mentioned: bool = True
 
 
 class SimpleHeuristicClassifier:
@@ -53,11 +57,13 @@ class SimpleHeuristicClassifier:
         # defines (issue #70). An empty requirement set means "this JD states none", not "the
         # candidate met none", so scoring it as 0% would silently cap the score. Must-haves
         # dominate; nice-to-haves matter; seniority and education are secondary.
+        # A component the JD leaves undefined (no education requirement, unparseable
+        # seniority) is excluded instead of scoring a constant (issue #108).
         components = [
             (features.must_coverage, 60, features.must_count > 0),
             (features.nice_coverage, 20, features.nice_count > 0),
-            (features.seniority_fit, 15, True),
-            (features.education_match, 5, True),
+            (features.seniority_fit, 15, features.seniority_known),
+            (features.education_match, 5, features.education_mentioned),
         ]
         # With neither requirement set present there is nothing to verify, so keep the legacy
         # full-scale formula and let the score stay low rather than renormalise over 20 points.
@@ -65,10 +71,12 @@ class SimpleHeuristicClassifier:
             components = [
                 (features.must_coverage, 60, True),
                 (features.nice_coverage, 20, True),
-                (features.seniority_fit, 15, True),
-                (features.education_match, 5, True),
+                (features.seniority_fit, 15, features.seniority_known),
+                (features.education_match, 5, features.education_mentioned),
             ]
         total_weight = sum(weight for _, weight, present in components if present)
+        if total_weight <= 0:
+            return 0.0
         score = (
             sum(value * weight for value, weight, present in components if present)
             / total_weight
@@ -190,15 +198,28 @@ def extract_match_features(
     else:
         exp_delta = 0.0
 
-    # Seniority fit
+    # Seniority fit: rank distance, not equality. A senior candidate against a staff role is
+    # a near miss, not the same as a junior candidate (issue #108). Unparseable either side is
+    # excluded from scoring rather than scored as a constant.
     candidate_seniority = (
         resume_signals.latest_seniority(parsed_resume) if parsed_resume else "unknown"
     )
     job_seniority = jd_hints.get("seniority_level", "unknown")
-    seniority_fit = 1.0 if candidate_seniority == job_seniority else 0.6
+    cand_rank = _SENIORITY_RANK.get(str(candidate_seniority or "").lower())
+    job_rank = _SENIORITY_RANK.get(str(job_seniority or "").lower())
+    seniority_known = cand_rank is not None and job_rank is not None
+    if not seniority_known:
+        seniority_fit = 0.0
+    else:
+        # Over-level is a full fit; each level short costs 0.15 (senior -> staff = 0.70),
+        # floored at 0. The old 1.0/0.6 split could not tell a near miss from a large gap.
+        seniority_fit = max(0.0, 1.0 - 0.15 * max(0, job_rank - cand_rank))
 
-    # Education match
-    education_match = 1.0 if jd_hints.get("education_mentioned") else 0.5
+    # Education: read the education requirement itself. The JD mentioning education is not
+    # evidence the candidate meets it, and a JD that mentions none must not contribute a
+    # constant (issue #108).
+    education_match = 0.0
+    education_mentioned = False
 
     # Requirement coverage (from assessment if available)
     must_coverage = 0.0
@@ -208,6 +229,8 @@ def extract_match_features(
     over_qualified = 0.0
 
     if assessment and hasattr(assessment, "requirements"):
+        from backend.match_scoring import CREDIT, KNOWN_STATUSES
+
         reqs = assessment.requirements or []
         must_reqs = [r for r in reqs if r.category == "must_have"]
         nice_reqs = [r for r in reqs if r.category == "nice_to_have"]
@@ -215,13 +238,25 @@ def extract_match_features(
         must_count = len(must_reqs)
         nice_count = len(nice_reqs)
 
-        if must_reqs:
-            met_must = sum(1 for r in must_reqs if r.status == "met")
-            must_coverage = met_must / len(must_reqs)
+        def _coverage(items):
+            # Same contract as match_scoring._coverage: weighted credit per status
+            # (partial = CREDIT[PARTIAL]) over the requirements that can be judged.
+            known = [r for r in items if r.status in KNOWN_STATUSES]
+            if not known:
+                return None
+            return sum(CREDIT[r.status] for r in known) / len(known)
 
-        if nice_reqs:
-            met_nice = sum(1 for r in nice_reqs if r.status == "met")
-            nice_coverage = met_nice / len(nice_reqs)
+        must_cov = _coverage(must_reqs)
+        nice_cov = _coverage(nice_reqs)
+        must_coverage = must_cov or 0.0
+        nice_coverage = nice_cov or 0.0
+
+        edu_reqs = [r for r in reqs if getattr(r, "kind", "") == "education"]
+        if edu_reqs:
+            known_edu = [r for r in edu_reqs if r.status in KNOWN_STATUSES]
+            if known_edu:
+                education_mentioned = True
+                education_match = sum(CREDIT[r.status] for r in known_edu) / len(known_edu)
 
         over_qualified = 1.0 if getattr(assessment, "over_qualified", False) else 0.0
 
@@ -234,6 +269,8 @@ def extract_match_features(
         over_qualified_flag=over_qualified,
         must_count=must_count,
         nice_count=nice_count,
+        seniority_known=seniority_known,
+        education_mentioned=education_mentioned,
     )
 
 
@@ -261,6 +298,33 @@ _SENIORITY_RANK = {
     "intern": 0, "junior": 1, "mid": 2, "senior": 3, "lead": 4,
     "staff": 5, "principal": 6, "manager": 7, "director": 8,
 }
+
+# A job title is not a skill requirement. Residual mining can credit the posting's own title
+# (e.g. "Senior Staff Engineer") whenever the resume contains it, which both adds a bogus
+# requirement and double-counts seniority (issue #108).
+_TITLE_MODIFIERS = {
+    "senior", "sr", "staff", "principal", "lead", "junior", "jr", "mid", "associate",
+    "chief", "head", "vp", "director", "manager", "entry", "level", "i", "ii", "iii", "iv",
+}
+_ROLE_NOUNS = {
+    "engineer", "engineering", "developer", "architect", "manager", "director", "scientist",
+    "analyst", "consultant", "specialist", "programmer", "intern", "lead",
+}
+
+
+def _is_title_phrase(phrase: str, job_title: str = "") -> bool:
+    """True when a mined phrase is the posting's title or nothing but a role label."""
+    norm = _normalize_skill(phrase or "")
+    if not norm:
+        return True
+    if job_title and norm == _normalize_skill(job_title):
+        return True
+    words = [w for w in re.split(r"[^a-z0-9+#]+", norm) if w]
+    if not words:
+        return True
+    return all(w in _TITLE_MODIFIERS or w in _ROLE_NOUNS for w in words) and any(
+        w in _ROLE_NOUNS for w in words
+    )
 
 
 def _skill_token(pattern: str) -> re.Pattern:
@@ -438,6 +502,8 @@ def build_deterministic_assessment(
         for item in requirements_extractor.extract_residual_requirements(
             jd, spans, resume_text=resume_text or resume_blob
         ):
+            if _is_title_phrase(item["text"], job_title):
+                continue
             reqs.append(
                 RequirementItem(
                     text=item["text"],
@@ -515,7 +581,9 @@ def build_deterministic_assessment(
             )
         )
 
-    # Seniority level
+    # Seniority level. Kept as a requirement (not only the 15-point feature) so the score
+    # audit and the strengths/partials panels can see it; the feature uses a rank gradient
+    # while the requirement keeps the met/partial/missing vocabulary the judge understands.
     job_sen = jd_signals.seniority_level(job_title or "")
     cand_sen = resume_signals.latest_seniority(parsed_resume)
     if job_sen and job_sen != "unknown":
