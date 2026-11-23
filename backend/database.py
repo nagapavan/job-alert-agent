@@ -595,19 +595,16 @@ def is_feature_enabled(db, feature: str) -> bool:
     return bool(get_feature_flags(db).get(feature, False))
 
 
-# Tunable match-scoring parameters (mirrors backend.match_scoring.ScoringConfig defaults).
-DEFAULT_SCORING_CONFIG = {
-    "must_weight": 3.0,
-    "nice_weight": 1.0,
-    "must_floor": 0.5,
-    "cap_when_below_floor": 55.0,
-    "must_blend": 0.7,
-    "nice_blend": 0.3,
-    "strong": 85.0,
-    "good": 70.0,
-    "moderate": 55.0,
-    "weak": 40.0,
-}
+# Tunable match-scoring parameters, derived from the ScoringConfig dataclass so the two
+# cannot drift: changing a default in one place is enough (finding 82).
+def _default_scoring_config() -> dict:
+    from backend.match_scoring import ScoringConfig
+
+    cfg = ScoringConfig()
+    return {name: float(getattr(cfg, name)) for name in cfg.__dataclass_fields__}
+
+
+DEFAULT_SCORING_CONFIG = _default_scoring_config()
 
 
 def get_scoring_config(db) -> dict:

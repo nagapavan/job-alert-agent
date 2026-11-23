@@ -384,3 +384,34 @@ def test_a_generic_requisition_id_is_scoped_to_the_resolved_company(db_session):
 
     assert job is not None and job.id == at_hooli.id
     assert info["matched_by"] == "requisition"
+
+
+def test_a_substring_company_does_not_match_a_different_employer(db_session):
+    """`Acme` must not resolve to `Acmetools` (finding 64)."""
+    from backend.main import _match_job_for_email_event
+
+    other = Company(name="Acmetools")
+    db_session.add(other)
+    db_session.flush()
+    db_session.add(Job(company_id=other.id, title="Engineer"))
+    db_session.commit()
+
+    job, info = _match_job_for_email_event(db_session, "Acme", "Engineer")
+    assert job is None
+    assert info["matched_by"] == "no_company"
+
+
+def test_a_legal_suffix_still_matches(db_session):
+    """Word-boundary matching must keep the 'Acme' -> 'Acme Corporation' case (finding 64)."""
+    from backend.main import _match_job_for_email_event
+
+    company = Company(name="Acme Corporation")
+    db_session.add(company)
+    db_session.flush()
+    job = Job(company_id=company.id, title="Engineer")
+    db_session.add(job)
+    db_session.commit()
+
+    matched, info = _match_job_for_email_event(db_session, "Acme", "Engineer")
+    assert matched is not None and matched.id == job.id
+    assert info["matched_by"] == "exact_title"

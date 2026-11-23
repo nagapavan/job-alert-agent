@@ -604,3 +604,96 @@ class TestAtsHeaderChromeIsNotScored:
     def test_the_real_must_haves_survive(self):
         by_text = {r.text: r.category for r in self._assessment().requirements}
         assert by_text.get("Ruby on Rails") in (None, "must_have")
+
+
+def test_unknown_candidate_seniority_is_unknown_not_met():
+    """A resume with no parseable roles must not pass a senior requirement by default
+    (`_SENIORITY_RANK.get(..., 3)` used to make it MET — finding 80)."""
+    jd = "We require a senior engineer with Python and 5+ years of experience."
+    assessment = build_deterministic_assessment(
+        jd, None, resume_text="", job_title="Senior Engineer"
+    )
+    seniority = [r for r in assessment.requirements if r.kind == "seniority"]
+    assert seniority, "the posting states a seniority level"
+    assert seniority[0].status == "unknown"
+
+
+def test_unknown_must_haves_do_not_trip_the_must_floor():
+    """A posting whose only must-haves are unjudgeable is not a zero-coverage posting
+    (finding 87)."""
+    from backend.match_scoring import RequirementAssessment, RequirementItem
+
+    assessment = RequirementAssessment(
+        requirements=[
+            RequirementItem(text="Rust", status="unknown", category="must_have"),
+            RequirementItem(text="Go", status="unknown", category="must_have"),
+        ]
+    )
+    features = extract_match_features(None, {}, assessment=assessment)
+    assert features.must_count == 0
+    assert features.must_coverage == 0.0
+
+
+def test_weighted_coverage_uses_the_shared_implementation():
+    """Classifier features and compute_match must weight requirements identically (finding 88)."""
+    from backend.match_scoring import (
+        RequirementAssessment,
+        RequirementItem,
+        ScoringConfig,
+        _coverage,
+    )
+
+    reqs = [
+        RequirementItem(text="A", status="met", category="must_have", weight=3),
+        RequirementItem(text="B", status="missing", category="must_have", weight=1),
+    ]
+    features = extract_match_features(
+        None, {}, assessment=RequirementAssessment(requirements=reqs)
+    )
+    assert features.must_coverage == _coverage(reqs, ScoringConfig())
+
+
+def test_taxonomy_reload_reaches_the_scanner(monkeypatch):
+    """The scanner must read the module attribute, so a reload is visible without a restart
+    (finding 93)."""
+    from backend import match_classifier as mc
+    from backend import skill_taxonomy as tax
+
+    monkeypatch.setattr(tax, "DISPLAY_SKILLS", ["Zebrafish"])
+    assert "zebrafish" in mc._resume_skill_scan("zebrafish pipelines")
+
+
+def test_fully_supported_residual_is_met_not_partial(monkeypatch):
+    """Residual evidence at full token overlap is MET; weaker support stays PARTIAL (finding 96)."""
+    from backend import requirements_extractor
+
+    monkeypatch.setattr(
+        requirements_extractor,
+        "extract_residual_requirements",
+        lambda *a, **k: [
+            {"text": "event sourcing", "category": "must_have", "evidence": "resume:token_overlap", "score": 1.0},
+            {"text": "cqrs", "category": "must_have", "evidence": "resume:embedding", "score": 0.6},
+        ],
+    )
+    assessment = build_deterministic_assessment(
+        "Requirements: we need event sourcing and cqrs experience. " * 3,
+        {"skills": []},
+        job_title="Engineer",
+    )
+    by_text = {r.text: r.status for r in assessment.requirements}
+    assert by_text.get("event sourcing") == "met"
+    assert by_text.get("cqrs") == "partial"
+
+
+def test_eligibility_is_evaluated_without_a_location():
+    """A blank location must not exempt a posting from title/topic filters (finding 95)."""
+    from unittest.mock import patch
+
+    from backend.job_scoring import _check_eligibility
+
+    class _Filter:
+        def rejection_reason(self, *a):
+            return "title"
+
+    with patch("backend.preference_filter.PreferenceFilter.from_db", return_value=_Filter()):
+        assert _check_eligibility(None, "Sales", "", "desc") == (False, "title")

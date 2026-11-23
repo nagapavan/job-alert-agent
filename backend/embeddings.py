@@ -448,6 +448,14 @@ def embed_texts(texts: Sequence[str], settings: Optional[dict] = None) -> List[L
             if not backend.available():
                 continue
             vectors = backend.embed(texts)
+            wrong = next((len(v) for v in vectors if len(v) != EMBEDDING_DIM), None)
+            if wrong is not None:
+                # A model whose native width differs from the stored schema would poison
+                # every vector table; reject it and let the chain fall through (finding 92).
+                raise ValueError(
+                    f"backend {backend.name} returned a {wrong}-d vector; "
+                    f"expected {EMBEDDING_DIM}"
+                )
         except Exception as exc:  # noqa: BLE001 - chain deliberately swallows per-backend errors
             last_error = exc
             logger.debug("Embedding backend %s failed: %s", backend.name, exc)

@@ -195,3 +195,14 @@ def test_derive_strengths_gaps_partials_kept_when_not_padded():
     assert partials == ["Embeddings", "Agentic AI"]
     s_lower = {s.lower() for s in strengths}
     assert not any(p.lower() in s_lower for p in partials)
+
+
+def test_default_scoring_config_tracks_the_dataclass():
+    """The stored-config defaults are derived from ScoringConfig, so a dataclass change
+    cannot be silently overridden at runtime (finding 82)."""
+    from backend.database import DEFAULT_SCORING_CONFIG
+    from backend.match_scoring import ScoringConfig
+
+    cfg = ScoringConfig()
+    for name in cfg.__dataclass_fields__:
+        assert DEFAULT_SCORING_CONFIG[name] == getattr(cfg, name)

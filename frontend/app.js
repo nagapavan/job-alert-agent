@@ -558,7 +558,7 @@ function renderDynamicCityPills(countryKey) {
             const active = selected.has(hub.toLowerCase());
             const cls = active ? "city-pill active" : "city-pill";
             const label = active ? `✓ ${escapeHTML(hub)}` : `+ ${escapeHTML(hub)}`;
-            return `<button type="button" class="${cls}" onclick="addCityKeyword('${escapeHTML(hub)}')"${active ? ' title="Already selected"' : ''}>${label}</button>`;
+            return `<button type="button" class="${cls}" data-action="add-city" data-city="${escapeHTML(hub)}"${active ? ' title="Already selected"' : ''}>${label}</button>`;
         }).join(" ")}
     `;
 
@@ -2585,7 +2585,7 @@ function renderTrendingChips() {
         if (isTracked) {
             return `<button type="button" class="chip-btn tracked" disabled title="Currently monitored">✓ ${escapeHTML(item.name)}</button>`;
         } else {
-            return `<button type="button" class="chip-btn" onclick="quickAddCompany('${escapeHTML(item.name)}')">➕ ${escapeHTML(item.name)}</button>`;
+            return `<button type="button" class="chip-btn" data-action="quick-add-company" data-company="${escapeHTML(item.name)}">➕ ${escapeHTML(item.name)}</button>`;
         }
     }).join("");
 }
@@ -2818,7 +2818,7 @@ function renderCompanies() {
                 </div>
                 <div class="company-list-right">
                     <button class="btn btn-sm btn-primary" onclick="scrapeCompanyJobs(${c.id})" title="Scan this company's career portal for new jobs">⚡ Scan</button>
-                    <button class="btn btn-sm btn-outline" onclick="scanAndOpenCompanyRadar(${c.id}, '${escapeHTML(c.name)}', this)" title="Scan ${escapeHTML(c.name)} and open Opportunity Radar">🛰️ Radar</button>
+                    <button class="btn btn-sm btn-outline" data-action="scan-company-radar" data-company-id="${c.id}" data-company="${escapeHTML(c.name)}" title="Scan ${escapeHTML(c.name)} and open Opportunity Radar">🛰️ Radar</button>
                     <button class="btn btn-sm btn-outline" onclick="openEditCompanyModal(${c.id})" title="Edit Careers Portal URL / Domain">✏️ Edit</button>
                     <button class="btn btn-sm btn-outline" onclick="refreshCompanyIntel(${c.id})" title="Refresh Web Intelligence">🔄</button>
                     <button class="btn btn-sm btn-danger" onclick="deleteCompany(${c.id})" title="Remove Company">🗑️</button>
@@ -2849,7 +2849,7 @@ function renderCompanies() {
                     </div>
                     <div class="company-card-actions">
                         <button class="btn btn-sm btn-primary" onclick="scrapeCompanyJobs(${c.id})" title="Scan this company's career portal for new jobs">⚡ Scan</button>
-                        <button class="btn btn-sm btn-outline" onclick="scanAndOpenCompanyRadar(${c.id}, '${escapeHTML(c.name)}', this)" title="Scan ${escapeHTML(c.name)} and open Opportunity Radar">🛰️ Radar</button>
+                        <button class="btn btn-sm btn-outline" data-action="scan-company-radar" data-company-id="${c.id}" data-company="${escapeHTML(c.name)}" title="Scan ${escapeHTML(c.name)} and open Opportunity Radar">🛰️ Radar</button>
                         <button class="btn btn-sm btn-outline" onclick="openEditCompanyModal(${c.id})" title="Edit Careers Portal URL / Domain">✏️</button>
                         <button class="btn btn-sm btn-outline" onclick="refreshCompanyIntel(${c.id})" title="Refresh Web Intelligence">🔄</button>
                         <button class="btn btn-sm btn-danger" onclick="deleteCompany(${c.id})" title="Remove Company">🗑️</button>
@@ -3652,9 +3652,10 @@ function openJobDetailsModal(jobId) {
     `;
 
     // Load Tech Stack Alignment Matrix & Hiring Team
-    loadJobSkillsAlignment(job.id);
-    loadJobHiringTeam(job.id);
-    loadJobActivity(job.id);
+    const seq = ++modalLoadSeq;
+    loadJobSkillsAlignment(job.id, seq);
+    loadJobHiringTeam(job.id, seq);
+    loadJobActivity(job.id, seq);
 
     // Reset active tab to Match
     const firstTabBtn = document.querySelector('.modal-tab-btn[data-tab="match"]');
@@ -3667,7 +3668,7 @@ function openJobDetailsModal(jobId) {
     maybeRescoreStaleJob(job);
 }
 
-async function loadJobSkillsAlignment(jobId) {
+async function loadJobSkillsAlignment(jobId, seq = null) {
     const matchedContainer = document.getElementById("modal-matched-skills-grid");
     const gapContainer = document.getElementById("modal-gap-skills-grid");
     const badge = document.getElementById("modal-stack-badge");
@@ -3684,6 +3685,7 @@ async function loadJobSkillsAlignment(jobId) {
         const res = await fetch(`${API_BASE}/api/jobs/${jobId}/skills-alignment`);
         if (!res.ok) throw new Error("Failed to load skills alignment");
         const data = await res.json();
+        if (seq !== null && seq !== modalLoadSeq) return;
 
         const hasStackScore = data.compatibility_pct !== null && data.compatibility_pct !== undefined;
         if (badge) badge.innerText = hasStackScore ? `${data.compatibility_pct}% Stack Match` : "Not analyzed";
@@ -3702,7 +3704,7 @@ async function loadJobSkillsAlignment(jobId) {
 
         if (data.gap_skills && data.gap_skills.length > 0) {
             gapContainer.innerHTML = data.gap_skills.map(s => `
-                <span class="skill-chip-gap" onclick="bridgeSkillGapInTailoring('${escapeHTML(s.name)}')" title="Click to include ${escapeHTML(s.name)} in resume tailoring tips">
+                <span class="skill-chip-gap" data-action="bridge-skill-gap" data-skill="${escapeHTML(s.name)}" title="Click to include this skill in resume tailoring tips">
                     ⚡ ${escapeHTML(s.name)} <span style="font-size:10px; opacity:0.7;">+ Tailor</span>
                 </span>
             `).join("");
@@ -3710,11 +3712,12 @@ async function loadJobSkillsAlignment(jobId) {
             gapContainer.innerHTML = '<span style="font-size:12px; color:#a6e3a1;">🎉 Full stack alignment! All detected key requirements exist in your profile.</span>';
         }
     } catch (e) {
+        if (seq !== null && seq !== modalLoadSeq) return;
         matchedContainer.innerHTML = '<span style="font-size:12px; color:var(--text-dim);">Could not compute stack alignment.</span>';
     }
 }
 
-async function loadJobActivity(jobId) {
+async function loadJobActivity(jobId, seq = null) {
     const container = document.getElementById("modal-activity-timeline");
     if (!container || !jobId) return;
     container.innerHTML = '<span style="font-size:12px; color:var(--text-dim);">Loading activity…</span>';
@@ -3723,6 +3726,7 @@ async function loadJobActivity(jobId) {
         const res = await fetch(`${API_BASE}/api/jobs/${jobId}/events`);
         if (!res.ok) throw new Error("Failed to load activity");
         const events = await res.json();
+        if (seq !== null && seq !== modalLoadSeq) return;
         if (!events.length) {
             container.innerHTML = '<span style="font-size:12px; color:var(--text-dim);">No recorded activity for this role yet.</span>';
             renderJobEvidence(null);
@@ -3733,6 +3737,7 @@ async function loadJobActivity(jobId) {
         renderJobEvidence(ordered[0], ordered.length);
         renderActivityTimeline(container, ordered);
     } catch (e) {
+        if (seq !== null && seq !== modalLoadSeq) return;
         container.innerHTML = '<span style="font-size:12px; color:var(--text-dim);">Could not load activity history.</span>';
     }
 }
@@ -3802,7 +3807,7 @@ function renderJobEvidence(latestEvent, totalCount) {
     if (tabBtn && totalCount) tabBtn.innerText = `🕑 Activity (${totalCount})`;
 }
 
-async function loadJobHiringTeam(jobId) {
+async function loadJobHiringTeam(jobId, seq = null) {
     const container = document.getElementById("modal-hiring-team-list");
     if (!container || !jobId) return;
     container.innerHTML = '<div style="padding:15px; text-align:center; color:var(--text-dim);"><div class="spinner" style="margin:0 auto 8px auto;"></div>Locating hiring team and recruiters...</div>';
@@ -3811,6 +3816,7 @@ async function loadJobHiringTeam(jobId) {
         const res = await fetch(`${API_BASE}/api/jobs/${jobId}/hiring-team`);
         if (!res.ok) throw new Error("Failed to load hiring team");
         const data = await res.json();
+        if (seq !== null && seq !== modalLoadSeq) return;
 
         if (!data.contacts || data.contacts.length === 0) {
             container.innerHTML = `
@@ -3839,7 +3845,7 @@ async function loadJobHiringTeam(jobId) {
                                 👤 Profile ↗
                             </a>
                         ` : ''}
-                        <button class="btn btn-sm btn-primary" style="font-size:11px; padding:4px 8px;" onclick="draftRecruiterOutreachFromContact('${escapeHTML(c.author_name)}', '${escapeHTML(state.activeJobModal?.title || '')}', '${escapeHTML(data.company_name)}')" title="Draft personalized recruiter outreach note">
+                        <button class="btn btn-sm btn-primary" style="font-size:11px; padding:4px 8px;" data-action="draft-outreach" data-name="${escapeHTML(c.author_name)}" data-title="${escapeHTML(state.activeJobModal?.title || '')}" data-company="${escapeHTML(data.company_name)}" title="Draft personalized recruiter outreach note">
                             💬 Draft Note
                         </button>
                     </div>
@@ -3847,6 +3853,7 @@ async function loadJobHiringTeam(jobId) {
             `;
         }).join("");
     } catch (e) {
+        if (seq !== null && seq !== modalLoadSeq) return;
         container.innerHTML = `<div style="color:var(--text-dim); padding:10px;">Could not load hiring contacts.</div>`;
     }
 }
@@ -4913,6 +4920,9 @@ async function triggerSyncAll() {
 
 let isApplyingJob = false;
 let extensionBridgeReady = false;
+// Guards the dossier loaders: opening job B must not let job A's slow responses paint into
+// B's panels (finding 176).
+let modalLoadSeq = 0;
 
 // The extension's dashboard bridge announces itself on load. Absence of that message is
 // what tells us to fall back to window.open + the materials drawer.
@@ -4923,6 +4933,38 @@ window.addEventListener("message", (event) => {
         extensionBridgeReady = true;
     } else if (event.data.type === "APPLY_SUBMITTED" && event.data.jobId) {
         confirmSubmission(event.data.jobId);
+    }
+});
+
+// Value-bearing actions are bound through data attributes instead of inline `onclick`:
+// escapeHTML turns an apostrophe into `&#039;`, which the HTML parser decodes back to `'`
+// before JS parses the attribute, so the old `onclick="f('...')"` broke (and could inject)
+// on any value containing a quote (finding 177).
+document.addEventListener("click", (event) => {
+    const el = event.target.closest("[data-action]");
+    if (!el) return;
+    const data = el.dataset;
+    switch (data.action) {
+        case "copy-answer":
+            copyToClipboard(data.answer || "");
+            break;
+        case "bridge-skill-gap":
+            bridgeSkillGapInTailoring(data.skill || "");
+            break;
+        case "add-city":
+            addCityKeyword(data.city || "");
+            break;
+        case "quick-add-company":
+            quickAddCompany(data.company || "");
+            break;
+        case "scan-company-radar":
+            scanAndOpenCompanyRadar(Number(data.companyId), data.company || "", el);
+            break;
+        case "draft-outreach":
+            draftRecruiterOutreachFromContact(
+                data.name || "", data.title || "", data.company || ""
+            );
+            break;
     }
 });
 
@@ -4955,16 +4997,32 @@ function openApplyInBrowser(jobs) {
     });
 }
 
-function openApplyFallback(jobs) {
+function openApplyFallback(jobs, popup = null) {
+    let target = popup;
     jobs.forEach((job) => {
-        if (job && job.url) window.open(job.url, "_blank");
+        if (!job || !job.url) return;
+        if (target && !target.closed) {
+            try {
+                target.location.href = job.url;
+            } catch (e) {
+                window.open(job.url, "_blank");
+            }
+        } else {
+            window.open(job.url, "_blank");
+        }
+        target = null;
     });
     openMaterialsDrawer(jobs);
 }
 
 async function confirmSubmission(jobId) {
     try {
-        await fetch(`${API_BASE}/api/jobs/${jobId}/confirm-submission`, { method: "POST" });
+        const res = await fetch(`${API_BASE}/api/jobs/${jobId}/confirm-submission`, { method: "POST" });
+        // A 404/401/500 is not a confirmation: the row's Submitted badge is driven by this
+        // flag, so a false toast would mislabel it permanently (finding 174).
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+        }
         showToast("✅ Submission confirmed.");
         await fetchJobs();
     } catch (e) {
@@ -5069,6 +5127,10 @@ async function launchApply(jobId) {
         showToast("⏳ Opening application session, please wait...");
         return;
     }
+    // Open a blank tab synchronously, inside the click gesture, then navigate it once the
+    // materials arrive. Calling window.open after an await is outside the gesture, so
+    // Chrome blocks it and the old code still reported success (finding 173).
+    const popup = window.open("about:blank", "_blank");
     isApplyingJob = true;
     startFastQueuePolling();
     try {
@@ -5076,19 +5138,27 @@ async function launchApply(jobId) {
         const res = await fetch(`${API_BASE}/api/jobs/${jobId}/apply`, { method: "POST" });
         const data = await res.json();
         if (!res.ok) {
+            if (popup && !popup.closed) popup.close();
             showToast(`⚠️ ${data.detail || data.message || "Could not prepare the application"}`);
             return;
         }
         const jobs = [data.apply];
         const result = await openApplyInBrowser(jobs);
         if (result.ok) {
+            if (popup && !popup.closed) popup.close();
             showToast(`🚀 Opening '${data.apply.title}' in your browser.`);
         } else {
-            openApplyFallback(jobs);
-            showToast("Opened the application and materials (extension not available).");
+            openApplyFallback(jobs, popup);
+            const opened = popup && !popup.closed;
+            showToast(
+                opened
+                    ? "Opened the application and materials (extension not available)."
+                    : "Materials ready below — your browser blocked the job tab. Allow pop-ups, then reopen."
+            );
         }
         await fetchJobs();
     } catch (e) {
+        if (popup && !popup.closed) popup.close();
         showToast("⚠️ Could not connect to agent backend.");
     } finally {
         stopFastQueuePolling();
@@ -5509,7 +5579,7 @@ function renderQAMemory(items) {
                         ${simBadge}
                     </div>
                     <div style="display: flex; gap: 6px;">
-                        <button type="button" class="btn btn-sm btn-outline" style="padding: 2px 8px; font-size: 11px;" onclick="copyToClipboard('${escapeHTML((item.answer_text || item.answer || '').replace(/'/g, "\\'"))}')">📋 Copy</button>
+                        <button type="button" class="btn btn-sm btn-outline" style="padding: 2px 8px; font-size: 11px;" data-action="copy-answer" data-answer="${escapeHTML(item.answer_text || item.answer || '')}">📋 Copy</button>
                         <button type="button" class="btn btn-sm btn-outline text-danger" style="padding: 2px 8px; font-size: 11px;" onclick="deleteQAMemoryItem(${item.id})">✕</button>
                     </div>
                 </div>

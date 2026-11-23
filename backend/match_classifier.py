@@ -168,19 +168,20 @@ def extract_match_features(
         must_reqs = [r for r in reqs if r.category == "must_have"]
         nice_reqs = [r for r in reqs if r.category == "nice_to_have"]
 
-        must_count = len(must_reqs)
-        nice_count = len(nice_reqs)
+        # Only judgeable requirements count toward the must/nice totals and coverage: an
+        # all-unknown posting is not a zero-coverage posting, so it must not trip the
+        # must-have floor (finding 87).
+        known_must = [r for r in must_reqs if r.status in KNOWN_STATUSES]
+        known_nice = [r for r in nice_reqs if r.status in KNOWN_STATUSES]
+        must_count = len(known_must)
+        nice_count = len(known_nice)
 
-        def _coverage(items):
-            # Same contract as match_scoring._coverage: weighted credit per status
-            # (partial = CREDIT[PARTIAL]) over the requirements that can be judged.
-            known = [r for r in items if r.status in KNOWN_STATUSES]
-            if not known:
-                return None
-            return sum(CREDIT[r.status] for r in known) / len(known)
+        # One coverage implementation (finding 88): delegate to match_scoring so weights
+        # cannot diverge between the classifier features and compute_match.
+        from backend.match_scoring import ScoringConfig, _coverage as _scoring_coverage
 
-        must_cov = _coverage(must_reqs)
-        nice_cov = _coverage(nice_reqs)
+        must_cov = _scoring_coverage(known_must, ScoringConfig())
+        nice_cov = _scoring_coverage(known_nice, ScoringConfig())
         must_coverage = must_cov or 0.0
         nice_coverage = nice_cov or 0.0
 
@@ -215,11 +216,8 @@ def extract_match_features(
 
 # Skill vocabulary, aliases and concept groups come from the curated taxonomy
 # (data/skill_taxonomy.json) so the vocabulary can grow without code changes.
+from backend import skill_taxonomy as _taxonomy
 from backend.skill_taxonomy import (
-    AMBIGUOUS_SKILLS as _AMBIGUOUS_SKILLS,
-    CLOUD_PROVIDERS as _CLOUD_PROVIDERS,
-    CONCEPT_GROUPS as _CONCEPT_GROUPS,
-    DISPLAY_SKILLS as _DISPLAY_SKILLS,
     alias_surfaces as _alias_surfaces,
     normalize_skill as _normalize_skill,
 )
@@ -301,7 +299,7 @@ def _resume_skill_scan(resume_text: str) -> "set[str]":
     """Skills detected from raw resume text (union of canonical + alias surfaces)."""
     lowered = (resume_text or "").lower()
     found = set()
-    for s in _DISPLAY_SKILLS:
+    for s in _taxonomy.DISPLAY_SKILLS:
         if any(p.search(lowered) for p in _skill_patterns(s)):
             found.add(_normalize_skill(s))
     return found
@@ -373,7 +371,7 @@ def build_deterministic_assessment(
 
     seen = set()
     cloud_hits = []
-    for skill in _DISPLAY_SKILLS:
+    for skill in _taxonomy.DISPLAY_SKILLS:
         norm = _normalize_skill(skill)
         if norm in seen or norm in tech_required:
             continue
@@ -381,7 +379,7 @@ def build_deterministic_assessment(
         # "genai" -> LLM, "prompt design" -> Prompt Engineering). Skills whose name is also an
         # ordinary word are matched against the original-case text instead, so prose does not
         # become a requirement (issue #50).
-        if norm in _AMBIGUOUS_SKILLS:
+        if norm in _taxonomy.AMBIGUOUS_SKILLS:
             m = _ambiguous_skill_match(jd_scan, skill)
         else:
             m = None
@@ -395,11 +393,11 @@ def build_deterministic_assessment(
         category = _category_at(m.start())
         if norm in resume_skills:
             status = MET
-        elif _CONCEPT_GROUPS.get(norm, set()) & resume_skills:
+        elif _taxonomy.CONCEPT_GROUPS.get(norm, set()) & resume_skills:
             status = PARTIAL
         else:
             status = MISSING
-        if norm in _CLOUD_PROVIDERS:
+        if norm in _taxonomy.CLOUD_PROVIDERS:
             cloud_hits.append((skill, category, status))
             continue
         reqs.append(
@@ -437,12 +435,15 @@ def build_deterministic_assessment(
         ):
             if _is_title_phrase(item["text"], job_title):
                 continue
+            # A residual the resume evidences at full token overlap is MET, not PARTIAL;
+            # partial is only for weaker evidence (finding 96).
+            support = float(item.get("score") or 0.0)
             reqs.append(
                 RequirementItem(
                     text=item["text"],
                     kind="skill",
                     category=item["category"],
-                    status=PARTIAL,
+                    status=MET if support >= 0.999 else PARTIAL,
                     evidence=item.get("evidence", ""),
                 )
             )
@@ -520,9 +521,14 @@ def build_deterministic_assessment(
     job_sen = jd_signals.seniority_level(job_title or "")
     cand_sen = resume_signals.latest_seniority(parsed_resume)
     if job_sen and job_sen != "unknown":
-        jr = _SENIORITY_RANK.get(job_sen, 3)
-        cr = _SENIORITY_RANK.get(cand_sen, 3)
-        status = MET if cr >= jr else (PARTIAL if cr == jr - 1 else MISSING)
+        # An unreadable resume (no parseable roles) is not a senior. Do not let the
+        # `_SENIORITY_RANK` default turn "unknown" into a silent MET.
+        if not cand_sen or cand_sen == "unknown" or cand_sen not in _SENIORITY_RANK:
+            status = UNKNOWN
+        else:
+            jr = _SENIORITY_RANK.get(job_sen, 3)
+            cr = _SENIORITY_RANK.get(cand_sen, 3)
+            status = MET if cr >= jr else (PARTIAL if cr == jr - 1 else MISSING)
         reqs.append(
             RequirementItem(
                 text=f"{job_sen} level", kind="seniority", category=MUST_HAVE, status=status

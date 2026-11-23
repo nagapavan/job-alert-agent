@@ -264,10 +264,15 @@ def extract_residual_requirements(
         if is_generic_phrase(phrase):
             # Chrome, not a skill: neither credited nor queued for review (issue #98).
             continue
-        supported, _score, how = resume_supports(phrase, resume_text, resume_chunks)
+        supported, score, how = resume_supports(phrase, resume_text, resume_chunks)
         if supported:
             results.append(
-                {"text": phrase, "category": category, "evidence": f"resume:{how}"}
+                {
+                    "text": phrase,
+                    "category": category,
+                    "evidence": f"resume:{how}",
+                    "score": round(float(score), 4),
+                }
             )
         else:
             skill_taxonomy.record_skill_candidate(phrase)

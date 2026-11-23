@@ -258,11 +258,9 @@ def _score_job_with_engine(
 
     # A deterministic *error* always falls back (per requirement); a clean "no requirements"
     # result on a non-JD discovery artifact does not, so it does not burn an LLM call.
-    if (
-        DETERMINISTIC_BULK_SCORING
-        and not det_errored
-        and not _looks_like_job_description(description)
-    ):
+    if not det_errored and not _looks_like_job_description(description):
+        # Applies with the deterministic path off too: a discovery artifact must not burn a
+        # bounded LLM call (finding 91).
         return unscored
 
     # Bounded LLM fallback for signal-less JDs the deterministic extractor cannot use.
@@ -453,23 +451,26 @@ def _deterministic_match(
         }
 
     except Exception as classifier_err:
+        # Re-raise so the caller can mark this a *deterministic error* (det_errored) and
+        # still fall back to the LLM. Swallowing it here made a genuine bug
+        # indistinguishable from "no requirements" (finding 86).
         logger.warning(
             f"Classifier-based scoring failed: {classifier_err}; falling back to LLM"
         )
-        return None
+        raise
 
 def _check_eligibility(db, job_title: str, location: str, description: str) -> tuple[bool, Optional[str]]:
     """Checks if the job is eligible based on user preferences."""
     try:
-        # Check location eligibility if provided
-        if (location or "").strip():
-            from backend.preference_filter import PreferenceFilter
+        # Evaluate even when the posting carries no location: title, skip-topic and work-mode
+        # filters still apply, and a blank location must not exempt a posting (finding 95).
+        from backend.preference_filter import PreferenceFilter
 
-            reason = PreferenceFilter.from_db(db).rejection_reason(
-                job_title, location, description
-            )
-            if reason:
-                return False, reason
+        reason = PreferenceFilter.from_db(db).rejection_reason(
+            job_title, location, description
+        )
+        if reason:
+            return False, reason
     except Exception as e:
         logger.debug(f"Eligibility check skipped: {e}")
     return True, None

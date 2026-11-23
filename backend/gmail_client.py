@@ -3,7 +3,8 @@ Gmail API client (BYOK OAuth, opt-in, privacy-scoped).
 
 Design principles (see plan §/docs):
 - Never enumerate the mailbox: every messages.list call carries a narrow `q` and `maxResults`.
-- Fetch metadata + snippet only (never full message bodies).
+- Fetch metadata and snippets; a message classified as a job alert may also be fetched with a
+  bounded body so the posting can be read (never the whole mailbox).
 - Read-only scope; refresh token stored encrypted via backend.config.
 - Google API libraries are imported lazily so the app and tests run without them installed.
 """

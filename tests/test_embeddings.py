@@ -79,12 +79,14 @@ class TestChainResolution:
 
             def embed(self, texts):
                 calls["used"] = True
-                return [[0.5, 0.5] for _ in texts]
+                from backend.config import EMBEDDING_DIM
+
+                return [[0.5] * EMBEDDING_DIM for _ in texts]
 
         monkeypatch.setattr(embeddings, "resolve_backends", lambda settings=None: [_FakeBackend()])
         out = embed_texts(["hello"])
         assert calls.get("used") is True
-        assert out == [[0.5, 0.5]]
+        assert out == [[0.5] * len(out[0])]
 
     def test_empty_batch_returns_empty(self):
         assert embed_texts([]) == []
@@ -389,3 +391,22 @@ class TestOnnxSingletons:
         chain.clear()
 
         assert resolve_backends(settings) != []
+
+
+def test_wrong_dimension_backend_is_rejected(monkeypatch):
+    """A backend whose native width differs from the schema must not poison the vectors
+    (finding 92)."""
+    import backend.embeddings as embeddings
+
+    class _WrongWidth:
+        name = "standalone"
+
+        def available(self):
+            return True
+
+        def embed(self, texts):
+            return [[0.5, 0.5] for _ in texts]
+
+    monkeypatch.setattr(embeddings, "resolve_backends", lambda settings=None: [_WrongWidth()])
+    out = embeddings.embed_texts(["hello"])
+    assert len(out[0]) == embeddings.EMBEDDING_DIM

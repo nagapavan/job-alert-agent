@@ -482,3 +482,15 @@ class TestHeadingEmbeddingMemo:
         calls = self._patch(monkeypatch)
         assert si.classify_heading("Minimum Qualifications", "jd") == "required"
         assert calls["n"] == 0
+
+
+class TestPreferenceFilterSectionReset:
+    def test_skip_topic_after_a_non_must_have_heading_does_not_reject(self):
+        """The must-have section ends at the next recognised heading (finding 94)."""
+        pf = PreferenceFilter(PreferenceCriteria(skip_topics=["gym"]))
+        reason = pf.rejection_reason(
+            "Software Engineer",
+            "",
+            "Requirements:\nPython and Go.\n\nPerks:\nfree gym membership",
+        )
+        assert reason is None

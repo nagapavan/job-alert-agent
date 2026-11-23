@@ -9,6 +9,32 @@ import json
 from typing import Any, Dict, List, Optional
 
 
+def _entry_detail(entry: Dict[str, Any]) -> str:
+    """Free-text body of a role/project entry.
+
+    The heuristic parser writes ``details`` and the AI parser allows ``bullets``; older
+    payloads carried ``description``/``summary``. Read all four so a role chunk is never a
+    header line only.
+    """
+    parts: List[str] = []
+    details = entry.get("details")
+    if details:
+        parts.append(str(details).strip())
+    bullets = entry.get("bullets")
+    if bullets:
+        if isinstance(bullets, (list, tuple)):
+            parts.extend(str(b).strip() for b in bullets if str(b).strip())
+        else:
+            parts.append(str(bullets).strip())
+    if not parts:
+        for key in ("description", "summary"):
+            value = entry.get(key)
+            if value:
+                parts.append(str(value).strip())
+                break
+    return " • ".join(p for p in parts if p)
+
+
 def chunk_resume(parsed_json: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
     """Split a parsed resume into embeddable chunks (skills, each role, each project)."""
     parsed = parsed_json or {}
@@ -24,14 +50,14 @@ def chunk_resume(parsed_json: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
             for key in ("title", "company", "dates")
             if exp.get(key)
         )
-        detail = str(exp.get("description") or exp.get("summary") or "").strip()
+        detail = _entry_detail(exp)
         text = f"{header}\n{detail}".strip() if detail else header
         if text:
             chunks.append({"section": "role", "text": text})
 
     for project in parsed.get("projects") or []:
         name = str(project.get("name") or project.get("title") or "").strip()
-        detail = str(project.get("description") or "").strip()
+        detail = _entry_detail(project)
         text = f"{name}\n{detail}".strip() if detail else name
         if text:
             chunks.append({"section": "project", "text": text})

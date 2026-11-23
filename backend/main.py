@@ -1200,12 +1200,18 @@ def _execute_gmail_sync(db: Session, progress_cb: Optional[Callable] = None) -> 
     if error:
         channel_status.record(outcomes, "gmail", channel_status.ERROR, error)
     elif not events:
-        # The API path ran but classified nothing: "nothing to find" is not a success signal
-        # when the operator asked for a sync and got no outcome at all.
-        channel_status.record(
-            outcomes, "gmail", channel_status.DEGRADED_ZERO,
-            f"{messages_matched} message(s) matched, none classified",
-        )
+        # A quiet mailbox is a valid zero. Only matched-but-unclassified mail is a
+        # degradation (finding 63).
+        if messages_matched:
+            channel_status.record(
+                outcomes, "gmail", channel_status.DEGRADED_ZERO,
+                f"{messages_matched} message(s) matched, none classified",
+            )
+        else:
+            channel_status.record(
+                outcomes, "gmail", channel_status.OK,
+                "no matching messages in the window",
+            )
     else:
         channel_status.record(
             outcomes, "gmail", channel_status.OK, f"{len(events)} event(s) classified"
@@ -3783,14 +3789,20 @@ def analyze_job_match_endpoint(
         except Exception as ev_err:
             logger.debug(f"Resume evidence retrieval skipped: {ev_err}")
 
-    det_match_details = _deterministic_match(
-        db,
-        resume_text,
-        description,
-        parsed_resume,
-        job_title=payload.job_title or "",
-        location=payload.location or "",
-    )
+    try:
+        det_match_details = _deterministic_match(
+            db,
+            resume_text,
+            description,
+            parsed_resume,
+            job_title=payload.job_title or "",
+            location=payload.location or "",
+        )
+    except Exception as det_err:
+        # A deterministic crash is an error, not "no requirements": fall through to the
+        # LLM path instead of surfacing a 500 (finding 86).
+        logger.warning(f"Deterministic match errored ({det_err}); using LLM analysis.")
+        det_match_details = None
     if det_match_details:
         return MatchAnalyzeResponse(
             match_score=det_match_details["score"],
@@ -4121,6 +4133,24 @@ def _company_looks_like_a_sentence(name: str) -> bool:
     )
 
 
+def _company_names_match(candidate: str, wanted: str) -> bool:
+    """Word-boundary employer match.
+
+    ``Micron`` matches ``Micron Technology`` but ``Meta`` must not match ``Metabase``
+    (finding 64).
+    """
+    def norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+    a, b = norm(candidate), norm(wanted)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    shorter, longer = sorted((a, b), key=len)
+    return re.search(rf"(?<![a-z0-9]){re.escape(shorter)}(?![a-z0-9])", longer) is not None
+
+
 def _match_job_for_email_event(
     db,
     comp_name: str,
@@ -4162,7 +4192,17 @@ def _match_job_for_email_event(
         if comp_domain:
             companies.append(comp_domain)
     if not companies and comp_name:
-        companies = db.query(Company).filter(Company.name.ilike(f"%{comp_name}%")).all()
+        wanted = comp_name.strip()
+        exact = db.query(Company).filter(Company.name.ilike(wanted)).first()
+        if exact:
+            companies = [exact]
+        else:
+            # Bounded widening, then a word-boundary check in Python: a raw `%name%` scan
+            # files a mail against a different employer ("Meta" -> "Metabase", finding 64).
+            candidates = (
+                db.query(Company).filter(Company.name.ilike(f"%{wanted}%")).all()
+            )
+            companies = [c for c in candidates if _company_names_match(c.name, wanted)]
 
     if requisition_id:
         by_req = [
@@ -5102,7 +5142,10 @@ def _ingest_email_opportunities_to_db(
                 source=source,
                 source_type="Email",
                 status="To Apply",
-                match_score=55.0,
+                # No scorer ran on this opportunity: leave the score unset so the UI does
+                # not band it "Moderate" on a constant (finding 85). The analysis records
+                # provenance only.
+                match_score=None,
                 match_analysis=f"Opportunity detected in Gmail: '{ev.get('subject', '')}'.",
             )
         )

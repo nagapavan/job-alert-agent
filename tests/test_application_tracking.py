@@ -717,6 +717,8 @@ def test_ingest_email_opportunities_creates_and_dedups(db_session):
     assert job.status == "To Apply"
     assert job.source_type == "Email"
     assert job.source == "Gmail Opportunity"
+    # No scorer ran, so the row must not carry a constant score/band (finding 85).
+    assert job.match_score is None
 
     # Same opportunity again -> deduped
     assert _ingest_email_opportunities_to_db(db_session, events) == 0
