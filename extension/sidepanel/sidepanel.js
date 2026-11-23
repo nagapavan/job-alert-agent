@@ -339,7 +339,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (document.getElementById("prof-auth")) document.getElementById("prof-auth").value = prof.workAuthorization || "";
     if (document.getElementById("prof-sponsorship")) document.getElementById("prof-sponsorship").value = prof.sponsorshipRequired || "";
 
-    if (document.getElementById("cfg-backend-url")) document.getElementById("cfg-backend-url").value = data.backendUrl || "http://localhost:8000";
+    if (document.getElementById("cfg-backend-url")) document.getElementById("cfg-backend-url").value = data.backendUrl || DEFAULT_BACKEND_URL;
     if (document.getElementById("cfg-api-key")) document.getElementById("cfg-api-key").value = data.apiKey || "";
     if (document.getElementById("cfg-mode")) document.getElementById("cfg-mode").value = data.mode || "connected";
   }
@@ -394,7 +394,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       sponsorshipRequired: document.getElementById("prof-sponsorship")?.value || ""
     };
 
-    const backendUrl = document.getElementById("cfg-backend-url")?.value.trim() || "http://localhost:8000";
+    const backendUrl = document.getElementById("cfg-backend-url")?.value.trim() || DEFAULT_BACKEND_URL;
     const apiKey = document.getElementById("cfg-api-key")?.value.trim() || "";
     const mode = document.getElementById("cfg-mode")?.value || "connected";
 

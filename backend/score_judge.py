@@ -4,7 +4,7 @@ The judge is an *auditor*, not a scorer: it returns verdicts on the requirement 
 the groundedness of the narrative claims, and the deterministic engine re-scores the
 corrected set. A given verdict set therefore always produces the same number.
 
-Boundaries (see AGENTS.md §10.2 "deterministic-first"):
+Boundaries (see DESIGN.md §10.2 "deterministic-first"):
 
 - never called during discovery or bulk scans — opt-in, one job at a time;
 - never invents requirements (``missing_requirements`` is reported, never scored);

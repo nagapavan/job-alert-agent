@@ -26,7 +26,7 @@ class TestPeriodicScheduler:
         assert updated.interval_hours == 4.5
         assert updated.is_enabled is True
 
-    @patch("backend.main._run_google_jobs_task_runner")
+    @patch("backend.routers.google_jobs._run_google_jobs_task_runner")
     def test_run_job_now_triggers_background_task(self, mock_runner, monkeypatch):
         # Google Jobs is opt-in; this test exercises the scheduled task, not the flag gate.
         import backend.database as dbmod
@@ -63,7 +63,7 @@ class TestSchedulerAPIEndpoints:
         # Reset back to true
         client.patch("/api/scheduler/jobs/sched_linkedin_sync", json={"is_enabled": True})
 
-    @patch("backend.main._run_linkedin_sync_task_runner")
+    @patch("backend.routers.linkedin._run_linkedin_sync_task_runner")
     def test_trigger_scheduled_job_run_endpoint(self, mock_runner, monkeypatch):
         import backend.database as dbmod
         monkeypatch.setattr(dbmod, "is_feature_enabled", lambda db, feature: True)
@@ -76,7 +76,7 @@ class TestSchedulerAPIEndpoints:
         assert data["job_id"] == "sched_linkedin_sync"
         assert "task_id" in data
 
-    @patch("backend.main._run_linkedin_sync_task_runner")
+    @patch("backend.routers.linkedin._run_linkedin_sync_task_runner")
     def test_trigger_run_without_consent_returns_403(self, mock_runner, monkeypatch):
         """A consent-gated job that is skipped must surface 403, not a misleading 404."""
         import backend.database as dbmod
@@ -117,7 +117,7 @@ def test_scheduler_skips_disabled_feature_for_automatic_run(monkeypatch):
     monkeypatch.setattr(dbmod, "has_consent", lambda db, key: False)
     assert scheduler.run_job_now("sched_linkedin_sync") is None
     # A consent-gated channel is still skipped on an explicit "Run now" without consent.
-    with patch("backend.main._run_linkedin_sync_task_runner", return_value={"jobs_found": 0}):
+    with patch("backend.routers.linkedin._run_linkedin_sync_task_runner", return_value={"jobs_found": 0}):
         assert scheduler.run_job_now("sched_linkedin_sync", force=True) is None
 
 
@@ -126,7 +126,7 @@ def test_scheduler_forced_run_proceeds_with_consent(monkeypatch):
     import backend.database as dbmod
     monkeypatch.setattr(dbmod, "is_feature_enabled", lambda db, feature: True)
     monkeypatch.setattr(dbmod, "has_consent", lambda db, key: True)
-    with patch("backend.main._run_linkedin_sync_task_runner", return_value={"jobs_found": 0}):
+    with patch("backend.routers.linkedin._run_linkedin_sync_task_runner", return_value={"jobs_found": 0}):
         assert scheduler.run_job_now("sched_linkedin_sync", force=True) is not None
 
 
@@ -151,7 +151,7 @@ def test_status_from_result_mapping():
     assert scheduler._status_from_result(None) == ("COMPLETED", 0)
 
 
-@patch("backend.main._run_google_jobs_task_runner")
+@patch("backend.routers.google_jobs._run_google_jobs_task_runner")
 def test_scheduled_run_finalizes_completed_status(mock_runner, monkeypatch, tmp_path):
     """Completion replaces RUNNING with COMPLETED and records the item count."""
     import backend.database as dbmod
@@ -166,7 +166,7 @@ def test_scheduled_run_finalizes_completed_status(mock_runner, monkeypatch, tmp_
     assert job.last_items_count == 7
 
 
-@patch("backend.main._run_google_jobs_task_runner")
+@patch("backend.routers.google_jobs._run_google_jobs_task_runner")
 def test_scheduled_run_finalizes_failed_status(mock_runner, monkeypatch, tmp_path):
     import backend.database as dbmod
     import backend.scheduler as sched_mod
@@ -179,7 +179,7 @@ def test_scheduled_run_finalizes_failed_status(mock_runner, monkeypatch, tmp_pat
     assert job.last_status == "FAILED"
 
 
-@patch("backend.main._run_google_jobs_task_runner")
+@patch("backend.routers.google_jobs._run_google_jobs_task_runner")
 def test_scheduled_run_finalizes_skipped_status(mock_runner, monkeypatch, tmp_path):
     """A runner that declines (e.g. browser profile busy) must not be reported as COMPLETED."""
     import backend.database as dbmod

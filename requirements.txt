@@ -1,5 +1,5 @@
 # Pinned for reproducible installs (generated from the project virtualenv).
-# Optional / unofficial extras degrade gracefully when absent (see AGENTS.md §8).
+# Optional / unofficial extras degrade gracefully when absent (see PROJECT_STRUCTURE.md §8).
 fastapi==0.141.1
 uvicorn==0.52.4
 sqlalchemy==2.0.52

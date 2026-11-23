@@ -264,11 +264,11 @@ class PeriodicScheduler:
                 except Exception as fe:
                     logger.debug(f"Feature-flag gate unavailable: {fe}")
 
-        # Import runner functions lazily to avoid circular dependencies
-        from backend.main import (
-            _run_google_jobs_task_runner,
-            _run_linkedin_sync_task_runner
-        )
+        # Imported from the channel modules, not from backend.main: importing the app module
+        # runs init_db() and starts the scheduler as a side effect, which a maintenance script or
+        # a test that reaches run_job_now must not trigger.
+        from backend.routers.google_jobs import _run_google_jobs_task_runner
+        from backend.routers.linkedin import _run_linkedin_sync_task_runner
 
         runner_map = {
             "google_jobs_scan": ("Google Jobs Scheduled Scan", _run_google_jobs_task_runner),

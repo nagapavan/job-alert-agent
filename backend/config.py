@@ -456,6 +456,11 @@ ENABLE_DYNAMIC_MODEL_ROUTING = os.environ.get("ENABLE_DYNAMIC_MODEL_ROUTING", "t
 # 4.0s + 0-50% jitter (applied at call sites). Raise via env for stricter pacing.
 LINKEDIN_AUTOMATION_PACING_SECONDS = float(os.environ.get("LINKEDIN_AUTOMATION_PACING_SECONDS", "4.0"))
 
+# Upper bound on per-sync LinkedIn saved-job detail-page navigations (each fetches the real
+# "About the job" text so the scorer has signal). Keeps a large saved-jobs library from turning
+# one sync into hundreds of page loads; the remainder stay unscored baselines.
+LINKEDIN_SAVED_JOB_DESC_FETCH_LIMIT = int(os.environ.get("LINKEDIN_SAVED_JOB_DESC_FETCH_LIMIT", "25"))
+
 # Self-identifying User-Agent for HTML/index scraping (custom careers pages, Google for Jobs).
 # Public ATS JSON APIs keep the standard browser UA; identifying crawlers is the compliance-
 # relevant part (e.g. Amazon's Agent Policy requires agents to self-identify).

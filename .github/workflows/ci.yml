@@ -31,6 +31,10 @@ jobs:
       - name: JS syntax checks
         run: |
           node -c frontend/app.js
+          node -c frontend/fetch-timeout.js
           node -c extension/js/runtime-adapter.js
           node -c extension/content/ats-autofill.js
           node -c extension/sidepanel/sidepanel.js
+      - name: Frontend behaviour checks
+        run: |
+          node frontend/tests/fetch-timeout.test.js

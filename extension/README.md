@@ -50,6 +50,15 @@ Without it, `/api/health` still succeeds (the badge shows "Connected (API)") whi
 authenticated call returns **401**. Alternatively, allowlist the extension ID via the
 `ALLOWED_EXTENSION_IDS` environment variable to trust that specific origin.
 
+### 5. Backend origin
+
+`js/config.js` holds the default origin (`DEFAULT_BACKEND_URL`), and the live value comes from
+`chrome.storage.local.backendUrl`, which the side panel writes when you edit **Profile → Backend
+URL**. Edit the constant there, not in the individual scripts.
+
+`manifest.json` keeps its `host_permissions` literal on purpose: Chrome does not expand variables
+in the manifest, so that list has to be edited by hand if you move the backend to another port.
+
 
 ---
 
@@ -71,6 +80,7 @@ extension/
 │   ├── ats-autofill.js        # In-DOM scraper & form filler
 │   └── ats-autofill.css       # Floating badge & field highlight styles
 ├── js/
+│   ├── config.js              # Default backend origin, shared by worker and panel
 │   └── runtime-adapter.js     # Hybrid runtime adapter (FastAPI vs Gemini Nano)
 ├── sidepanel/
 │   ├── sidepanel.html         # Multi-tab side panel UI

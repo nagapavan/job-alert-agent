@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
+
+from backend.embeddings import cosine_similarity as _cosine
 
 logger = logging.getLogger("section_intent")
 
@@ -284,7 +287,13 @@ def _prefix_phrase_label(line: str, phrase_map: Dict[str, Sequence[str]]) -> str
 
 
 def _embedding_label(line: str, domain: str) -> str:
-    """Embedding nearest-neighbour fallback; returns 'unknown' when unavailable."""
+    """Embedding nearest-neighbour fallback; returns 'unknown' when unavailable.
+
+    Memoised per thread (see ``_exemplar_vectors`` / ``_remember_label``): the 13 JD exemplars
+    are embedded once per embedding backend, not once per heading line, and a heading text is
+    classified once per backend. Section headings repeat across a corpus, so the fallback used
+    to dominate scoring time (~5 s of a 6.8 s five-posting profile).
+    """
     exemplars = _EMBED_EXEMPLARS.get(domain)
     if not exemplars:
         return "unknown"
@@ -293,19 +302,26 @@ def _embedding_label(line: str, domain: str) -> str:
         return "unknown"
     try:
         from backend import embeddings
+    except Exception as exc:  # noqa: BLE001 - fallback must never break extraction
+        logger.debug("Embedding heading classification skipped: %s", exc)
+        return "unknown"
 
-        labels: List[str] = []
-        vectors: List[List[float]] = []
-        for label, samples in exemplars.items():
-            for sample in samples:
-                labels.append(label)
-                vectors.append(embeddings.embed_text(sample))
+    stamp = embeddings.last_embed_stamp()
+    if stamp is not None:
+        cached = _label_cache().get((stamp, domain, text))
+        if cached is not None:
+            return cached
+
+    try:
+        labels, vectors = _exemplar_vectors(domain, exemplars, embeddings, stamp)
 
         # A non-semantic backend (hash) would produce meaningless similarity. Decided from
         # the vector actually produced, because configuration alone cannot tell whether a
         # configured backend served the request.
         stamp = embeddings.last_embed_stamp()
         if not stamp or stamp[0] == "hash":
+            if stamp is not None:
+                _remember_label((stamp, domain, text), "unknown")
             return "unknown"
 
         query = embeddings.embed_text(text)
@@ -317,22 +333,77 @@ def _embedding_label(line: str, domain: str) -> str:
             return "unknown"
         top_score, top_label = scored[0]
         second = scored[1][0] if len(scored) > 1 else 0.0
+        label = "unknown"
         if top_score >= _EMBED_THRESHOLD and (top_score - second) >= _EMBED_MARGIN:
-            return top_label
+            label = top_label
+        _remember_label((stamp, domain, text), label)
+        return label
     except Exception as exc:  # noqa: BLE001 - fallback must never break extraction
         logger.debug("Embedding heading classification skipped: %s", exc)
     return "unknown"
 
 
-def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
-    if not a or not b:
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = sum(x * x for x in a) ** 0.5
-    nb = sum(y * y for y in b) ** 0.5
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
+# Heading classification runs on background scoring threads, so the memo is thread-local: the
+# embedding stamp it is keyed on is itself per-thread, and no lock is needed.
+_HEADING_CACHE = threading.local()
+# Cap per thread so a long rescore of unique headings cannot grow the memo without bound.
+_HEADING_CACHE_MAX = 4096
+
+
+def _label_cache() -> Dict[Tuple[Tuple[str, str], str, str], str]:
+    cache = getattr(_HEADING_CACHE, "labels", None)
+    if cache is None:
+        cache = {}
+        _HEADING_CACHE.labels = cache
+    return cache
+
+
+def _exemplar_cache() -> Dict[Tuple[Tuple[str, str], str], Tuple[List[str], List[List[float]]]]:
+    cache = getattr(_HEADING_CACHE, "exemplars", None)
+    if cache is None:
+        cache = {}
+        _HEADING_CACHE.exemplars = cache
+    return cache
+
+
+def _remember_label(key: Tuple[Tuple[str, str], str, str], label: str) -> None:
+    cache = _label_cache()
+    if len(cache) >= _HEADING_CACHE_MAX:
+        cache.clear()
+    cache[key] = label
+
+
+def _exemplar_vectors(
+    domain: str,
+    exemplars: Dict[str, Sequence[str]],
+    embeddings,
+    stamp: Optional[Tuple[str, str]],
+) -> Tuple[List[str], List[List[float]]]:
+    """Exemplar labels + vectors for one domain, embedded once per embedding backend."""
+    cache = _exemplar_cache()
+    if stamp is not None:
+        cached = cache.get((stamp, domain))
+        if cached is not None:
+            return cached
+    labels: List[str] = []
+    vectors: List[List[float]] = []
+    for label, samples in exemplars.items():
+        for sample in samples:
+            labels.append(label)
+            vectors.append(embeddings.embed_text(sample))
+    stamp = embeddings.last_embed_stamp()
+    if stamp is not None:
+        # A backend change makes every earlier exemplar vector incomparable.
+        for stale in [k for k in cache if k[0] != stamp]:
+            cache.pop(stale, None)
+        cache[(stamp, domain)] = (labels, vectors)
+    return labels, vectors
+
+
+def reset_heading_cache() -> None:
+    """Drops this thread's heading memo (used by tests and after a backend switch)."""
+    _HEADING_CACHE.labels = {}
+    _HEADING_CACHE.exemplars = {}
 
 
 def classify_heading(line: str, domain: str = "jd") -> str:
@@ -450,6 +521,149 @@ def _sentence_spans(text: str) -> List[Tuple[int, int]]:
     return units
 
 
+# -------------------------------------------------------------
+# Inline (sentence-trailing) preference markers — issue #98
+# -------------------------------------------------------------
+# A posting often marks one requirement nice-to-have without opening a section:
+# "Experience with NATS.IO, Jetstream, or Kafka preferred". Honouring the cue only at the
+# *end* of a unit keeps the mid-sentence case ("Advanced degrees are a plus but not a
+# substitute for shipping") from switching sections.
+_TRAILING_PREFERENCE_RE = re.compile(
+    r"(?:\bis\s+)?\b(?:preferred|a\s+plus|nice\s+to\s+have|nice-to-have|good\s+to\s+have)"
+    r"\s*[.!]?\s*$",
+    re.I,
+)
+
+
+def ends_with_preference_cue(unit: str) -> bool:
+    """True when a requirement unit is marked nice-to-have by a trailing cue."""
+    return bool(_TRAILING_PREFERENCE_RE.search((unit or "").strip()))
+
+
+# -------------------------------------------------------------
+# Leading ATS header chrome — issue #98
+# -------------------------------------------------------------
+# Portal pages render a metadata block above the JD: title, department, location, worker
+# category, job class, posted-date badge, requisition number and the Apply/Save CTAs. It
+# sits before the first heading, which `jd_section_spans` labels `required`, so it used to
+# be mined as requirements ("Full Time", "Professional", "24 days ago", "Apply").
+#
+# The guard is deliberately positive: a leading block is chrome only when at least two of
+# its lines match a metadata shape. A flat JD that opens with a bare skills list matches
+# none of them, so its leading span stays `required` — the reason this is not implemented
+# by demoting all pre-heading text.
+_CHROME_LINE_PATTERNS: Tuple["re.Pattern", ...] = (
+    re.compile(r"^\d+\s+(?:second|minute|hour|day|week|month)s?\s+ago$", re.I),
+    re.compile(r"^(?:posted|updated|published)\b.{0,40}$", re.I),
+    re.compile(
+        r"^(?:requisition|req|job|position|reference|ref)\s*"
+        r"(?:id|no\.?|number|#)?\s*[:#]\s*\S+$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:apply(?: now)?|easy apply|save(?: job)?|share|bookmark|view job|back to results)$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:full[- ]?time|part[- ]?time|contract(?:or)?|internship|temporary|permanent|"
+        r"freelance|seasonal)$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:professional|management|executive|entry[- ]level|mid[- ]level|senior[- ]level|"
+        r"student|graduate|experienced)$",
+        re.I,
+    ),
+    re.compile(r"^(?:remote|on[- ]?site|hybrid)(?:\s*\([^)]*\))?$", re.I),
+)
+
+_CHROME_LOCATION_RE = re.compile(r"^[A-Za-z][A-Za-z .'-]{1,30}(?:,\s*[A-Za-z][A-Za-z .'-]{1,30}){1,3}$")
+_CHROME_REGION_CODE_RE = re.compile(r"^[A-Z]{2,3}$")
+
+
+def _is_location_line(line: str) -> bool:
+    """`City, ST` / `Remote India, IN` — a location, not a comma-separated skill list."""
+    if not _CHROME_LOCATION_RE.match(line):
+        return False
+    parts = [p.strip() for p in line.split(",") if p.strip()]
+    return bool(parts) and bool(_CHROME_REGION_CODE_RE.match(parts[-1]))
+
+
+def _is_chrome_line(line: str) -> bool:
+    stripped = (line or "").strip()
+    if not stripped:
+        return False
+    if any(p.match(stripped) for p in _CHROME_LINE_PATTERNS):
+        return True
+    return _is_location_line(stripped)
+
+
+def _is_prose_line(line: str) -> bool:
+    """A line that opens real JD content (a sentence or a bullet)."""
+    stripped = (line or "").strip()
+    if not stripped:
+        return False
+    if stripped[0] in BULLET_CHARS or re.match(r"^\d+[\.\)]\s", stripped):
+        return True
+    words = stripped.split()
+    if len(words) >= 8:
+        return True
+    return stripped[-1] in ".!?" and len(words) >= 4
+
+
+def leading_header_chrome_end(text: str, max_lines: int = 15, max_filler: int = 2) -> int:
+    """Offset at which the leading ATS metadata block ends (0 when there is none).
+
+    Walks the leading lines until the first heading, prose line, `max_lines`, or the third
+    non-chrome line, and returns the end offset only when the block carries at least two
+    chrome signals. The filler allowance is what lets a department or title line sit inside
+    the block without letting a terse skills list (`Kubernetes` / `Docker` / `AWS`) be read as
+    chrome and stripped.
+    """
+    if not text or "\n" not in text:
+        return 0
+    block_end = 0
+    chrome_signals = 0
+    fillers = 0
+    offset = 0
+    for index, raw in enumerate(text.splitlines(keepends=True)):
+        if index >= max_lines:
+            break
+        offset += len(raw)
+        stripped = raw.strip()
+        if not stripped:
+            block_end = offset
+            continue
+        if _line_heading_label(stripped) is not None or _is_prose_line(stripped):
+            break
+        if _is_chrome_line(stripped):
+            chrome_signals += 1
+        else:
+            fillers += 1
+            if fillers > max_filler:
+                break
+        block_end = offset
+    if chrome_signals < 2 or block_end <= 0 or block_end >= len(text):
+        return 0
+    return block_end
+
+
+def _apply_header_chrome(spans: Sequence[SectionSpan], end: int) -> List[SectionSpan]:
+    """Relabel the leading chrome region as `intro` (already masked by the scorer)."""
+    if end <= 0:
+        return list(spans)
+    result: List[SectionSpan] = [SectionSpan("intro", 0, end)]
+    for span in spans:
+        start = max(span.start, end)
+        if span.end <= start:
+            continue
+        if result[-1].label == span.label:
+            result[-1] = SectionSpan(span.label, result[-1].start, span.end)
+        else:
+            result.append(SectionSpan(span.label, start, span.end))
+    return result
+
+
 def _leading_heading_phrase(unit: str) -> Optional[str]:
     """Label when a sentence *starts* with a known JD heading phrase followed by content.
 
@@ -479,6 +693,14 @@ def _build_spans(
         label = _line_heading_label(unit)
         if label is None and allow_leading_phrase and start > 0:
             label = _leading_heading_phrase(unit.strip())
+        if label is None and current_label != "preferred" and ends_with_preference_cue(unit):
+            # A single requirement marked nice-to-have inline: its own span, then the
+            # surrounding section label resumes.
+            if start > current_start:
+                spans.append(SectionSpan(current_label, current_start, start))
+            spans.append(SectionSpan("preferred", start, end))
+            current_start = end
+            continue
         if label is not None:
             if start > current_start:
                 spans.append(SectionSpan(current_label, current_start, start))
@@ -526,15 +748,18 @@ def jd_section_spans(text: str) -> List[SectionSpan]:
     keep their existing spans untouched (issue #108).
     """
     text = text or ""
+    chrome_end = leading_header_chrome_end(text)
     if "\n" in text:
         line_spans = _build_spans(text, _line_spans(text), allow_leading_phrase=False)
         if len(line_spans) > 1 or not _long_lines_dominate(text):
-            return [s for s in line_spans if s.end > s.start or not line_spans]
+            kept = [s for s in line_spans if s.end > s.start or not line_spans]
+            return _apply_header_chrome(kept, chrome_end)
 
     sentence_spans = _build_spans(
         text, _sentence_spans(text), allow_leading_phrase=True
     )
-    return _merge_adjacent(sentence_spans) or [SectionSpan("required", 0, len(text))]
+    spans = _merge_adjacent(sentence_spans) or [SectionSpan("required", 0, len(text))]
+    return _apply_header_chrome(spans, chrome_end)
 
 
 def label_at(spans: Sequence[SectionSpan], offset: int) -> str:

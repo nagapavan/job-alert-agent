@@ -62,7 +62,7 @@ function normalizeNanoAvailability(value) {
 
 class JobAgentRuntimeAdapter {
   constructor() {
-    this.backendUrl = "http://localhost:8000";
+    this.backendUrl = DEFAULT_BACKEND_URL;
     this.apiKey = "";
     this.mode = "connected"; // "connected" or "standalone"
     this.isConnected = false;

@@ -11,6 +11,7 @@ from pypdf import PdfReader
 # Skill vocabulary is loaded from data/skill_taxonomy.json (curated, extensible data)
 # instead of a hardcoded list. A built-in fallback keeps the app working if it is absent.
 from backend.skill_taxonomy import DISPLAY_SKILLS as COMMON_TECH_SKILLS
+from backend.text_utils import HEADER_PROBE_CHARS
 
 def resume_fingerprint(text: str) -> str:
     """Content fingerprint of a resume, used as its version identity (issue #56).
@@ -430,7 +431,7 @@ def parse_open_source_resume(text: str) -> dict:
     Extracts contact info, summary, experience timeline, education, and skills.
     """
     sections = segment_resume_sections(text)
-    header_text = sections["header"] or text[:400]
+    header_text = sections["header"] or text[:HEADER_PROBE_CHARS]
 
     # 1. Email
     email_match = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", text)
@@ -467,7 +468,7 @@ def parse_open_source_resume(text: str) -> dict:
             name = first
 
     if not name or len(name.split()) < 2:
-        flat_start = " ".join(text[:400].split())
+        flat_start = " ".join(text[:HEADER_PROBE_CHARS].split())
         title_pos = re.search(
             r"\b(Principal|Senior|Lead|Staff|Software\s+Engineer|Developer|Architect|Mobile:|Mail:|Phone:|Email:|Links:)\b",
             flat_start,

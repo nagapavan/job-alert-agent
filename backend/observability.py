@@ -5,12 +5,13 @@ request correlation tracking, LLM audit trails, and log tailing utilities.
 """
 
 import os
+import re
 import sys
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 
 from backend.config import BASE_DIR, LLM_AUDIT_CAPTURE_CONTENT, LLM_AUDIT_MAX_CONTENT_CHARS
 
@@ -236,6 +237,34 @@ def truncate_text(text: str, max_chars: int = 500) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "…"
+
+
+def sanitize_log_details(details: Optional[Union[str, dict, list]]) -> Optional[str]:
+    """
+    Redacts PII/credentials before persisting to OperationLog. Always returns valid JSON text
+    (or None), so callers can safely ``json.loads`` the stored value.
+    """
+    if not details:
+        return None
+    try:
+        raw = details if isinstance(details, str) else json.dumps(details)
+        # Redact common credentials/tokens if present
+        raw = re.sub(
+            r'("?(?:api_key|token|password|secret|refresh_token|client_secret|access_token)"?\s*:\s*)"[^"]+"',
+            r'\1"[REDACTED]"',
+            raw,
+            flags=re.IGNORECASE,
+        )
+        # Redact email addresses in logs
+        raw = re.sub(
+            r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", "[REDACTED_EMAIL]", raw
+        )
+        return raw
+    except Exception:
+        try:
+            return json.dumps(str(details))
+        except Exception:
+            return None
 
 
 def tail_log_file(lines: int = 100, log_path: Optional[Path] = None) -> List[Dict[str, Any]]:

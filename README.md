@@ -195,9 +195,9 @@ Privacy notes: the API path uses a **narrow query** (job-board senders + intervi
 Some discovery channels are **opt-in** and carry terms-of-service / account-risk considerations:
 
 * **LinkedIn automation is opt-in and disabled by default.** It drives your logged-in session and reads its DOM, which may conflict with LinkedIn's User Agreement and can risk account limitations. Enable it under **Settings → Opt-in Discovery Features** only if you accept that risk.
-* **Conservative pacing** is applied (`LINKEDIN_AUTOMATION_PACING_SECONDS`, default 2.5s) with low request volumes to reduce load.
+* **Conservative pacing** is applied (`LINKEDIN_AUTOMATION_PACING_SECONDS`, default 4.0s) with low request volumes to reduce load.
 * **Per-portal opt-in & consent:** high-comfort public-API portals (Greenhouse/Lever/Ashby) are on; unofficial/ambiguous endpoints (SmartRecruiters/Workable/Workday/Uber/custom HTML) and session-driven channels (LinkedIn/Gmail) are **off by default** and must be explicitly enabled in **Settings → Discovery Features**.
-* **Employer blocklist:** companies/domains on `excluded_companies` (default includes **Amazon**, whose Conditions of Use + Agent Policy restrict automated access) are never scanned.
+* **Employer blocklist:** companies/domains on `excluded_companies` (seeded with employers whose own terms forbid automated access — **Amazon**, **Booking.com**, **eBay**, **Target**, **HEINEKEN**) are never scanned.
 * **There is no official, self-serve LinkedIn jobs API for candidates** (LinkedIn's official APIs are partner-only and *publish* jobs). With LinkedIn direct scan off, LinkedIn roles remain discoverable via Gmail job-alert emails and Google for Jobs. See [`docs/ATS_PORTALS.md`](docs/ATS_PORTALS.md). This is **not legal advice** — you are responsible for each site's terms.
 * **Self-identifying User-Agent + `robots.txt`:** HTML/custom scraping sends a descriptive agent UA and honours `robots.txt` (fail-open; override with `JOB_ALERT_AGENT_RESPECT_ROBOTS=false`). Public ATS JSON APIs keep a standard UA.
 * **Legacy data repair:** `python -m backend.scripts.repair_linkedin_saved_jobs [--apply]` fixes malformed LinkedIn saved-job rows ingested before the parser fix (dry-run by default).
@@ -233,11 +233,10 @@ Full documentation map: [`docs/README.md`](docs/README.md). Highlights:
 
 * [`DESIGN_DIAGRAMS.md`](DESIGN_DIAGRAMS.md) — system design, C4 models, 9 data-flow diagrams, and text/ASCII architecture + deployment topology (§19).
 * [`AGENTIC_ARCHITECTURE.md`](AGENTIC_ARCHITECTURE.md) — agentic harness & autonomy model, AI/ML/LLM architecture (model topology, task tiering, reasoning/verifier loop, RAG/vector memory), and prompt-engineering details.
-* [`AGENTS.md`](AGENTS.md) — developer/agent guidelines: package inventory, detailed database schema, performance strategies, security implementation, and a developer onboarding guide.
+* [`AGENTS.md`](AGENTS.md) — the behavioural rulebook (workflow, code-editing and testing rules). Reference material is in [`PROJECT_STRUCTURE.md`](PROJECT_STRUCTURE.md) (module map, schema, packages, onboarding) and design/policy in [`DESIGN.md`](DESIGN.md).
 * [`PROJECT_INDEX.md`](PROJECT_INDEX.md) — file-by-file responsibility index with code examples for every major component.
 * [`docs/GMAIL_API.md`](docs/GMAIL_API.md) — opt-in BYOK Gmail API design.
 * [`docs/ATS_PORTALS.md`](docs/ATS_PORTALS.md) — ATS portal support, filter contract, requisition probing, and roadmap.
 * [`docs/SYNC_ALL_PLAN.md`](docs/SYNC_ALL_PLAN.md) — one-shot "Sync All" orchestrator plan and task tracker.
-* [`docs/antigravity/`](docs/antigravity/README.md) — original planning artifacts (provenance).
 
 A compact topic→document map (architecture, code examples, schema, AI/prompt engineering, packages, performance, security, onboarding) is at the top of [`docs/README.md`](docs/README.md).

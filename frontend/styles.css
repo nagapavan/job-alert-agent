@@ -7,6 +7,9 @@
     --bg-card-hover: rgba(28, 30, 41, 0.9);
     --bg-sidebar: #111218;
     --bg-drawer: #161720;
+    /* Pinned dossier width: matches the 580px slide-over wherever there is room, and only
+       narrows near the 1500px breakpoint where the feed still needs its own space. */
+    --dock-width: clamp(520px, 31vw, 580px);
     --border-color: rgba(255, 255, 255, 0.08);
     --border-highlight: rgba(255, 255, 255, 0.15);
     
@@ -55,6 +58,9 @@ body {
     display: grid;
     grid-template-columns: 280px 1fr;
     height: 100vh;
+    /* A wide card must never push the shell sideways (that hid the sidebar). */
+    min-width: 0;
+    overflow: hidden;
 }
 
 /* Sidebar */
@@ -127,6 +133,16 @@ body {
     display: flex;
     align-items: center;
     gap: 10px;
+}
+
+/* Emoji glyphs are flex children: without a fixed basis a long label squashes them
+   horizontally ("Background Jobs & Queue" did exactly that). */
+.nav-icon {
+    flex: 0 0 auto;
+    width: 18px;
+    display: inline-flex;
+    justify-content: center;
+    line-height: 1;
 }
 
 .nav-item:hover, .nav-item.active {
@@ -242,6 +258,36 @@ body {
     flex-shrink: 0;
 }
 
+/* Email review queue: one actionable row per staged email */
+.email-review-banner {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+}
+
+.email-review-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(6, 182, 212, 0.18);
+}
+
+.email-review-row:first-child {
+    padding-top: 0;
+    border-top: none;
+}
+
+.email-review-footer {
+    display: flex;
+    justify-content: flex-end;
+}
+
+.email-review-row .sync-banner-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
 /* "Reviewing last sync (N)" chip that appears on the feed tab row */
 .review-batch-chip {
     display: inline-flex;
@@ -271,6 +317,8 @@ body {
 .main-content {
     padding: 36px 48px;
     overflow-y: auto;
+    overflow-x: hidden;
+    min-width: 0;
     display: flex;
     flex-direction: column;
     gap: 28px;
@@ -1065,11 +1113,28 @@ body {
     position: relative;
 }
 
+.job-card {
+    cursor: pointer;
+}
+
+.job-card:focus-visible {
+    outline: 2px solid var(--primary-light);
+    outline-offset: 2px;
+}
+
+/* The row whose dossier is open in the dock. */
+.job-card.is-active {
+    border-color: rgba(129, 140, 248, 0.55);
+    box-shadow: inset 0 0 0 1px rgba(129, 140, 248, 0.25);
+}
+
 .job-card:hover {
     background: linear-gradient(145deg, rgba(34, 37, 56, 0.85), rgba(22, 24, 38, 0.95));
     border-color: rgba(99, 102, 241, 0.4);
-    transform: translateY(-1.5px);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+    /* No transform here: lifting the card moves its hit box, so a cursor sitting on the bottom
+       border leaves the card, drops the hover, re-enters — the tile blinks. The lift is faked
+       with the shadow instead, which never affects hit-testing. */
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.42);
 }
 
 .job-card.selected {
@@ -1268,6 +1333,12 @@ body {
     color: #fbbf24;
 }
 
+.status-dropdown.status-interview-scheduling {
+    background: rgba(139, 92, 246, 0.1);
+    border-color: rgba(139, 92, 246, 0.3);
+    color: #a78bfa;
+}
+
 .status-dropdown.status-interview {
     background: rgba(139, 92, 246, 0.15);
     border-color: rgba(139, 92, 246, 0.45);
@@ -1284,6 +1355,18 @@ body {
     background: rgba(239, 68, 68, 0.12);
     border-color: rgba(239, 68, 68, 0.4);
     color: #f87171;
+}
+
+.status-dropdown.status-closed {
+    background: rgba(148, 163, 184, 0.12);
+    border-color: rgba(148, 163, 184, 0.35);
+    color: #cbd5e1;
+}
+
+.status-dropdown.status-withdrawn {
+    background: rgba(100, 116, 139, 0.12);
+    border-color: rgba(100, 116, 139, 0.3);
+    color: #94a3b8;
 }
 
 .status-dropdown.status-archived {
@@ -1893,8 +1976,8 @@ body {
 
 .company-card:hover {
     border-color: var(--border-highlight);
-    box-shadow: var(--shadow-subtle);
-    transform: translateY(-2px);
+    /* Shadow-only hover, like .job-card: a lift moves the hit box and blinks at the border. */
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
 }
 
 .company-card-top {
@@ -2282,6 +2365,104 @@ body {
     overflow-y: auto;
 }
 
+/* Job dossier: a pinned dock on wide screens, a slide-over drawer elsewhere. The dock stays
+   mounted with an empty state so selecting a job never reflows the feed behind it. */
+.modal-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+}
+
+.modal-header-actions .btn-close.is-pinned {
+    background: var(--primary-light);
+    color: var(--primary);
+    border-color: var(--primary);
+}
+
+.dock-empty-state {
+    display: none;
+    margin: auto;
+    max-width: 320px;
+    text-align: center;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.dock-empty-icon {
+    font-size: 40px;
+    opacity: 0.7;
+}
+
+.dock-empty-state h4 {
+    margin: 0;
+    font-size: 15px;
+    color: var(--text-main);
+}
+
+.dock-empty-state p {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+
+/* Card actions keep a max share of the row so the title always has room: at a fixed
+   flex-shrink:0 the action cluster used to squeeze the title to one word per line. */
+.job-actions-right {
+    flex-shrink: 1;
+    max-width: 50%;
+}
+
+.job-info-main {
+    min-width: 300px;
+}
+
+@media (min-width: 1500px) {
+    body.dock-wide .app-container {
+        grid-template-columns: 280px minmax(0, 1fr) var(--dock-width);
+    }
+
+    /* A pinned panel reads like a column, not a modal: tighter padding buys line length. */
+    body.dock-wide #details-modal .modal-drawer {
+        padding: 22px 24px;
+    }
+
+    body.dock-wide #details-modal.drawer-overlay {
+        position: static;
+        width: auto;
+        height: 100vh;
+        padding: 0;
+        background: transparent;
+        backdrop-filter: none;
+        display: flex;
+        justify-content: stretch;
+    }
+
+    /* `hidden` must not collapse the dock on wide screens: it would reflow the feed. */
+    body.dock-wide #details-modal.drawer-overlay.hidden {
+        display: flex;
+    }
+
+    body.dock-wide #details-modal .modal-drawer {
+        width: 100%;
+        box-shadow: none;
+    }
+
+    /* Empty dock: keep the header (pin/close live there), hide the dossier body. */
+    body.dock-wide .modal-drawer:not(.dock-filled) > .modal-tabs,
+    body.dock-wide .modal-drawer:not(.dock-filled) > .modal-body,
+    body.dock-wide .modal-drawer:not(.dock-filled) > .modal-footer,
+    body.dock-wide .modal-drawer:not(.dock-filled) .modal-subtitle,
+    body.dock-wide .modal-drawer:not(.dock-filled) .modal-evidence {
+        display: none;
+    }
+
+    body.dock-wide .modal-drawer:not(.dock-filled) .dock-empty-state {
+        display: flex;
+    }
+}
+
 .modal-header {
     display: flex;
     justify-content: space-between;
@@ -2289,6 +2470,14 @@ body {
     margin-bottom: 20px;
     border-bottom: 1px solid var(--border-color);
     padding-bottom: 16px;
+}
+
+/* The dossier scrolls; keep the title and the ✕ reachable at any scroll position. */
+.modal-drawer .modal-header {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    background: var(--bg-drawer);
 }
 
 .modal-subtitle {
@@ -2319,13 +2508,27 @@ body {
 
 .modal-tabs {
     display: flex;
-    gap: 6px;
+    gap: 2px;
     border-bottom: 1px solid var(--border-color);
-    padding-bottom: 10px;
+    padding-bottom: 0;
     margin-bottom: 18px;
     overflow-x: auto;
+    flex-wrap: wrap;
+    row-gap: 0;
 }
 
+/* The drawer is a flex column: without this the header/tabs/footer are shrunk to fit and the
+   tab bar collapses to a sliver instead of the content scrolling. */
+.modal-drawer > .modal-header,
+.modal-drawer > .modal-tabs,
+.modal-drawer > .modal-footer,
+.modal-drawer > .dock-empty-state {
+    flex: 0 0 auto;
+}
+
+/* Underline tabs: the active state is an accent label over a 2px accent rule that sits on the
+   row's own border, so the tab bar reads as navigation without a container per tab (and survives
+   the wrap to two rows that seven tabs cause in the drawer). */
 .modal-tab-btn {
     background: none;
     border: none;
@@ -2333,17 +2536,30 @@ body {
     font-family: var(--font-stack);
     font-size: 13px;
     font-weight: 500;
-    padding: 6px 12px;
-    border-radius: 8px;
+    padding: 9px 12px 10px;
+    border-radius: 6px 6px 0 0;
     cursor: pointer;
     transition: var(--transition);
     white-space: nowrap;
+    box-shadow: inset 0 -2px 0 transparent;
+}
+
+.modal-tab-btn:hover {
+    color: var(--text-main);
+    background: rgba(255, 255, 255, 0.04);
+    box-shadow: inset 0 -2px 0 var(--border-highlight);
+}
+
+.modal-tab-btn:focus-visible {
+    outline: 2px solid var(--primary-light);
+    outline-offset: 2px;
 }
 
 .modal-tab-btn.active {
-    background: var(--primary-light);
+    background: none;
     color: var(--primary);
     font-weight: 600;
+    box-shadow: inset 0 -2px 0 var(--primary);
 }
 
 .modal-body {
@@ -2398,6 +2614,19 @@ body {
     padding: 16px;
     border-radius: 12px;
     margin-bottom: 12px;
+    /* In the pinned dock the row is narrower than the overlay: let the text keep its width and
+       drop the Re-score button to its own line instead of squeezing every line. */
+    flex-wrap: wrap;
+}
+
+/* The score circle is a div too: it must keep its 56px square (it turned into an ellipse). */
+.match-score-banner > div:not(.match-score-circle) {
+    flex: 1 1 240px;
+    min-width: 0;
+}
+
+.match-score-banner .match-score-circle {
+    flex: 0 0 56px;
 }
 
 /* Score provenance: which resume version produced the number (issue #56). */
@@ -2894,6 +3123,15 @@ body {
     box-shadow: 0 12px 30px rgba(168, 85, 247, 0.55);
 }
 
+/* The dossier dock occupies the right edge; keep the copilot launcher reachable beside it. */
+body.dock-wide .floating-copilot-btn {
+    right: calc(var(--dock-width) + 24px);
+}
+
+body.dock-wide .copilot-drawer {
+    right: var(--dock-width);
+}
+
 .copilot-btn-sparkle {
     font-size: 16px;
     animation: sparkle-glow 2s ease-in-out infinite;
@@ -3379,7 +3617,7 @@ body {
 .sync-channel-card:hover {
     background: rgba(255, 255, 255, 0.05);
     border-color: rgba(137, 180, 250, 0.35);
-    transform: translateY(-2px);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
 }
 
 .sync-channel-info {
@@ -3572,12 +3810,19 @@ body {
     justify-content: space-between;
     align-items: center;
     margin-bottom: 10px;
+    flex-wrap: wrap;
+    gap: 8px;
 }
 
 .stack-title-group {
     display: flex;
     align-items: center;
     gap: 10px;
+    min-width: 0;
+}
+
+.stack-title-group > div {
+    min-width: 0;
 }
 
 .stack-icon {
@@ -3715,6 +3960,43 @@ body {
     font-size: 13px;
     color: var(--text);
     word-break: break-word;
+}
+
+.modal-evidence {
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--text-dim);
+    max-width: 720px;
+    line-height: 1.4;
+    word-break: break-word;
+}
+
+.modal-evidence[data-empty="1"] {
+    opacity: 0.7;
+    font-style: italic;
+}
+
+.activity-history {
+    margin-top: 8px;
+}
+
+.activity-history summary {
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--text-dim);
+    padding: 6px 2px;
+    user-select: none;
+}
+
+.activity-history summary:hover {
+    color: var(--text);
+}
+
+.activity-history-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 6px;
 }
 
 .hiring-team-container {
@@ -4117,4 +4399,169 @@ body {
 .guidance-angle {
     display: block;
     margin-top: 2px;
+}
+
+/* Background Tasks: this section was laid out with inline styles, which no media query can reach,
+   so its 2fr/1fr/1fr grid clipped ~60px as soon as the viewport narrowed. */
+.tasks-section-stack {
+    max-width: 1200px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.tasks-section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    border-bottom: 1px solid #313244;
+    padding-bottom: 15px;
+}
+
+.tasks-top-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr);
+    gap: 20px;
+}
+
+.tasks-queue-metrics {
+    display: grid;
+    /* Two tiles side by side only when the panel is wide enough for both labels. */
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 10px;
+    margin-bottom: 14px;
+}
+
+/* -------------------------------------------------------------
+   Responsive shell
+   The desktop layout is a fixed 280px sidebar plus fixed-column content grids. Those columns stop
+   fitting on narrower viewports (split-screen, tablets, small laptops) and the content gets crushed
+   rather than reflowed, so the shell and the grids collapse in stages.
+   ------------------------------------------------------------- */
+@media (max-width: 1200px) {
+    .app-container {
+        grid-template-columns: 232px minmax(0, 1fr);
+    }
+
+    .main-content {
+        padding: 28px 28px;
+    }
+}
+
+@media (max-width: 1024px) {
+    /* Actions drop below the title instead of squeezing it to one word per line. */
+    .app-header {
+        flex-wrap: wrap;
+        gap: 14px;
+    }
+
+    .welcome-text {
+        flex: 1 1 100%;
+    }
+
+    .header-actions {
+        flex-wrap: wrap;
+    }
+
+    .stats-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    /* Fixed-column content grids stack; auto-fit grids keep their own behaviour. */
+    .profile-dashboard-grid,
+    .settings-preferences-grid,
+    .form-row-2col,
+    .parsed-data-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .tasks-top-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 860px) {
+    /* The sidebar becomes a horizontal nav strip so the content keeps the full width. */
+    .app-container {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: auto minmax(0, 1fr);
+    }
+
+    /* Wrap rather than scroll: six sections in a scrolling strip hid the last ones with no
+       affordance. */
+    .sidebar {
+        flex-direction: row;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px 14px;
+        padding: 12px 16px;
+        border-right: none;
+        border-bottom: 1px solid var(--border-color);
+    }
+
+    .logo-area {
+        margin-bottom: 0;
+        padding-left: 0;
+        flex: 0 0 auto;
+    }
+
+    /* No room for the badge/token stack in a one-line strip. */
+    .logo-subtitle,
+    .sidebar-footer {
+        display: none;
+    }
+
+    .nav-menu {
+        flex-direction: row;
+        flex-wrap: wrap;
+        gap: 6px;
+    }
+
+    .nav-item {
+        padding: 9px 12px;
+        font-size: 13px;
+        white-space: nowrap;
+    }
+
+    .main-content {
+        padding: 20px 18px;
+    }
+
+    .tasks-top-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+@media (max-width: 720px) {
+    /* A job row needs ~570px for its 300px info column plus the action cluster; below that the
+       actions move under the title instead of overflowing the card. */
+    .job-card {
+        flex-wrap: wrap;
+        align-items: flex-start;
+    }
+
+    .job-info-main {
+        min-width: 0;
+    }
+
+    .job-actions-right {
+        max-width: 100%;
+    }
+}
+
+@media (max-width: 640px) {
+    .stats-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .main-content {
+        padding: 16px 14px;
+    }
+
+    .welcome-text h2 {
+        font-size: 22px;
+    }
 }

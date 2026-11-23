@@ -15,6 +15,7 @@ from backend.scraper import (
     probe_smartrecruiters_job_active,
 )
 from backend.playwright_app import (
+    normalize_hirist_status,
     scan_and_sync_hirist_applications,
     sync_email_application_events
 )
@@ -335,9 +336,10 @@ def test_gmail_query_is_narrow():
     assert "newer_than:90d" in GMAIL_QUERY
     assert "from:greenhouse.io" in GMAIL_QUERY
     assert "subject:interview" in GMAIL_QUERY
-    # Opportunity signals (LinkedIn / job alerts) are included for opportunity tracking.
-    assert "from:linkedin.com" in GMAIL_QUERY
-    assert "job alert" in GMAIL_QUERY
+    # Recruiter outreach (LinkedIn message notifications) is in scope; the alert digests are
+    # not — they have their own pass so they cannot starve the status window.
+    assert "from:hit-reply@linkedin.com" in GMAIL_QUERY
+    assert "-from:jobalerts-noreply@linkedin.com" in GMAIL_QUERY
     # All-mail widening: the window covers the full application lifecycle and the
     # major ATS sender domains are included alongside the subject keywords.
     assert "from:workday.com" in GMAIL_QUERY
@@ -536,6 +538,83 @@ def test_apply_email_events_updates_all_application_statuses(db_session):
     ])
     db_session.refresh(backend_job)
     assert backend_job.status == "Rejected"
+
+
+def test_email_posting_closure_is_closed_not_rejected(db_session):
+    """A mail that reports the posting closed must not count as an employer rejection."""
+    from backend.main import _apply_email_events_to_db
+
+    comp = Company(name="InitechClosure", domain="initechclosure.com")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(company_id=comp.id, title="Staff Backend Engineer", url="https://x/close",
+              status="Applied")
+    db_session.add(job)
+    db_session.commit()
+
+    _apply_email_events_to_db(db_session, [{
+        "company": "InitechClosure", "role": "Staff Backend Engineer",
+        "event_type": "rejection", "confidence": 0.95,
+        "subject": "Update on your application",
+        "snippet": "This position has been closed and we are no longer accepting applications.",
+    }])
+    db_session.refresh(job)
+    assert job.status == "Closed"
+    assert job.rejected_at is None
+
+    _apply_email_events_to_db(db_session, [{
+        "company": "InitechClosure", "role": "Staff Backend Engineer",
+        "event_type": "rejection", "confidence": 0.95,
+        "subject": "Update on your application",
+        "snippet": "Unfortunately we have decided to pursue other candidates.",
+    }])
+    db_session.refresh(job)
+    assert job.status == "Rejected"
+    assert job.rejected_at is not None
+
+
+def test_interview_invite_on_a_live_application_lands_in_scheduling(db_session):
+    """An invitation to schedule is recorded as its own stage, not as the interview itself."""
+    from backend.main import _apply_email_events_to_db
+
+    comp = Company(name="GlobexScheduling", domain="globexscheduling.com")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(company_id=comp.id, title="Staff Software Engineer", url="https://x/sched",
+              status="Applied")
+    db_session.add(job)
+    db_session.commit()
+
+    _apply_email_events_to_db(db_session, [{
+        "company": "GlobexScheduling", "role": "Staff Software Engineer",
+        "event_type": "interview", "confidence": 0.9,
+        "subject": "Invitation to interview — please select a time",
+    }])
+    db_session.refresh(job)
+    assert job.status == "Interview Scheduling"
+
+
+def test_normalize_hirist_status_separates_closed_from_rejected():
+    assert normalize_hirist_status("Position closed") == "Closed"
+    assert normalize_hirist_status("Expired") == "Closed"
+    assert normalize_hirist_status("Not Shortlisted") == "Rejected"
+
+
+def test_status_vocabulary_accepts_the_expanded_states():
+    comp = client.post("/api/companies", json={"name": "UmbrellaStatusCo"}).json()
+    job = client.post(
+        "/api/jobs",
+        json={
+            "company_id": comp["id"],
+            "title": "Platform Engineer",
+            "url": "https://x/umbrella-status",
+            "status": "To Apply",
+        },
+    ).json()
+    for status in ("Interview Scheduling", "Closed", "Withdrawn"):
+        res = client.patch(f"/api/jobs/{job['id']}/status", json={"status": status})
+        assert res.status_code == 200
+        assert res.json()["status"] == status
 
 
 def test_apply_email_events_creates_untracked_application(db_session):
@@ -768,17 +847,18 @@ def test_dedupe_gmail_opportunity_jobs_merges_and_preserves_status(db_session):
 
 
 def test_task_events_sse_asyncio_is_available():
-    """Regression: main.py must import asyncio (the SSE endpoint uses it)."""
-    import backend.main as main
-    assert hasattr(main, "asyncio")
+    """Regression: the module owning the SSE endpoint must import asyncio."""
+    import backend.routers.tasks as tasks_router
+    assert hasattr(tasks_router, "asyncio")
 
 
 def test_task_events_sse_route_precedes_dynamic_task_route():
     """Regression: GET /api/tasks/events must be matched by the SSE handler, not
     /api/tasks/{task_id} (which would swallow 'events' and return 404)."""
     from backend.main import app
+    from conftest import route_paths
 
-    paths = [getattr(r, "path", None) for r in app.routes]
+    paths = route_paths(app)
     assert "/api/tasks/events" in paths
     assert "/api/tasks/{task_id}" in paths
     assert paths.index("/api/tasks/events") < paths.index("/api/tasks/{task_id}")
@@ -926,8 +1006,9 @@ def test_api_sync_external_smartrecruiters_probe_closes_closed_posting(mock_prob
         assert any("SmartRecruiters" in d for d in data["details"])
 
         db.refresh(job)
-        assert job.status == "Rejected"
-        assert job.rejected_at is not None
+        # A vanished requisition is a closure, not an employer rejection.
+        assert job.status == "Closed"
+        assert job.rejected_at is None
         events = db.query(ApplicationEvent).filter(ApplicationEvent.job_id == job.id).all()
         assert any(e.event_type == "requisition_closed" for e in events)
     finally:
@@ -941,7 +1022,7 @@ def test_api_sync_external_smartrecruiters_probe_closes_closed_posting(mock_prob
 
 @patch("backend.main.probe_lever_job_active")
 def test_api_sync_external_lever_probe_closes_closed_requisition(mock_probe_lever):
-    """Applied/Shortlisted Lever jobs are auto-rejected when the public API reports closed."""
+    """Applied/Shortlisted Lever jobs are marked Closed when the public API reports closed."""
     mock_probe_lever.return_value = False
     db = TestingSessionLocal()
     comp = None
@@ -971,8 +1052,8 @@ def test_api_sync_external_lever_probe_closes_closed_requisition(mock_probe_leve
         assert any("Lever" in d for d in data["details"])
 
         db.refresh(job)
-        assert job.status == "Rejected"
-        assert job.rejected_at is not None
+        assert job.status == "Closed"
+        assert job.rejected_at is None
 
         events = db.query(ApplicationEvent).filter(ApplicationEvent.job_id == job.id).all()
         assert any(e.event_type == "requisition_closed" for e in events)
@@ -983,3 +1064,103 @@ def test_api_sync_external_lever_probe_closes_closed_requisition(mock_probe_leve
         if comp and comp.id:
             db.query(Company).filter(Company.id == comp.id).delete(synchronize_session=False)
         db.commit()
+
+
+def test_external_sync_log_names_each_status_change(db_session):
+    """The Operations log must name WHICH application moved, not just how many (log readability)."""
+    import json
+    from backend.main import _execute_external_sync, ExternalSyncRequest
+    from backend.database import OperationLog
+
+    comp = Company(name="GlobexReadability", domain="globexreadability.com")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(
+        company_id=comp.id,
+        title="Staff Platform Engineer",
+        url="https://x/spe",
+        status="Shortlisted",
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    changes = []
+    from backend.main import _apply_email_events_to_db
+
+    _apply_email_events_to_db(
+        db_session,
+        [
+            {
+                "company": "GlobexReadability",
+                "role": "Staff Platform Engineer",
+                "event_type": "interview",
+                "subject": "Interview invitation for Staff Platform Engineer",
+            }
+        ],
+        changes,
+    )
+
+    assert len(changes) == 1
+    change = changes[0]
+    assert change["job_id"] == job.id
+    assert change["title"] == "Staff Platform Engineer"
+    assert change["company"] == "GlobexReadability"
+    assert change["from"] == "Shortlisted"
+    # A scheduling email proves an application, not an interview for this requisition
+    # (2026-11-16: rows the operator never applied to were reaching the Interview stage).
+    assert change["to"] == "Applied"
+    assert "Interview invitation" in change["subject"]
+
+
+def test_external_sync_operation_log_carries_structured_changes(db_session, monkeypatch):
+    """details_json must carry the per-job change records the modal renders."""
+    import json
+    from backend.main import _execute_external_sync, ExternalSyncRequest
+    from backend.database import OperationLog
+
+    comp = Company(name="InitechReadability", domain="initechreadability.com")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(
+        company_id=comp.id, title="Backend Engineer", url="https://x/be", status="Applied"
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    events = [
+        {
+            "company": "InitechReadability",
+            "role": "Backend Engineer",
+            "event_type": "rejection",
+            "subject": "Update on your application",
+        }
+    ]
+    monkeypatch.setattr("backend.main.is_gmail_configured", lambda: True)
+    monkeypatch.setattr("backend.main.is_feature_enabled", lambda db, flag: True)
+
+    def _fake_sync(db, stats=None):
+        if stats is not None:
+            stats.update({
+                "messages_matched": 1,
+                "alert_messages_matched": 1,
+                "alerts_had_watermark": True,
+            })
+        return events
+
+    monkeypatch.setattr("backend.main.gmail_client.run_gmail_sync", _fake_sync)
+
+    _execute_external_sync(
+        ExternalSyncRequest(sources=["gmail"], max_pages=1, headless=True), db_session
+    )
+
+    log = (
+        db_session.query(OperationLog)
+        .filter(OperationLog.operation_type == "external_application_sync")
+        .order_by(OperationLog.id.desc())
+        .first()
+    )
+    assert log is not None
+    payload = json.loads(log.details_json)
+    assert payload["status_changes"][0]["job_id"] == job.id
+    assert payload["status_changes"][0]["to"] == "Rejected"
+    assert any("Backend Engineer" in d for d in payload["details"])

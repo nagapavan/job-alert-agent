@@ -22,6 +22,7 @@ data/*
 !data/ats_portals.json
 !data/skill_taxonomy.json
 !data/role_titles.json
+!data/country_hubs.json
 data/resumes/
 *.pdf
 *.docx
@@ -56,6 +57,9 @@ scripts/README.md
 
 # Local reasoning docs (transient, not committed)
 reasoning/*.md
+
+# Local backlog (GitHub issues are no longer used)
+OPEN_ISSUES.md
 
 # backups and audits
 job_alert_agent.db.bak-*

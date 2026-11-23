@@ -956,6 +956,132 @@ def test_legacy_dismissal_without_company_still_matches_role_only(db_session):
     assert hit is not None
 
 
+def test_dismissal_requires_the_rule_to_identify_the_role(db_session):
+    """A rule built only from generic role words may match its exact title and nothing else."""
+    index_dismissed_job_pattern(
+        job_title="Principal Engineer",
+        job_description="Own platform architecture across teams",
+        db=db_session,
+        company_name="Initech",
+    )
+    db_session.commit()
+
+    # Same description (cosine would be ~1.0), but the title adds a role word the rule lacks.
+    assert (
+        check_semantic_dismissal(
+            job_title="Principal Software Engineer",
+            job_description="Own platform architecture across teams",
+            db=db_session,
+            company_name="Initech",
+        )
+        is None
+    )
+
+    exact = check_semantic_dismissal(
+        job_title="Principal Engineer",
+        job_description="Own platform architecture across teams",
+        db=db_session,
+        company_name="Initech",
+    )
+    assert exact is not None
+
+
+def test_dismissal_refuses_a_different_seniority_level(db_session):
+    """Senior and Staff are different roles: the description must not bridge them."""
+    index_dismissed_job_pattern(
+        job_title="Senior Backend Engineer (Ruby)",
+        job_description="Ruby services, Postgres, distributed systems",
+        db=db_session,
+        company_name="Globex",
+    )
+    db_session.commit()
+
+    same_level = check_semantic_dismissal(
+        job_title="Senior Backend Engineer (Ruby)",
+        job_description="Ruby services, Postgres, distributed systems",
+        db=db_session,
+        company_name="Globex",
+    )
+    assert same_level is not None
+
+    for other_title in ("Staff Backend Engineer (Ruby)", "Senior Backend Engineer (Go)"):
+        assert (
+            check_semantic_dismissal(
+                job_title=other_title,
+                job_description="Ruby services, Postgres, distributed systems",
+                db=db_session,
+                company_name="Globex",
+            )
+            is None
+        ), other_title
+
+
+def test_title_similarity_penalises_extra_tokens_on_either_side():
+    """Regression: normalising by the rule's tokens alone let a longer title score 1.0."""
+    from backend.ai_helper import _distinguishing_title_similarity
+
+    short = "Backend Engineer (Ruby)"
+    long = "Backend Engineer (Ruby, Kotlin, Kafka)"
+    assert _distinguishing_title_similarity(short, long) == pytest.approx(0.5)
+    assert _distinguishing_title_similarity(long, short) == pytest.approx(0.5)
+
+
+def test_dismissal_survives_a_different_named_language(db_session):
+    """A rule naming one language must not hide a posting naming another."""
+    index_dismissed_job_pattern(
+        job_title="Backend Engineer (Go)",
+        job_description="Services in Go, Postgres, Kubernetes",
+        db=db_session,
+        company_name="Umbrella",
+    )
+    db_session.commit()
+
+    assert (
+        check_semantic_dismissal(
+            job_title="Backend Engineer (Python)",
+            job_description="Services in Go, Postgres, Kubernetes",
+            db=db_session,
+            company_name="Umbrella",
+        )
+        is None
+    )
+    assert (
+        check_semantic_dismissal(
+            job_title="Backend Engineer (Go)",
+            job_description="Services in Go, Postgres, Kubernetes",
+            db=db_session,
+            company_name="Umbrella",
+        )
+        is not None
+    )
+
+
+def test_apply_dismissal_filter_reports_status_and_reason(db_session):
+    from backend.dismissal import apply_dismissal_filter
+
+    index_dismissed_job_pattern(
+        job_title="Sales Solutions Specialist",
+        job_description="Outreach, RFP drafting, customer demos",
+        db=db_session,
+        company_name="Acme Corp",
+    )
+    db_session.commit()
+
+    hit = apply_dismissal_filter(
+        db_session, "Sales Solutions Specialist", "Client demos", "Acme Corp"
+    )
+    assert hit.dismissed is True
+    assert hit.status == "Not Interested"
+    assert "Sales Solutions Specialist" in hit.analysis
+
+    miss = apply_dismissal_filter(
+        db_session, "Core Infrastructure Rust Engineer", "Kernel modules", "Acme Corp"
+    )
+    assert miss.dismissed is False
+    assert miss.status == "To Apply"
+    assert miss.analysis is None
+
+
 def test_resume_summary_is_collapsed_to_single_line():
     """Regression: per-word line breaks from PDF extraction must be collapsed in the summary."""
     from backend.parser import parse_open_source_resume

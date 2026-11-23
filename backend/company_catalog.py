@@ -6,7 +6,6 @@ file is absent the shipped generic `backend/companies_config.example.json` is us
 app has a working catalog out of the box without hardcoding any real employer names.
 """
 import json
-import math
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -50,17 +49,6 @@ def get_catalog_company(name_or_domain: str) -> Optional[Dict[str, str]]:
             return c
             
     return None
-
-def compute_cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
-    """Calculates cosine similarity between two vector lists."""
-    if not vec1 or not vec2 or len(vec1) != len(vec2):
-        return 0.0
-    dot_product = sum(a * b for a, b in zip(vec1, vec2))
-    norm_a = math.sqrt(sum(a * a for a in vec1))
-    norm_b = math.sqrt(sum(b * b for b in vec2))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return max(0.0, min(1.0, dot_product / (norm_a * norm_b)))
 
 def parse_company_import(content: str, filename: str = "") -> List[Dict[str, str]]:
     """

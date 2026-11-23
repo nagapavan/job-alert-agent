@@ -46,6 +46,23 @@ def _l2_normalize(vector: Sequence[float]) -> List[float]:
     return list(vector)
 
 
+def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
+    """Cosine similarity between two vectors, or 0.0 for empty/mismatched input.
+
+    Unclamped: callers compare against thresholds well above 0, so a negative score is
+    information rather than noise. Length mismatch is treated as "no similarity" instead of
+    silently comparing the shared prefix.
+    """
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 @runtime_checkable
 class EmbeddingBackend(Protocol):
     """Minimal contract every embedding backend satisfies."""

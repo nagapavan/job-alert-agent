@@ -1,4 +1,6 @@
 """Unit tests for deterministic job-description signal parsers."""
+import pytest
+
 from backend.jd_signals import (
     is_over_qualified,
     parse_certifications,
@@ -181,3 +183,47 @@ def test_over_qualified_range_upper_bound():
     hint = {"min_years": 3, "max_years": 5, "scope": "total", "technology": None, "snippet": ""}
     assert is_over_qualified(8, hint) is True
     assert is_over_qualified(5, hint) is False
+
+
+def test_role_suffix_is_not_stripped_as_a_location():
+    """A role qualifier must survive: "Staff Software Engineer - NLP" is not a Hyderabad-style split."""
+    from backend.scraper import _split_role_location
+
+    role, location = _split_role_location("Staff Software Engineer - NLP")
+    assert role == "Staff Software Engineer - NLP"
+    assert location is None
+
+    role, location = _split_role_location("Principal Engineer - Hyderabad")
+    assert role == "Principal Engineer"
+    assert location == "Hyderabad"
+
+    role, location = _split_role_location("Principal Engineer - Remote")
+    assert (role, location) == ("Principal Engineer", "Remote")
+
+
+def test_is_place_name_excludes_gazetteer_alternate_names():
+    from backend.geo import is_place_name
+
+    assert is_place_name("Hyderabad") is True
+    assert is_place_name("London") is True
+    # "NLP" is an alternate name for Mbombela (ZA) - not location evidence in a job title.
+    assert is_place_name("NLP") is False
+    assert is_place_name("EMEA") is False
+
+
+@pytest.mark.parametrize(
+    "word", ["Principal", "Staff", "Senior", "Lead", "Architect", "Manager", "Director", "Engineer"]
+)
+def test_parse_experience_seniority_word_is_never_a_technology(word):
+    """Issue #98: '1+ year in Principal Software Engineering role' is total experience."""
+    hints = parse_experience(f"1+ year in {word} Software Engineering role")
+    assert hints, word
+    assert hints[0]["scope"] == "total"
+    assert hints[0]["technology"] is None
+
+
+def test_parse_experience_real_technology_still_scoped():
+    """The role-word guard must not swallow a genuine technology."""
+    hints = parse_experience("4+ years in Kubernetes operations")
+    assert hints[0]["scope"] == "technology"
+    assert hints[0]["technology"] == "Kubernetes"

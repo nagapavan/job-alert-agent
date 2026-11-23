@@ -203,7 +203,6 @@ Discovery channels carry varying trust/TOS risk. Opt-in feature flags in `UserPr
 | :--- | :--- | :--- | :--- |
 | `linkedin_sync` | LinkedIn DOM automation | High (session-driven, TOS ambiguous) | **off** |
 | `gmail_sync` | Gmail inbox reading | Medium (OAuth, privacy-scoped) | **off** |
-| `jobspy_google` | Unofficial Google Jobs aggregator | Medium (third-party API) | **off** |
 | `ats_smartrecruiters`, `ats_workable`, `ats_workday`, `ats_uber`, `ats_custom_html` | Unofficial portals | High (reverse-engineered endpoints) | **off** |
 
 **Enforcement**:
@@ -214,7 +213,7 @@ Discovery channels carry varying trust/TOS risk. Opt-in feature flags in `UserPr
   - Scheduler automatic runs
 - **Manual override**: Explicit `force=True` bypasses the gate for a single manual run (e.g., user clicks "Run now")
 
-**UI disclosure**: LinkedIn/Gmail/JobSpy channels show explicit risk warnings when enabled, explaining account limitations and TOS implications.
+**UI disclosure**: LinkedIn/Gmail channels show explicit risk warnings when enabled, explaining account limitations and TOS implications.
 
 ---
 
@@ -248,11 +247,11 @@ If Gmail API isn't connected, fall back to a **restricted browser-session scanne
 
 ## 9. Employer/Domain Blocklist
 
-`UserPreference.excluded_companies` (default: `"amazon"`) is a comma-separated blocklist of company names/domains. Function signature: `is_company_excluded(name: str, domain: str, db)` in `backend/database.py` — it matches the company name/domain against blocklist tokens case-insensitively.
+`UserPreference.excluded_companies` (seeded with `amazon`, `booking.com`, `ebay`, `heineken`, `target.com`) is a comma-separated blocklist of company names/domains. Function signature: `is_company_excluded(name: str, domain: str, db)` in `backend/database.py` — it matches the company name/domain against blocklist tokens case-insensitively.
 
 Companies matching the blocklist are **never scanned** by any discovery channel.
 
-**Rationale for default "amazon"**: Amazon's Conditions of Use and Agent Policy explicitly restrict automated/agent access.
+**Rationale for the seed** (`DEFAULT_EXCLUDED_COMPANIES`): each listed employer's published terms forbid automated access to its own site — Amazon (Conditions of Use bar data mining/robots; Agent Terms), Booking.com (A15.2: automated means and AI-powered assistants need written permission), eBay (User Agreement: robots, scrapers, LLM-driven bots), Target (only its approved agents may interact), HEINEKEN (careers terms: crawlers and auto bots). Tokens for common-word employers are domains (`target.com`) so an unrelated company sharing the word is not blocked. A policy that only bans automated *applying* is not a reason to skip scanning, so such employers are not seeded.
 
 ---
 

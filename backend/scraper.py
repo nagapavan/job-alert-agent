@@ -11,8 +11,14 @@ from bs4 import BeautifulSoup
 
 from backend.ai_helper import _clean_json_string, generate_text
 from backend.config import AGENT_USER_AGENT, RESPECT_AI_USE_FILES, RESPECT_ROBOTS
+from backend.header_segments import (
+    classify_segment,
+    parse_pipe_card,
+    split_company_location,
+)
 from backend.matchers import check_title_match
 from backend.prompts import company_intelligence_synthesis_system
+from backend.title_parser import looks_like_role
 
 logger = logging.getLogger("scraper")
 
@@ -195,6 +201,7 @@ ATS_HOST_MARKERS = {
     "smartrecruiters": ("smartrecruiters.com",),
     "workable": ("workable.com",),
     "workday": ("myworkdayjobs.com", "workday.com"),
+    "adp_workforce_now": ("workforcenow.adp.com",),
 }
 
 
@@ -321,6 +328,30 @@ def _register_ats_slug_resolvers() -> None:
         return {**board, "slug": f"{board['tenant']}/{board['site']}"}
 
     register_slug_resolver("workday_board")(_workday_board_resolver)
+
+    def _adp_workforce_now_resolver(url_or_name: str, ats: str) -> Dict[str, str]:
+        """Returns the {cid, ccId, lang} context for an ADP WFN career-centre URL, else {}.
+
+        ADP tenants are identified by the ``cid`` query parameter, which cannot be derived from a
+        company name. Without it the resolver returns {} so the engine skips the portal instead
+        of querying a guessed tenant (same rule as the Workday resolver).
+        """
+        url = (url_or_name or "").strip()
+        if "workforcenow.adp.com" not in url.lower():
+            return {}
+        try:
+            parsed = urllib.parse.urlparse(url if "://" in url else f"https://{url}")
+            query = urllib.parse.parse_qs(parsed.query)
+        except Exception:  # noqa: BLE001 - an unparsable URL is simply not an ADP board
+            return {}
+        cid = (query.get("cid") or [""])[0].strip()
+        if not cid:
+            return {}
+        cc_id = (query.get("ccId") or [""])[0].strip() or "19000101_000001"
+        lang = (query.get("lang") or [""])[0].strip() or "en_US"
+        return {"cid": cid, "ccId": cc_id, "lang": lang, "slug": cid}
+
+    register_slug_resolver("adp_workforce_now")(_adp_workforce_now_resolver)
 
 
 _register_ats_slug_resolvers()
@@ -742,6 +773,40 @@ def scrape_workday_jobs(
     )
 
 
+def scrape_adp_workforce_now_jobs(
+    company_name: str,
+    title_filters: Optional[List[str]] = None,
+    city_filters: Optional[List[str]] = None,
+    location_filters: Optional[List[str]] = None,
+    work_mode: Optional[str] = None,
+    max_matches: int = 35,
+    careers_url: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """
+    Fetches job postings from an ADP Workforce Now career centre's public JSON API.
+
+    Career-centre URL: https://workforcenow.adp.com/...recruitment.html?cid={cid}&ccId={ccId}
+    List:   GET .../careercenter/public/events/staffing/v1/job-requisitions  ($skip/$top)
+    Detail: GET .../job-requisitions/{itemID}
+
+    The ``cid`` tenant id cannot be guessed from a company name, so this scraper requires an ADP
+    career-centre URL (usually Company.careers_url) and returns nothing without one.
+
+    Delegates to the config-driven engine (``data/ats_portals.json`` → ``paginated_json`` /
+    ``adp`` variant); see docs/ATS_PORTALS.md §Risk tiers.
+    """
+    return _scrape_portal_via_engine(
+        "adp_workforce_now",
+        company_name=company_name,
+        title_filters=title_filters,
+        city_filters=city_filters,
+        location_filters=location_filters,
+        work_mode=work_mode,
+        max_matches=max_matches,
+        careers_url=careers_url,
+    )
+
+
 def scrape_uber_jobs() -> List[Dict[str, str]]:
     """
     Fetches live job listings from Uber's public careers search API.
@@ -1153,6 +1218,104 @@ def _parse_google_alert_text(text: str, email_subject: str = "") -> List[Dict[st
     return unique_jobs
 
 
+# LinkedIn alert digests render one card per posting:
+#     <title>
+#     <company>
+#     <location>
+#     Top applicant            (badge, optional)
+#     View job: https://www.linkedin.com/comm/jobs/view/...
+# separated by a dashed rule. The plain-text body carries all of it.
+_LINKEDIN_DIGEST_RULE_RE = re.compile(r"(?m)^\s*-{5,}\s*$")
+_LINKEDIN_VIEW_JOB_RE = re.compile(r"(?im)^\s*view\s+job\s*:\s*(\S+)")
+_LINKEDIN_DIGEST_BADGES = frozenset(
+    {
+        "top applicant", "easy apply", "be an early applicant", "actively recruiting",
+        "promoted", "viewed", "new", "applied", "just posted", "job expired",
+        "no longer accepting applications", "apply now", "see more jobs",
+        "apply with resume & profile", "your job alert",
+        "new jobs match your preferences",
+    }
+)
+
+
+def _linkedin_badge(line: str) -> bool:
+    lowered = (line or "").strip().lower().rstrip(".")
+    if lowered in _LINKEDIN_DIGEST_BADGES:
+        return True
+    # Footer CTAs ("View all jobs: https://…") are not card lines; treating one as a title
+    # created a job called "View all jobs: https://www.linkedin.com/comm/".
+    if "://" in lowered or re.match(r"^(?:view|see|show|browse|apply)\b", lowered):
+        return True
+    return bool(re.match(r"^\d+\+?\s+new\s+jobs?\b", lowered)) or bool(
+        re.match(r"^your\s+job\s+alert\b", lowered)
+    )
+
+
+def parse_linkedin_alert_cards(
+    email_text: str, email_subject: str = "", max_jobs: int = 5
+) -> List[Dict[str, Any]]:
+    """Parses a LinkedIn job-alert digest body into opportunity candidates.
+
+    Each card is typed rather than sliced positionally: the first role-looking line is the
+    title, the next company-looking line the employer, the next place-looking line the
+    location. Badge/CTA lines are ignored, and a card whose employer cannot be typed is
+    dropped (a digest is not worth a junk company row).
+
+    ``max_jobs`` caps how many postings one digest contributes — a digest can carry 30+.
+    """
+    text = (email_text or "").strip()
+    if not text or "view job" not in text.lower():
+        return []
+
+    jobs: List[Dict[str, Any]] = []
+    seen_urls = set()
+    for block in _LINKEDIN_DIGEST_RULE_RE.split(text):
+        view = _LINKEDIN_VIEW_JOB_RE.search(block)
+        if not view:
+            continue
+        url = view.group(1).strip().rstrip(".,)")
+        lines = [
+            line.strip()
+            for line in block[: view.start()].splitlines()
+            if line.strip() and not _linkedin_badge(line)
+        ]
+        kinds = [classify_segment(line) for line in lines]
+        title = company = location = ""
+        for index, (kind, value) in enumerate(kinds):
+            if kind != "title":
+                continue
+            for later in range(index + 1, len(kinds)):
+                later_kind, later_value = kinds[later]
+                if not company and later_kind == "company":
+                    company = later_value
+                    continue
+                if company and not location and later_kind in ("location", "work_mode"):
+                    location = later_value
+                    break
+            if company:
+                title = value
+                break
+        if not (title and company) or "://" in title or not _digest_company_is_plausible(company):
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        jobs.append(
+            {
+                "title": title,
+                "company": company,
+                "location": location or "Remote / Various",
+                "description": f"Discovered via LinkedIn alert: {email_subject}".strip(),
+                "url": url,
+                "source": "LinkedIn Job Alert",
+                "source_type": "LinkedIn",
+            }
+        )
+        if len(jobs) >= max(1, max_jobs):
+            break
+    return jobs
+
+
 def parse_google_alerts_digest(
     email_html_or_text: str, email_subject: str = ""
 ) -> List[Dict[str, Any]]:
@@ -1272,10 +1435,19 @@ _FREEMAIL_DOMAINS = {
 # ATS / aggregator / job-board sender domains whose SLD is a vendor, not the hiring company.
 _EMAIL_ATS_DOMAINS = {
     "greenhouse.io", "greenhouse-mail.io", "lever.co", "jobs.lever.co", "ashbyhq.com",
-    "myworkdayjobs.com", "workday.com", "smartrecruiters.com", "jobs.smartrecruiters.com",
+    "myworkdayjobs.com", "myworkday.com", "workday.com", "smartrecruiters.com",
+    "jobs.smartrecruiters.com", "hirist.tech", "kekamail.com", "karat.com", "karat.io",
+    "recruiterflow.com", "recruiterflowmail.com", "jobgether.com",
     "workable.com", "icims.com", "taleo.net", "linkedin.com", "googlealerts-noreply.google.com",
     "indeed.com", "glassdoor.com", "ziprecruiter.com", "naukri.com", "wellfound.com",
     "angel.co", "monster.com", "builtin.com", "hirist.com", "foundit.com",
+    # Interview scheduling / assessment vendors: they mail *on behalf of* the employer, so
+    # their name is never the employer (a "Goodtime" application row was created this way).
+    "goodtime.io", "modernloop.io", "calendly.com", "hirevue.com", "sparkhire.com",
+    "vidcruiter.com", "paradox.ai", "eightfold.ai", "phenompeople.com",
+    # Enterprise recruiting clouds: <tenant>.cloud.oracle.com is an Oracle Recruiting tenant,
+    # so the vendor would otherwise be filed as the employer (a JPMorgan mail became "Oracle").
+    "cloud.oracle.com", "successfactors.com",
 }
 
 
@@ -1410,6 +1582,17 @@ def _load_role_titles() -> List[str]:
     return titles
 
 
+# Interview-scheduling mail states the role inside a sentence: "… for Software Engineering
+# PMTS (Apache, Kafka, Terraform):" / "Invitation from an unknown sender: <role> with <Employer>".
+# The generic role phrases below would collapse those to "Software Engineer", which then fails
+# to match the tracked title. Only used when the subject is about an interview.
+_RELAY_INTERVIEW_ROLE_RES = (
+    re.compile(r"\binterview\s+for\s+([^:\n]{2,90}?)\s*:", re.I),
+    re.compile(r"\bfor\s+([^:\n]{2,90}?)\s*:", re.I),
+    re.compile(r"unknown\s+sender\s*:\s*([^:\n]{2,90}?)(?:\s+with\s+.+)?$", re.I),
+)
+
+
 def _resolve_role_from_email(subject: str, snippet: str = "") -> str:
     """Resolves a role title from an email, preferring the broad opportunity phrase regex.
 
@@ -1418,6 +1601,17 @@ def _resolve_role_from_email(subject: str, snippet: str = "") -> str:
     and keeps any trailing qualifier (`` - Full Stack (AI)``), so real tracked titles stay
     matchable instead of collapsing to ``Software Engineer``. Falls back to the standard ladder.
     """
+    lowered_subject = (subject or "").lower()
+    if any(word in lowered_subject for word in ("interview", "invitation", "unknown sender")):
+        for pattern in _RELAY_INTERVIEW_ROLE_RES:
+            match = pattern.search(subject)
+            if match:
+                title = match.group(1).strip().strip(" .,-–—")
+                # The capture is a sentence fragment unless it actually names a role
+                # ("for your interviews with Microsoft" is not a title).
+                if 3 <= len(title) <= 90 and looks_like_role(title):
+                    return title
+
     for source in (subject, snippet):
         if not source:
             continue
@@ -1427,7 +1621,8 @@ def _resolve_role_from_email(subject: str, snippet: str = "") -> str:
         if not m:
             continue
         title = m.group(1).strip()
-        qualifier = re.match(r"(\s*[(\-,\/][^:.\n]{1,50})", source[m.end():])
+        # Never read across a pipe: "Engineer || Sprinto || Remote" is a card, not a qualifier.
+        qualifier = re.match(r"(\s*[(\-,\/][^:.\n|]{1,50})", source[m.end():])
         if qualifier:
             title = f"{title}{qualifier.group(1).rstrip(' ,')}".strip()
         return title or None
@@ -1449,9 +1644,11 @@ def _looks_like_location(text: str) -> bool:
     if seg.lower() in _WORK_MODE_TOKENS:
         return True
     try:
-        from backend.geo import countries_for_cities
+        from backend.geo import is_place_name
 
-        return bool(countries_for_cities([seg]))
+        # Curated aliases + primary city names only: gazetteer alternate names are too noisy
+        # ("NLP" is an alternate for Mbombela, ZA) and stripping them silently renames the role.
+        return is_place_name(seg)
     except Exception:
         return False
 
@@ -1478,30 +1675,37 @@ def _resolve_role_and_location(subject: str, snippet: str = "") -> tuple:
 def _employer_from_subject(subject: str) -> Optional[str]:
     """Extracts the real employer named in the subject (agency-relayed JDs).
 
-    Order: pipe-delimited segment -> ``with|at|from|for|by|about|to|on behalf of X`` regex.
-    Trailing punctuation is stripped and prepositional junk rejected.
+    Order: typed pipe card -> ``with|at|from|for|by|about|to|on behalf of X`` regex.
+    A candidate that is a work mode, a place, a bucket placeholder or a role phrase is never
+    an employer ("Remote" used to be stored as the company), and a trailing parenthetical is
+    peeled off as the location.
     """
     subject = subject or ""
+    card = parse_pipe_card(subject)
+    if card and card.get("company"):
+        return card["company"]
+
+    # "<title> | <employer>" headers: the right-most segment that *types* as a company wins.
+    # Typing is what stops "… | Remote" from being stored as an employer.
     if "|" in subject:
-        for seg in reversed([s.strip() for s in subject.split("|")]):
-            seg = _COMPANY_TRAILING_PUNCT_RE.sub("", seg).strip()
-            if (
-                seg
-                and not _candidate_is_junk(seg)
-                and len(seg) <= 30
-                and not _EMAIL_SENIORITY_ROLE_RE.search(seg)
-                and not _OPPORTUNITY_ROLE_PHRASE_RE.search(seg)
-            ):
-                return seg
+        for segment in reversed([s.strip() for s in re.split(r"\|\|?", subject)]):
+            kind, value = classify_segment(segment)
+            if kind == "company":
+                return value
 
     comp_match = re.search(
         r"(?:on\s+behalf\s+of|with|at|from|for|by|about|to)\s+([A-Z][A-Za-z0-9\.\s]{2,25}?)"
-        r"(?:\s*[:|\-,]|\s+for|\s+regarding|\s+team|\s*$)",
+        r"(?:\s*[:|\-,]|\(|\s+for|\s+regarding|\s+team|\s*$)",
         subject,
     )
     if comp_match:
-        candidate = _COMPANY_TRAILING_PUNCT_RE.sub("", comp_match.group(1)).strip()
-        if not _candidate_is_junk(candidate):
+        candidate, _location = split_company_location(comp_match.group(1))
+        candidate = _COMPANY_TRAILING_PUNCT_RE.sub("", candidate).strip()
+        if (
+            not _candidate_is_junk(candidate)
+            and _digest_company_is_plausible(candidate)
+            and not looks_like_role(candidate)
+        ):
             return candidate
     return None
 
@@ -1518,10 +1722,25 @@ def extract_company_and_role_from_email_header(
     agency relaying a JD for a real employer is tracked under the *employer* (dedup with a direct
     posting) while the agency is preserved separately for context.
     """
+    # Alert bodies sometimes arrive as text/plain that still carries markup ("</u></a></h5>").
+    snippet = re.sub(r"<[^>]{1,200}>", " ", snippet or "")
+    snippet = re.sub(r"[ \t]{2,}", " ", snippet).strip()
     full_text = f"{subject} {snippet}".strip()
 
     # Agency = the sender's organisation (None for ATS/aggregator/freemail senders).
     agency = infer_company_from_sender_domain(sender)
+
+    # A typed pipe card ("<subject> || <Title> || <Company> || <Location>") is structured:
+    # read it positionally instead of guessing from the prose.
+    card = parse_pipe_card(subject)
+    if card and card.get("company"):
+        return {
+            "company": card["company"],
+            "employer": card["company"],
+            "agency": agency,
+            "role": card["title"],
+            "location": card.get("location"),
+        }
 
     # Employer = the real hiring company named in the subject/body, if any.
     employer = None
@@ -1537,6 +1756,11 @@ def extract_company_and_role_from_email_header(
     company = employer or agency
 
     role, location = _resolve_role_and_location(subject, snippet)
+    if not location:
+        # "Principal Engineer: ... at Globex (Remote, India)" — the parenthetical is the place.
+        _head, parenthetical = split_company_location(subject)
+        if parenthetical:
+            location = parenthetical
 
     return {
         "company": company,
@@ -1612,6 +1836,51 @@ _OPPORTUNITY_COMPANY_STOPWORDS = {
 }
 
 
+# A LinkedIn alert digest renders one card as three lines directly above its "View job:" link:
+#     <role>
+#     <company>
+#     <location>
+#     [Top applicant | Apply with resume & profile | Be an early applicant]
+#     View job: https://www.linkedin.com/comm/jobs/view/...
+# Reading that block is structural, so it cannot mistake a department ("AI CoE", "FDE", "Ads") or a
+# location ("Remote", "Singapore") for the employer the way the free-text heuristic can.
+
+# Section labels that sit where an employer would be in a digest block.
+_NOT_AN_EMPLOYER = {
+    "fde times",
+    "edge",
+    "fast growing",
+    "1 connection",
+}
+
+
+def parse_linkedin_alert_digest(text: str):
+    """Return (role, company, location) from the first LinkedIn alert card, else None."""
+    cards = parse_linkedin_alert_cards(text, max_jobs=1)
+    if not cards:
+        return None
+    card = cards[0]
+    return card["title"], card["company"], card.get("location")
+
+
+def _digest_company_is_plausible(company: str) -> bool:
+    name = (company or "").strip()
+    if not name or len(name) > 60 or len(name.split()) > 5:
+        return False
+    if name.lower() in _NOT_AN_EMPLOYER or name.lower() in _OPPORTUNITY_COMPANY_STOPWORDS:
+        return False
+    if name.lower() in _WORK_MODE_TOKENS:
+        return False  # "Remote" is a location, not an employer
+    try:
+        from backend.geo import is_place_name
+
+        if is_place_name(name):
+            return False  # a location is not an employer
+    except Exception:
+        pass
+    return True
+
+
 def extract_opportunity_company_and_title(
     snippet: str,
     subject: str = "",
@@ -1632,6 +1901,14 @@ def extract_opportunity_company_and_title(
 
     text = (snippet or "").strip()
     if not text:
+        return fallback_company, fallback_role
+
+    digest = parse_linkedin_alert_digest(text)
+    if digest:
+        role, company, _location = digest
+        if _digest_company_is_plausible(company):
+            return company.strip(), (role or fallback_role).strip()
+        # A digest we cannot read is not a licence to guess: keep the supplied values.
         return fallback_company, fallback_role
 
     match = _OPPORTUNITY_ROLE_PHRASE_RE.search(text)

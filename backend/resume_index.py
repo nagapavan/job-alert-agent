@@ -69,7 +69,7 @@ def index_resume_chunks(db, resume) -> int:
 
 def top_evidence(db, resume_id: int, query: str, k: int = 3) -> List[str]:
     """Return the resume chunks most similar to ``query`` (best-effort; [] when none)."""
-    from backend.company_catalog import compute_cosine_similarity
+    from backend.embeddings import cosine_similarity as compute_cosine_similarity
     from backend.database import ResumeChunk
 
     chunks = (

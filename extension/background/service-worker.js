@@ -3,6 +3,8 @@
  * Job Alert Agent - AI Career Copilot & ATS Autofill
  */
 
+importScripts("../js/config.js");
+
 // Enable side panel to open automatically when user clicks the extension action icon
 chrome.sidePanel
   .setPanelBehavior({ openPanelOnActionClick: true })
@@ -20,7 +22,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 
     if (!existing.backendUrl) {
       await chrome.storage.local.set({
-        backendUrl: "http://localhost:8000",
+        backendUrl: DEFAULT_BACKEND_URL,
         mode: "connected", // "connected" (FastAPI) or "standalone" (Gemini Nano)
         candidateProfile: {
           fullName: "",
@@ -92,8 +94,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // -------------------------------------------------------------
 // Assisted apply: open the user's own browser instead of a server-side one
 // -------------------------------------------------------------
-
-const DASHBOARD_URLS = ["http://localhost:8000/*", "http://127.0.0.1:8000/*"];
 
 async function stashApplyData(tabId, job) {
   if (!tabId) return;

@@ -212,3 +212,52 @@ def test_thank_you_for_interest_with_rejection_cue_is_rejection():
 
 def test_over_broad_application_status_phrase_removed():
     assert "application status" not in EMAIL_REJECTION_PHRASES
+
+# -------------------------------------------------------------
+# LinkedIn alert digests: read the structured block, never the department name
+# -------------------------------------------------------------
+
+_DIGEST = """Your job alert for Senior Staff Software Engineer in Hyderabad
+Principal Engineer - AI Applications
+Teradata
+Hyderabad
+Top applicant
+View job: https://www.linkedin.com/comm/jobs/view/4486068950/?x=1"""
+
+
+def test_digest_block_yields_the_real_employer_and_role():
+    from backend.scraper import extract_opportunity_company_and_title
+
+    company, role = extract_opportunity_company_and_title(
+        _DIGEST, "job alert", "LinkedIn", "Principal Engineer"
+    )
+    assert company == "Teradata"
+    assert role == "Principal Engineer - AI Applications"
+
+
+def test_digest_department_line_is_never_taken_as_the_employer():
+    """The old heuristic made "AI Applications" / "FDE" / "Python is a must" the company."""
+    from backend.scraper import extract_opportunity_company_and_title
+
+    dept = """Your job alert for Principal Engineer in Bengaluru
+AI Applications
+Top applicant
+View job: https://www.linkedin.com/comm/jobs/view/2/"""
+    company, _role = extract_opportunity_company_and_title(
+        dept, "job alert", "LinkedIn", "Principal Engineer"
+    )
+    assert company == "LinkedIn"  # falls back rather than inventing a department employer
+
+
+def test_digest_location_is_not_an_employer():
+    from backend.scraper import extract_opportunity_company_and_title
+
+    loc = """Your job alert for Staff Engineer
+Staff Engineer
+Remote
+Top applicant
+View job: https://www.linkedin.com/comm/jobs/view/3/"""
+    company, _role = extract_opportunity_company_and_title(
+        loc, "job alert", "LinkedIn", "Staff Engineer"
+    )
+    assert company == "LinkedIn"

@@ -1,6 +1,8 @@
 """Tests for Tier A/B residual requirement extraction + resume-evidence bridge (Phase 3)."""
 import json
 
+import pytest
+
 from backend import requirements_extractor as rx
 from backend import section_intent as si
 
@@ -199,3 +201,73 @@ class TestEmbeddingEvidenceTier:
 
         assert supported is True
         assert how == "embedding"
+
+
+class TestGenericPhrases:
+    """Issue #98: portal chrome must not be credited as partial coverage."""
+
+    @pytest.mark.parametrize("phrase", ["development", "full time", "professional", "Full Time"])
+    def test_generic_only_phrase(self, phrase):
+        assert rx.is_generic_phrase(phrase) is True
+
+    @pytest.mark.parametrize(
+        "phrase", ["Ruby on Rails", "service-oriented architecture", "stakeholder management"]
+    )
+    def test_real_phrase_is_not_generic(self, phrase):
+        assert rx.is_generic_phrase(phrase) is False
+
+    def test_generic_phrase_is_never_credited_or_queued(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("backend.skill_taxonomy.CANDIDATES_PATH", tmp_path / "c.json")
+        jd = "Requirements:\n- Development\n- Full Time\n"
+        spans = si.jd_section_spans(jd)
+        results = rx.extract_residual_requirements(
+            jd, spans, resume_text="software development full time professional"
+        )
+        assert results == []
+        if (tmp_path / "c.json").exists():
+            counts = json.loads((tmp_path / "c.json").read_text())["counts"]
+            assert not any(k in counts for k in ("development", "full time"))
+
+
+class TestInlinePreferenceCue:
+    """Issue #98: '... preferred' marks one requirement nice-to-have."""
+
+    def test_trailing_cue_is_stripped_and_flips_the_category(self):
+        jd = "Requirements:\n\nExperience with NATS preferred\n"
+        spans = si.jd_section_spans(jd)
+        units = dict(rx.iter_requirement_units(jd, spans))
+        assert units["Experience with NATS"] == "nice_to_have"
+
+    def test_plain_requirement_stays_must_have(self):
+        jd = "Requirements:\n\nStrong expertise in Ruby on Rails.\n"
+        spans = si.jd_section_spans(jd)
+        categories = dict(rx.iter_requirement_units(jd, spans))
+        assert categories["Strong expertise in Ruby on Rails."] == "must_have"
+        assert set(categories.values()) == {"must_have"}
+
+
+class TestHeaderChrome:
+    """Issue #98: an ATS metadata block never yields a requirement unit."""
+
+    def test_chrome_block_produces_no_units(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("backend.skill_taxonomy.CANDIDATES_PATH", tmp_path / "c.json")
+        jd = (
+            "Principal Software Engineer\n"
+            "Development\n"
+            "Remote India, IN\n"
+            "Full Time\n"
+            "Professional\n"
+            "24 days ago\n"
+            "Requisition ID: 1427\n"
+            "Apply\n"
+            "Save\n"
+            "\n"
+            "Requirements:\n"
+            "\n"
+            "Strong expertise in Ruby on Rails.\n"
+        )
+        spans = si.jd_section_spans(jd)
+        units = [u.lower() for u, _c in rx.iter_requirement_units(jd, spans)]
+        for chrome in ("development", "full time", "professional", "apply", "save"):
+            assert chrome not in units
+        assert any("ruby on rails" in u for u in units)

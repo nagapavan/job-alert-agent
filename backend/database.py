@@ -141,7 +141,7 @@ class Job(Base):
     location = Column(String(255), nullable=True)
     source = Column(String(100), nullable=True)  # e.g., "LinkedIn Job Alert", "Greenhouse", "Direct"
     source_type = Column(String(50), default="Direct")  # "LinkedIn" or "Direct"
-    status = Column(String(50), default="To Apply", index=True)  # Canonical: To Apply, Shortlisted, Applied, Screening, Interview, Offered, Rejected, Not Interested
+    status = Column(String(50), default="To Apply", index=True)  # Canonical: To Apply, Shortlisted, Applied, Screening, Interview Scheduling, Interview, Offered, Rejected, Closed, Withdrawn, Not Interested
     
     # AI Scoring & Tailoring
     match_score = Column(Float, nullable=True)
@@ -166,6 +166,12 @@ class Job(Base):
     # sync run). Non-null until the user acts on the job, so the UI can surface "new from sync"
     # batches that still need review. Cleared on any status change.
     sync_batch_id = Column(String(64), nullable=True, index=True)
+
+    # The employer's own requisition id for this posting ("R262578", "200045102", "gh_jid=...").
+    # It names exactly one posting, so an application mail carrying it can be attributed to this
+    # row without guessing from company + title (2026-11-16 attribution audit).
+    requisition_id = Column(String(64), nullable=True, index=True)
+    requisition_source = Column(String(32), nullable=True)
 
     # True only when match_score came from a real AI analysis (vs. a source/baseline/saved default)
     match_scored = Column(Boolean, default=False)
@@ -254,6 +260,27 @@ class OperationLog(Base):
     created_at = Column(DateTime, default=utc_now, index=True)
     timestamp = synonym("created_at")
 
+class LinkedInScanRequest(Base):
+    """Persisted single-flight queue for LinkedIn saved-jobs scans (issue #114).
+
+    One scan at a time may drive the single-owner browser profile. A request that arrives while
+    a scan is running is written here and executed by a background task when the gate frees, so
+    it survives a server restart instead of dying with the HTTP connection.
+    """
+
+    __tablename__ = "linkedin_scan_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    origin = Column(String(32), default="manual", nullable=False)  # manual | startup
+    status = Column(String(32), default="queued", index=True, nullable=False)
+    task_id = Column(String(64), nullable=True)
+    requested_at = Column(DateTime, default=utc_now, index=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    summary = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+
+
 class ApplicationQuestionAnswer(Base):
     """
     Semantic Memory for application essay and screener questions (e.g. Workday, Greenhouse, Lever).
@@ -300,6 +327,36 @@ class DismissedJobPattern(Base):
     embedding_model = Column(String(128), nullable=True)
     embedding_dim = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=utc_now)
+
+class EmailApplicationLink(Base):
+    """Which Gmail message was attributed to which tracked application, and on what evidence.
+
+    Attribution used to exist only as prose inside ``ApplicationEvent.description``: it could not
+    be queried, verified, re-evaluated, or corrected at the source. One row per message makes the
+    decision a record — ``message_id`` is unique, so a single mail can never be attached to two
+    applications, and correcting a mistake is an update instead of an appended note.
+    """
+    __tablename__ = "email_application_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(String(255), unique=True, index=True, nullable=False)
+    # Gmail thread: a reply inherits the application its thread is already linked to.
+    thread_id = Column(String(255), nullable=True, index=True)
+    job_id = Column(
+        Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # How it matched: requisition | thread | exact_domain | exact_title | title_contains |
+    # title_overlap | accepted_pending | auto_created
+    method = Column(String(40), nullable=False, default="")
+    confidence = Column(Float, nullable=True)
+    sender = Column(String(255), nullable=True)
+    subject = Column(Text, nullable=True)
+    received_at = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+
+    job = relationship("Job")
+
 
 class CustomFormField(Base):
     """
@@ -355,6 +412,9 @@ class PendingEmailApplication(Base):
     # "pending" | "accepted" | "expired"
     state = Column(String(20), nullable=False, default="pending")
     snippet = Column(Text, nullable=True)
+    # Kept so accepting the card can record which message produced the application link.
+    message_id = Column(String(255), nullable=True)
+    thread_id = Column(String(255), nullable=True)
 
     __table_args__ = (
         UniqueConstraint(
@@ -408,6 +468,23 @@ class ScoreAuditRecord(Base):
     created_at = Column(DateTime, default=utc_now)
 
 
+# Employers whose published terms forbid automated access to their own sites, so they are never
+# scanned. Tokens match case-insensitively as substrings of "<name> <domain>", which is why a
+# common-word employer is seeded by domain ("target.com", not "target"). Sources, checked
+# 2026-11-16: Amazon Conditions of Use (data mining/robots barred) + Agent Terms; Booking.com
+# Terms A15.2 (automated means and AI-powered assistants need written permission); eBay User
+# Agreement (robots, scrapers, LLM-driven bots); Target T&Cs (only its approved agents may
+# interact); HEINEKEN careers T&Cs (crawlers and auto bots). A policy that only bans automated
+# *applying* is not a reason to skip scanning, so those employers are not seeded here.
+DEFAULT_EXCLUDED_COMPANIES = ",".join((
+    "amazon",
+    "booking.com",
+    "ebay",
+    "heineken",
+    "target.com",
+))
+
+
 class UserPreference(Base):
     """
     Single-row candidate search preferences + opt-in discovery feature flags.
@@ -426,16 +503,10 @@ class UserPreference(Base):
     features_json = Column(Text, default="{}")     # opt-in feature flags (JSON)
     scoring_config_json = Column(Text, default="{}")  # tunable match-scoring weights/cutoffs (JSON)
     consents_json = Column(Text, default="{}")     # explicit per-feature consent records (JSON, versioned)
-    excluded_companies = Column(Text, default="amazon")  # comma-separated name/domain blocklist
+    excluded_companies = Column(Text, default=DEFAULT_EXCLUDED_COMPANIES)  # comma-separated name/domain blocklist
     skip_topics = Column(Text, default="")  # comma-separated skill/keyword blocklist (titles + JDs)
     extra_skills_json = Column(Text, default="[]")  # user-owned skills added on top of resume-extracted ones (JSON list)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
-
-
-# Default employer/domain blocklist (substring match, lowercased). Companies whose name or
-# domain contains any token are never scanned. Seeded with Amazon: its Conditions of Use and
-# Agent Policy explicitly restrict automated/agent access, so it must not be scraped by default.
-DEFAULT_EXCLUDED_COMPANIES = "amazon"
 
 
 # Opt-in discovery features. Disabled channels are hidden in the UI and skipped by the scheduler.
@@ -464,6 +535,7 @@ DEFAULT_FEATURE_FLAGS = {
     "ats_smartrecruiters": False,
     "ats_workable": False,
     "ats_workday": False,
+    "ats_adp": False,
     "ats_uber": False,
     "ats_custom_html": False,
 }
@@ -483,6 +555,7 @@ CONSENT_REQUIRED_FEATURES = (
     "ats_smartrecruiters",  # unofficial / ambiguous ATS endpoints
     "ats_workable",
     "ats_workday",
+    "ats_adp",
     "ats_uber",
     "ats_custom_html",
 )
@@ -814,6 +887,21 @@ def init_db(custom_url: str = None):
                     conn.execute(text("ALTER TABLE jobs ADD COLUMN match_gaps_json TEXT;"))
                 if "match_partials_json" not in col_names:
                     conn.execute(text("ALTER TABLE jobs ADD COLUMN match_partials_json TEXT;"))
+                if "requisition_id" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN requisition_id VARCHAR(64);"))
+                    conn.execute(
+                        text("CREATE INDEX IF NOT EXISTS ix_jobs_requisition_id ON jobs (requisition_id);")
+                    )
+                if "requisition_source" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN requisition_source VARCHAR(32);"))
+
+        if "pending_email_applications" in existing_tables:
+            col_names = {c["name"] for c in inspector.get_columns("pending_email_applications")}
+            with engine.begin() as conn:
+                if "message_id" not in col_names:
+                    conn.execute(text("ALTER TABLE pending_email_applications ADD COLUMN message_id VARCHAR(255);"))
+                if "thread_id" not in col_names:
+                    conn.execute(text("ALTER TABLE pending_email_applications ADD COLUMN thread_id VARCHAR(255);"))
 
         if "companies" in existing_tables:
             col_names = {c["name"] for c in inspector.get_columns("companies")}
@@ -850,7 +938,19 @@ def init_db(custom_url: str = None):
                 if "timezone" not in col_names:
                     conn.execute(text("ALTER TABLE user_preferences ADD COLUMN timezone VARCHAR(64) DEFAULT '';"))
                 if "excluded_companies" not in col_names:
-                    conn.execute(text("ALTER TABLE user_preferences ADD COLUMN excluded_companies TEXT DEFAULT 'amazon';"))
+                    conn.execute(text(
+                        "ALTER TABLE user_preferences ADD COLUMN excluded_companies TEXT "
+                        f"DEFAULT '{DEFAULT_EXCLUDED_COMPANIES}';"
+                    ))
+                # Upgrade rows that still hold the previous seed verbatim. A list the operator has
+                # edited no longer equals it, so their own blocklist is never overwritten.
+                conn.execute(
+                    text(
+                        "UPDATE user_preferences SET excluded_companies = :seed "
+                        "WHERE lower(trim(excluded_companies)) = 'amazon';"
+                    ),
+                    {"seed": DEFAULT_EXCLUDED_COMPANIES},
+                )
                 if "consents_json" not in col_names:
                     conn.execute(text("ALTER TABLE user_preferences ADD COLUMN consents_json TEXT DEFAULT '{}';"))
                 if "scoring_config_json" not in col_names:

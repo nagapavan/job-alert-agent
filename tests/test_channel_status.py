@@ -193,8 +193,17 @@ def test_external_sync_records_success_when_api_path_runs(db_session):
 
     _enable_gmail(db_session)
 
+    def _fake_sync(db, stats=None):
+        if stats is not None:
+            stats.update({
+                "messages_matched": 1,
+                "alert_messages_matched": 1,
+                "alerts_had_watermark": True,
+            })
+        return []
+
     with patch("backend.main.is_gmail_configured", return_value=True), patch(
-        "backend.gmail_client.run_gmail_sync", return_value=[]
+        "backend.gmail_client.run_gmail_sync", side_effect=_fake_sync
     ):
         result = _execute_external_sync(
             ExternalSyncRequest(sources=["gmail"]), db_session
@@ -213,3 +222,123 @@ def test_external_sync_marks_disabled_channel_as_skipped(db_session):
     gmail = [c for c in result.channels if c["channel"] == "gmail"]
     assert gmail and gmail[0]["outcome"] == channel_status.SKIPPED_FLAG
     assert result.status == "success"
+
+
+# -------------------------------------------------------------
+# Gmail sync visibility (issue #84)
+# -------------------------------------------------------------
+
+
+def test_gmail_sync_persists_an_operation_log(db_session):
+    """Triggering the Gmail sync must leave a record an operator can inspect."""
+    import json as _json
+    from backend.main import _execute_gmail_sync
+
+    comp = Company(name="Globex", domain="globex.com")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(company_id=comp.id, title="Backend Engineer", url="https://x/globex-be",
+              status="Applied")
+    db_session.add(job)
+    db_session.commit()
+
+    events = [{
+        "company": "Globex", "role": "Backend Engineer", "event_type": "rejection",
+        "subject": "Update on your application", "snippet": "", "sender": "jobs@globex.com",
+        "domain": "globex.com", "confidence": 0.9,
+    }]
+
+    def _fake_sync(db, stats=None):
+        if stats is not None:
+            stats.update({"messages_matched": 4, "new_processed": 2})
+        return events
+
+    with patch("backend.main.gmail_client.run_gmail_sync", _fake_sync):
+        result = _execute_gmail_sync(db_session)
+
+    log = (
+        db_session.query(OperationLog)
+        .filter(OperationLog.operation_type == "gmail_sync")
+        .order_by(OperationLog.id.desc())
+        .first()
+    )
+    assert log is not None
+    assert log.status == "success"
+    details = _json.loads(log.details_json)
+    assert details["emails_scanned"] == 4
+    assert details["status_updates"] == 1
+    assert details["channels"][0]["outcome"] == channel_status.OK
+    assert result["status_updates"] == 1
+
+
+def test_gmail_sync_zero_classified_events_is_degraded(db_session):
+    """The API path ran but produced nothing: that is Partial, never a silent success."""
+    import json as _json
+    from backend.main import _execute_gmail_sync
+
+    def _fake_sync(db, stats=None):
+        if stats is not None:
+            stats.update({"messages_matched": 6, "new_processed": 0})
+        return []
+
+    with patch("backend.main.gmail_client.run_gmail_sync", _fake_sync):
+        result = _execute_gmail_sync(db_session)
+
+    log = (
+        db_session.query(OperationLog)
+        .filter(OperationLog.operation_type == "gmail_sync")
+        .order_by(OperationLog.id.desc())
+        .first()
+    )
+    assert log.status == "Partial"
+    assert result["status"] == "Partial"
+    details = _json.loads(log.details_json)
+    assert details["channels"][0]["outcome"] == channel_status.DEGRADED_ZERO
+
+
+def test_gmail_sync_failure_is_recorded_as_failed(db_session):
+    """An exception must leave a Failed row, not only a toast."""
+    from backend.main import _execute_gmail_sync
+
+    def _boom(db, stats=None):
+        raise RuntimeError("token revoked")
+
+    with patch("backend.main.gmail_client.run_gmail_sync", _boom):
+        result = _execute_gmail_sync(db_session)
+
+    log = (
+        db_session.query(OperationLog)
+        .filter(OperationLog.operation_type == "gmail_sync")
+        .order_by(OperationLog.id.desc())
+        .first()
+    )
+    assert log.status == "Failed"
+    assert "token revoked" in log.summary
+    assert result["error"] == "token revoked"
+
+
+def test_gmail_task_endpoint_queues_a_background_task():
+    from fastapi.testclient import TestClient
+    from backend.main import app
+
+    client = TestClient(app)
+    with patch("backend.main.is_feature_enabled", return_value=True), patch(
+        "backend.main.is_gmail_configured", return_value=True
+    ), patch("backend.main._run_gmail_sync_task_runner", return_value={"status": "success"}):
+        resp = client.post("/api/tasks/sync/gmail")
+
+    assert resp.status_code == 202
+    data = resp.json()
+    assert data["task_id"].startswith("tsk_")
+    assert data["status"] == "QUEUED"
+
+
+def test_gmail_task_endpoint_refuses_when_disabled():
+    from fastapi.testclient import TestClient
+    from backend.main import app
+
+    client = TestClient(app)
+    with patch("backend.main.is_feature_enabled", return_value=False):
+        resp = client.post("/api/tasks/sync/gmail")
+
+    assert resp.status_code == 403

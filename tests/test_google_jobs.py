@@ -577,7 +577,7 @@ def test_api_google_jobs_sync_followed():
         "Notion india jobs",
     ]
     with patch(
-        "backend.main.fetch_google_jobs_followed_queries_playwright",
+        "backend.routers.google_jobs.fetch_google_jobs_followed_queries_playwright",
         return_value=mock_followed,
     ):
         res = client.post("/api/jobs/google-jobs/sync-followed")
@@ -594,6 +594,11 @@ def test_api_google_jobs_sync_followed():
 # -------------------------------------------------------------
 
 
+def _enable_google_jobs(client):
+    """The manual scrape route is gated on the channel flag, like the scheduled runner."""
+    client.put("/api/preferences", json={"features": {"google_jobs": True}})
+
+
 def test_api_google_jobs_scrape_endpoint(db_session):
     mock_jobs = [
         {
@@ -608,7 +613,8 @@ def test_api_google_jobs_scrape_endpoint(db_session):
         }
     ]
 
-    with patch("backend.main.fetch_google_jobs_playwright", return_value=mock_jobs):
+    _enable_google_jobs(client)
+    with patch("backend.routers.google_jobs.fetch_google_jobs_playwright", return_value=mock_jobs):
         res = client.post(
             "/api/jobs/google-jobs/scrape",
             json={
@@ -681,7 +687,8 @@ def test_api_google_jobs_scrape_multi_query(db_session):
                 }
             ]
 
-    with patch("backend.main.fetch_google_jobs_playwright", side_effect=mock_fetch):
+    _enable_google_jobs(client)
+    with patch("backend.routers.google_jobs.fetch_google_jobs_playwright", side_effect=mock_fetch):
         res = client.post(
             "/api/jobs/google-jobs/scrape",
             json={
@@ -736,8 +743,8 @@ def test_normalize_google_query_dedupes_location():
     assert normalize_google_query("") == ""
 
 
-@patch("backend.main.fetch_google_jobs_playwright")
-@patch("backend.main.get_db")
+@patch("backend.routers.google_jobs.fetch_google_jobs_playwright")
+@patch("backend.routers.google_jobs.get_db")
 def test_google_jobs_task_runner_uses_playwright(mock_get_db, mock_fetch_pw, db_session):
     """The scheduled runner fetches via Playwright (the sole fetcher) with max_results."""
     from backend.main import _run_google_jobs_task_runner
@@ -769,8 +776,8 @@ def test_google_jobs_task_runner_uses_playwright(mock_get_db, mock_fetch_pw, db_
     assert "max_results" in kwargs
 
 
-@patch("backend.main.fetch_google_jobs_playwright")
-@patch("backend.main.get_db")
+@patch("backend.routers.google_jobs.fetch_google_jobs_playwright")
+@patch("backend.routers.google_jobs.get_db")
 def test_google_jobs_runner_reports_partial_when_no_query_returns_postings(
     mock_get_db, mock_fetch_pw, db_session
 ):
@@ -801,8 +808,8 @@ def test_google_jobs_runner_reports_partial_when_no_query_returns_postings(
     assert details["per_query_outcomes"][0]["outcome"] == "zero_results"
 
 
-@patch("backend.main.fetch_google_jobs_playwright")
-@patch("backend.main.get_db")
+@patch("backend.routers.google_jobs.fetch_google_jobs_playwright")
+@patch("backend.routers.google_jobs.get_db")
 def test_google_jobs_runner_reports_browser_busy(mock_get_db, mock_fetch_pw, db_session):
     """A BrowserProfileBusy fetch is reported as browser_busy, not silent success."""
     from backend.database import OperationLog
@@ -836,8 +843,8 @@ def test_google_jobs_runner_reports_browser_busy(mock_get_db, mock_fetch_pw, db_
     assert details["per_query_outcomes"][0]["outcome"] == "browser_busy"
 
 
-@patch("backend.main.fetch_google_jobs_playwright")
-@patch("backend.main.get_db")
+@patch("backend.routers.google_jobs.fetch_google_jobs_playwright")
+@patch("backend.routers.google_jobs.get_db")
 def test_google_jobs_runner_reports_blocked_as_failed(
     mock_get_db, mock_fetch_pw, db_session
 ):
@@ -876,8 +883,8 @@ def test_google_jobs_runner_reports_blocked_as_failed(
     assert "blocked by Google" in log.summary
 
 
-@patch("backend.main.fetch_google_jobs_playwright")
-@patch("backend.main.get_db")
+@patch("backend.routers.google_jobs.fetch_google_jobs_playwright")
+@patch("backend.routers.google_jobs.get_db")
 def test_google_jobs_runner_fans_out_one_query_per_location(
     mock_get_db, mock_fetch_pw, db_session
 ):
@@ -941,3 +948,32 @@ def test_extract_company_and_role_from_email_header(monkeypatch):
     )
     assert res3["company"] == "Enterpert"
     assert res3["role"] == "Principal Engineer"
+
+
+def test_manual_scrape_is_gated_on_the_channel_flag(db_session):
+    """A disabled channel must not scrape, even when the SPA posts to the manual route."""
+    client.put("/api/preferences", json={"features": {"google_jobs": False}})
+    with patch("backend.routers.google_jobs.fetch_google_jobs_playwright") as fetch:
+        res = client.post("/api/jobs/google-jobs/scrape", json={"query": "staff engineer"})
+
+    assert res.status_code == 200
+    assert "disabled" in res.json()["message"].lower()
+    fetch.assert_not_called()
+
+
+def test_manual_scrape_honours_the_persisted_cooldown(db_session, monkeypatch):
+    """The manual route must not be a way to defeat the block cooldown."""
+    from backend import google_jobs_state
+
+    _enable_google_jobs(client)
+    monkeypatch.setattr(google_jobs_state, "STATE_PATH", db_session.info.setdefault("gj_state", __import__("pathlib").Path("/tmp/never-used-gj.json")))
+    google_jobs_state.record_block("blocked on query 'staff engineer'")
+
+    with patch("backend.routers.google_jobs.fetch_google_jobs_playwright") as fetch:
+        res = client.post("/api/jobs/google-jobs/scrape", json={"query": "staff engineer"})
+
+    assert res.status_code == 200
+    assert "cooling down" in res.json()["message"].lower()
+    fetch.assert_not_called()
+
+

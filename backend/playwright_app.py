@@ -6,7 +6,9 @@ import urllib.parse
 from typing import List, Dict, Optional, Any, Tuple
 
 from backend.config import CHROME_PROFILE_DIR
+from backend.geo import is_place_name
 from backend.parser import split_candidate_name
+from backend.title_parser import is_bucket_company, split_role_employer
 
 logger = logging.getLogger("playwright_app")
 
@@ -178,12 +180,25 @@ EMAIL_ALERT_PHRASES = [
     # Recruiter / agency cold outreach forwarding a JD (issue #82).
     "job opportunity", "opportunity with", "opportunity for", "jd for",
     "job description", "please find below", "greetings from", "hiring for",
-    "we are hiring", "position with", "role with", "on behalf of"
+    "we are hiring", "position with", "role with", "on behalf of",
+    # Employer career-portal digests (Microsoft Careers, EY Job Alerts, MyGreenhouse, Hirist).
+    "new jobs posted", "new jobs at", "new job match", "match your search",
+    "jobs for you", "top jobs", "open positions", "career opportunities",
+    "recommended jobs"
 ]
 
 EMAIL_APPLICATION_PHRASES = [
     "thank you for applying", "application received", "we received your application",
     "application submitted", "jobs/applications"
+]
+
+# Subjects that mention an interview but are *about* an interview that already happened — a
+# feedback request or survey. Classifying them as an interview invite recorded "interview"
+# outcomes for rows the operator never applied to (2026-11-16 cleanup, job 187).
+EMAIL_INTERVIEW_VETO_PHRASES = [
+    "interview experience", "interview feedback", "share your feedback",
+    "how did we do", "thank you for interviewing", "thanks for interviewing",
+    "post-interview", "post interview", "interview survey",
 ]
 
 # Ordered by specificity/priority; the first category with a matched phrase wins.
@@ -211,16 +226,22 @@ def classify_email(subject: str, snippet: str = "", sender: str = "") -> Dict[st
 
     for category, phrases in _EMAIL_CLASSIFICATION_ORDER:
         matched = [p for p in phrases if p in text]
-        if matched:
-            confidence = min(0.95, 0.45 + 0.2 * min(len(matched), 2))
-            if ats_sender:
-                confidence = min(0.98, confidence + 0.25)
-            return {
-                "category": category,
-                "confidence": round(confidence, 2),
-                "matched": matched[:5],
-                "ats_sender": ats_sender,
-            }
+        if not matched:
+            continue
+        if category == "interview" and any(
+            veto in text for veto in EMAIL_INTERVIEW_VETO_PHRASES
+        ):
+            # A feedback/survey mail mentions "interview" but is not an invitation.
+            continue
+        confidence = min(0.95, 0.45 + 0.2 * min(len(matched), 2))
+        if ats_sender:
+            confidence = min(0.98, confidence + 0.25)
+        return {
+            "category": category,
+            "confidence": round(confidence, 2),
+            "matched": matched[:5],
+            "ats_sender": ats_sender,
+        }
 
     return {"category": "general", "confidence": 0.0, "matched": [], "ats_sender": ats_sender}
 
@@ -933,15 +954,23 @@ def _extract_linkedin_job_from_anchor(anchor) -> Optional[Dict[str, Any]]:
     ):
         company = slug_company
 
-    # Last-ditch guard: if the title still ends with the employer name (collapsed DOM, no slug),
-    # strip the trailing employer so it is not duplicated in the header.
-    if company and company != "Unknown Company":
-        norm_title = re.sub(r"[^a-z0-9]", "", raw_title.lower())
-        norm_company = re.sub(r"[^a-z0-9]", "", company.lower())
-        if norm_company and norm_title.endswith(norm_company) and norm_title != norm_company:
-            trimmed = raw_title[: len(raw_title) - len(company)].strip(" ·-–—|,")
-            if trimmed:
-                raw_title = trimmed
+    # The title can still arrive with the employer glued on ("... EngineerArcesium", "... Engineer
+    # Oracle") when the card was collapsed and no slug was present. The shared title parser splits
+    # it and only reports high/medium confidence boundaries.
+    if raw_title:
+        role, parsed_employer, confidence = split_role_employer(raw_title)
+        if role and parsed_employer and confidence in ("high", "medium"):
+            norm = lambda value: re.sub(r"[^a-z0-9]", "", (value or "").lower())
+            merged = norm(parsed_employer) in norm(raw_title) and norm(role) != norm(raw_title)
+            unreliable_company = (
+                is_bucket_company(company)
+                or _looks_like_location(company)
+                or is_place_name(company)
+            )
+            if unreliable_company or merged:
+                raw_title = role
+                if unreliable_company:
+                    company = parsed_employer
 
     if not raw_title:
         return None
@@ -2194,7 +2223,9 @@ def fetch_google_jobs_followed_queries_playwright(
 def normalize_hirist_status(raw_status: str) -> str:
     """Normalizes raw status text from Hirist dashboard to internal Job status."""
     st = raw_status.lower()
-    if any(k in st for k in ["not shortlisted", "rejected", "declined", "closed", "position closed", "not selected", "expired"]):
+    if any(k in st for k in ["closed", "position closed", "expired", "no longer accepting"]):
+        return "Closed"
+    if any(k in st for k in ["not shortlisted", "rejected", "declined", "not selected"]):
         return "Rejected"
     if any(k in st for k in ["interview", "interview scheduled", "contacted", "call scheduled", "telephonic screen"]):
         return "Interview"

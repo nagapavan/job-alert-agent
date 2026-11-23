@@ -15,7 +15,7 @@ def _result(items):
     return assessment, compute_match(assessment)
 
 
-@patch("backend.main.assess_job_requirements")
+@patch("backend.job_scoring.assess_job_requirements")
 def test_score_job_with_engine_deterministic(mock_assess, db_session):
     # Signal-rich JD -> deterministic classifier, no LLM call.
     score, analysis, scored, method, at, band, rec, strengths, gaps, partials = _score_job_with_engine(
@@ -37,7 +37,7 @@ def test_score_job_with_engine_deterministic(mock_assess, db_session):
     mock_assess.assert_not_called()
 
 
-@patch("backend.main.assess_job_requirements")
+@patch("backend.job_scoring.assess_job_requirements")
 def test_score_job_with_engine_llm_fallback(mock_assess, db_session):
     mock_assess.side_effect = lambda *a, **k: _result(
         [RequirementItem(text="Python", status="met")]
@@ -57,7 +57,7 @@ def test_score_job_with_engine_llm_fallback(mock_assess, db_session):
     mock_assess.assert_called_once()
 
 
-@patch("backend.main.assess_job_requirements")
+@patch("backend.job_scoring.assess_job_requirements")
 def test_score_job_with_engine_llm_failure_unscored(mock_assess, db_session):
     mock_assess.side_effect = RuntimeError("llm offline")
     score, analysis, scored, method, at, band, rec, strengths, gaps, partials = _score_job_with_engine(
@@ -71,7 +71,7 @@ def test_score_job_with_engine_llm_failure_unscored(mock_assess, db_session):
     assert gaps == []
 
 
-@patch("backend.main.assess_job_requirements")
+@patch("backend.job_scoring.assess_job_requirements")
 def test_score_job_with_engine_skips_non_jd_snippet(mock_assess, db_session):
     # Discovery artifacts (LinkedIn alert/saved snippets) have no JD cues -> stay unscored
     # without spending a bounded LLM call.
@@ -84,7 +84,7 @@ def test_score_job_with_engine_skips_non_jd_snippet(mock_assess, db_session):
     mock_assess.assert_not_called()
 
 
-@patch("backend.main.assess_job_requirements")
+@patch("backend.job_scoring.assess_job_requirements")
 def test_rescore_updates_existing_jobs(mock_assess, db_session):
     resume = Resume(
         filename="r.md",
@@ -130,8 +130,8 @@ def test_rescore_updates_existing_jobs(mock_assess, db_session):
     assert out["llm_fallback"] == 1
 
 
-@patch("backend.main._deterministic_match")
-@patch("backend.main.assess_job_requirements")
+@patch("backend.job_scoring._deterministic_match")
+@patch("backend.job_scoring.assess_job_requirements")
 def test_score_job_with_engine_falls_back_on_deterministic_error(
     mock_assess, mock_det, db_session
 ):
@@ -147,8 +147,8 @@ def test_score_job_with_engine_falls_back_on_deterministic_error(
     mock_assess.assert_called_once()
 
 
-@patch("backend.main.DETERMINISTIC_BULK_SCORING", False)
-@patch("backend.main.assess_job_requirements")
+@patch("backend.job_scoring.DETERMINISTIC_BULK_SCORING", False)
+@patch("backend.job_scoring.assess_job_requirements")
 def test_score_job_with_engine_flag_disables_deterministic(mock_assess, db_session):
     mock_assess.side_effect = lambda *a, **k: _result(
         [RequirementItem(text="Python", status="met")]
@@ -161,9 +161,8 @@ def test_score_job_with_engine_flag_disables_deterministic(mock_assess, db_sessi
     mock_assess.assert_called_once()
 
 
-@patch("backend.main.top_evidence", return_value=[])
-@patch("backend.main.assess_job_requirements")
-def test_rescore_skips_when_no_resume(mock_assess, mock_evidence, db_session):
+@patch("backend.job_scoring.assess_job_requirements")
+def test_rescore_skips_when_no_resume(mock_assess, db_session):
     with patch("backend.main.get_db", return_value=iter([db_session])):
         out = _run_match_rescore_task_runner(limit=10)
     assert out["rescored"] == 0

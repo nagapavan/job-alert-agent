@@ -544,3 +544,63 @@ class TestEmptyNiceToHaveSet:
         )
         assert features.nice_count == 0
         assert features.must_count > 0
+
+
+class TestAtsHeaderChromeIsNotScored:
+    """Issue #98: an ATS page's metadata block and inline preferences must not be scored.
+
+    Synthetic posting shaped like an ADP career-centre page: the metadata block sits before
+    the first heading, and two requirements are marked nice-to-have inline.
+    """
+
+    JD = (
+        "Principal Software Engineer\n"
+        "Development\n"
+        "Remote India, IN\n"
+        "Full Time\n"
+        "Professional\n"
+        "24 days ago\n"
+        "Requisition ID: 1427\n"
+        "Apply\n"
+        "Save\n"
+        "\n"
+        "The Desired Attributes:\n"
+        "\n"
+        "Bachelor's degree in computer science, Engineering, or a related field.\n"
+        "10+ years of professional software development disciplines\n"
+        "1+ year in Principal Software Engineering role\n"
+        "Strong expertise in service-oriented architecture\n"
+        "Strong expertise in Ruby on Rails\n"
+        "Strong leadership and mentorship skills\n"
+        "Experience with NATS.IO, Jetstream, or Kafka preferred\n"
+        "Experience with GOlang preferred\n"
+    )
+    RESUME = "Principal engineer. Built services with Kafka and Go. 12 years of experience."
+
+    def _assessment(self):
+        return build_deterministic_assessment(
+            self.JD, {"skills": ["Kafka", "Go"]}, resume_text=self.RESUME,
+            job_title="Principal Software Engineer",
+        )
+
+    def test_portal_chrome_never_becomes_a_requirement(self):
+        texts = {r.text.lower() for r in self._assessment().requirements}
+        for chrome in (
+            "full time", "professional", "development", "apply", "save",
+            "24 days ago", "requisition id: 1427", "remote india, in",
+        ):
+            assert chrome not in texts, chrome
+
+    def test_seniority_word_is_not_a_technology_requirement(self):
+        texts = [r.text.lower() for r in self._assessment().requirements]
+        assert not any("years principal" in t for t in texts)
+        assert not any(t == "principal" for t in texts)
+
+    def test_inline_preferred_skills_are_nice_to_have(self):
+        by_text = {r.text: r.category for r in self._assessment().requirements}
+        assert by_text.get("Kafka") == "nice_to_have"
+        assert by_text.get("Go") == "nice_to_have"
+
+    def test_the_real_must_haves_survive(self):
+        by_text = {r.text: r.category for r in self._assessment().requirements}
+        assert by_text.get("Ruby on Rails") in (None, "must_have")

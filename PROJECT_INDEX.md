@@ -47,8 +47,27 @@ Quick-lookup reference for locating where changes should be made.
 **Responsibility:** Single source of truth for heading/section intent (replaced three duplicated detectors).
 - `classify_heading(line, domain="jd"|"resume"|"must_have")` — intent label or `"unknown"`; word-boundary matching, embeddings only as a JD fallback.
 - `jd_section_spans` / `label_at` / `mask_spans` / `first_preferred_offset` — JD segmentation helpers.
+- `leading_header_chrome_end` — end offset of a leading ATS metadata block (title, department, location, worker category, job class, posted-date badge, requisition id, Apply/Save). Requires **two** chrome signals, so a flat JD that opens with a bare skills list keeps its leading `required` span.
+- `ends_with_preference_cue` — inline `... preferred` / `... a plus` marks one requirement `preferred`, then the surrounding section label resumes.
 - `is_must_have_heading` (preference-filter policy) / `starts_with_preference_cue` (line-start-only).
 - `normalize_heading` — shared heading normalization.
+
+### `backend/title_parser.py`
+**Responsibility:** Parse merged LinkedIn card text into a real title + employer (shared by the live scanner and the repair scripts).
+- `parse_merged_title(text, known_companies)` — cascade: duplicated role → known employer → role-word tail (known name / camel case / separator / team prefix / suffix anchor) → camel case anywhere; returns confidence `high`/`medium`/`low`/`none`.
+- `resolve_company_name(name)` — canonicalises an employer through `data/company_synonyms.json` (canonical → aliases), longest-known-prefix, then a legal-suffix strip; descriptive words (`Society`, `Energy`, `Exchange`) are never stripped.
+- `is_bucket_company(name)` — recognises placeholder buckets (`LinkedIn Network`, `Unknown Company`) that must never absorb a parsed employer.
+
+### `backend/requisition.py`
+**Responsibility:** The employer's own requisition id, the strongest attribution key a mail carries.
+- `extract_requisition_id(*texts)` — returns `(id, source)` from `gh_jid=` (greenhouse), `jobId=` (adp), `JR\d+` / `R-?\d+` (workday), or a bare id in parentheses (`... (200045102)`, generic). False positives are harmless: an id only matches a job that stores the same one.
+- Stored on `Job.requisition_id` / `requisition_source` at ATS ingest (from the posting URL) and learned from a mail **only** on an unambiguous match.
+
+### `backend/channel_status.py`
+**Responsibility:** One vocabulary for per-channel discovery outcomes plus run-level aggregation.
+- Vocabulary: `ok`, `skipped_flag`, `not_connected`, `dependency_missing`, `degraded_zero`, `cooling_down`, `error`.
+- `record(outcomes, channel, outcome, reason)` — append a normalised outcome (reasons capped at 240 chars).
+- `unhealthy` / `aggregate_status` / `describe` — `Failed` only when every requested channel raised; `skipped_flag` is not a degradation; `Partial` for every other degradation. Backs `OperationLog.status` and the `details_json["channels"]` breakdown.
 
 ### `backend/skill_taxonomy.py`
 **Responsibility:** Data-driven skill taxonomy (canonical name → aliases + concepts).
@@ -78,7 +97,7 @@ Quick-lookup reference for locating where changes should be made.
 **Responsibility:** Bounded graceful drain on the ASGI shutdown lifecycle.
 - `run_shutdown` (idempotent) / `is_shutting_down` / `DRAIN_DEADLINE_SECONDS`.
 - Drain order: `scheduler.stop()` → `task_engine.cancel_all()` → `llm_queue.stop()` → `clean_stale_profile_locks()` **last**.
-- **Never register signal handlers** here — uvicorn owns SIGTERM/SIGINT and firing the lifecycle is enough; custom handlers broke `--reload` three ways. See `AGENTS.md` §12.11.
+- **Never register signal handlers** here — uvicorn owns SIGTERM/SIGINT and firing the lifecycle is enough; custom handlers broke `--reload` three ways. See `DESIGN.md` §12.11.
 
 ### `backend/company_catalog.py`
 **Responsibility:** Loads the static company catalog used for discovery/targeting.
@@ -129,6 +148,12 @@ Quick-lookup reference for locating where changes should be made.
 - `POST /api/match/analyze` — stateless structured resume↔job match analysis (`match_score`, `strengths`, `gaps`, `feedback`); falls back to the active resume and never fabricates a score (`match_score=None` + `error` on failure).
 - `POST /api/jobs/{job_id}/interview-questions` — JD-derived questions with STAR scaffolds & resume-grounded answers (400 without an active resume, 404 missing job, 502 on generation error).
 - `POST /api/tasks/sync/all` — one-shot "Sync All" orchestrator (ATS portals → Google Jobs → LinkedIn → application-status sync) with per-stage skip/fail handling.
+- `POST /api/tasks/sync/gmail` — queues the Gmail sync as a background task (4 steps: fetch → classify → apply → done) so it appears in the task queue/SSE feed and writes one `gmail_sync` `OperationLog`.
+- `POST /api/gmail/sync` — the same run synchronously, for API/CLI callers (disabled → `status="disabled"`, unconnected → `status="not_connected"`, exception → 502 after the `Failed` log row is written).
+- `POST /api/jobs/{job_id}/rescore` — re-scores one posting from its cached description (deterministic first, LLM only as the bounded fallback); the shared primitive behind stale-only bulk rescore and lazy re-score on open.
+- `POST /api/email/applications/pending/{id}/accept` — tracks a staged email as an application: attaches to the row with application evidence (never the oldest duplicate), applies the email's outcome as a status + evidence note, and records the message link.
+- Email → application attribution (`_match_job_for_email_event`) runs strongest key first: **requisition id** → **thread** (a reply inherits its thread's linked application) → company + title (exact > contains > overlap). Every decision is persisted in `email_application_links` (unique `message_id`), so the same mail can never attach to two applications and a correction is an update, not an appended note.
+- `GET /api/email/applications/pending` — staged application emails for the review banner (14-day expiry, one actionable row each; `accept` / `ignore` / `ignore-domain`).
 - `GET /api/linkedin/last-sync` — latest LinkedIn sync batch summary (batch id, added counts, pending-review count) powering the SPA "N new from sync" review banner.
 - `GET /api/jobs` — job list; supports `status`, `source_type` (linkedin/direct/email), `sync_batch`, and `new_from_sync` filters for the review queue.
 
@@ -235,15 +260,12 @@ Quick-lookup reference for locating where changes should be made.
 ### `docs/GMAIL_API.md`
 **Responsibility:** Opt-in BYOK Gmail API design & setup (implemented).
 
-### `docs/antigravity/`
-**Responsibility:** Original Antigravity IDE planning artifacts (requirements, plan, task, walkthrough) — provenance only.
-
 ---
 
 ## Code Examples — Major Components
 
 Short, real snippets showing the public contract of each major component. See the source files
-for the full implementations, and `AGENTIC_ARCHITECTURE.md` / `AGENTS.md` for the surrounding
+for the full implementations, and `AGENTIC_ARCHITECTURE.md` / `DESIGN.md` for the surrounding
 design (tiers, prompts, schema, security).
 
 ### `backend/ai_helper.py` — unified generation & structured outputs
@@ -510,6 +532,12 @@ catalog = load_company_catalog()                                 # list[dict] of
 
 ### `frontend/` — SPA (no build step)
 
+Sections are addressable, so a refresh no longer drops the operator on the job feed:
+`#/dashboard`, `#/tracker`, `#/companies`, `#/resume`, `#/tasks`, `#/settings`.
+`activateSection(name)` is the single entry point — nav clicks set the hash and `hashchange`
+performs the switch, so clicks, reload and Back/Forward share one code path (and the per-section
+loaders run once per activation).
+
 ```javascript
 // app.js: talk to the same-origin API; X-Request-ID is echoed by the server
 const res = await fetch("/api/jobs?status=Shortlisted");
@@ -523,6 +551,11 @@ await fetch("/api/tasks/discovery/google-jobs", {
 const es = new EventSource("/api/tasks/events");   // SSE progress
 es.onmessage = (e) => updateProgressBar(JSON.parse(e.data));
 ```
+
+The job dossier is a dock on wide screens: the column only exists while a job is open or the panel
+is pinned (`body.dock-wide`, width `--dock-width: clamp(520px, 31vw, 580px)` — the same 580px the
+slide-over uses). The copilot launcher/drawer offset off the same variable. Below 1500px the panel
+is a slide-over instead.
 
 ### `extension/` — hybrid runtime adapter
 

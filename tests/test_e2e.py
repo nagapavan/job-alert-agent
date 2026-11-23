@@ -6,9 +6,8 @@ from unittest.mock import patch, MagicMock
 from conftest import test_client as client
 
 @patch("backend.main.generate_text")
-@patch("backend.main.gather_company_intelligence")
-@patch("backend.main.scrape_greenhouse_jobs")
-def test_full_application_lifecycle_e2e(mock_gh, mock_intel, mock_gen):
+@patch("backend.scraper.scrape_greenhouse_jobs")
+def test_full_application_lifecycle_e2e(mock_gh, mock_gen):
     """
     End-to-End Test covering the full user flow:
     1. Resume Upload & ATS Parsing
@@ -19,13 +18,6 @@ def test_full_application_lifecycle_e2e(mock_gh, mock_intel, mock_gen):
     6. Post-Application RAG Chat Coaching
     7. Application Status Transitions & Event History Audit
     """
-    # Mocks
-    mock_intel.return_value = {
-        "description": "Leading global financial infrastructure platform.",
-        "recent_news": "Announced support for instant global payouts.",
-        "salary_insights": "$180k - $240k Base",
-        "hiring_process": "1. Recruiter Screen -> 2. Technical Coding -> 3. System Architecture"
-    }
     mock_gh.return_value = [
         {
             "title": "Principal Distributed Systems Engineer",

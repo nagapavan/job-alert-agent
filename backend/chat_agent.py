@@ -19,7 +19,8 @@ from backend.ai_helper import (
     resolve_semantic_essay_cache,
     judge_output,
 )
-from backend.company_catalog import compute_cosine_similarity
+from backend.embeddings import cosine_similarity as compute_cosine_similarity
+from backend.scoring_constants import SEMANTIC_CACHE_THRESHOLD
 from backend.prompts import career_copilot_system
 
 logger = logging.getLogger("chat_agent")
@@ -34,8 +35,11 @@ _STATUS_PATTERNS = (
     ("Screening", re.compile(r"\bscreen(?:ing|ed|s)?\b")),
     ("Offered", re.compile(r"\boffer(?:ed|ing|s)?\b")),
     ("Applied", re.compile(r"\bappl(?:y|ied|ies)\b")),
+    ("Interview Scheduling", re.compile(r"\binterview\s+schedul(?:e|ed|ing)\b")),
     ("Interview", re.compile(r"\binterview(?:ing|s)?\b")),
     ("Rejected", re.compile(r"\breject(?:ed|ion|s)?\b")),
+    ("Closed", re.compile(r"\bclosed?\b")),
+    ("Withdrawn", re.compile(r"\bwithdr(?:aw|ew|awn)\b")),
     ("Not Interested", re.compile(r"\b(?:not\s+interested|ignore|no\s+longer\s+interested)\b")),
 )
 
@@ -45,7 +49,8 @@ _STATUS_TARGET_STOPWORDS = {
     "role", "roles", "position", "positions", "please", "status", "stage", "as", "to",
     "mark", "set", "move", "update", "change", "flag", "put", "shortlist", "reject",
     "ignore", "offer", "offered", "applied", "apply", "screening", "screen", "interview",
-    "interviewing", "rejected", "rejection", "not", "interested", "longer", "candidate",
+    "interviewing", "scheduling", "schedule", "rejected", "rejection", "closed", "close",
+    "withdrawn", "withdraw", "not", "interested", "longer", "candidate",
 }
 
 
@@ -285,7 +290,10 @@ class CareerChatAgent:
 
     def _execute_status_update(self, job_id: int, new_status: str) -> Optional[Dict[str, Any]]:
         """Updates a job's status and logs an application event."""
-        valid_statuses = ["To Apply", "Shortlisted", "Applied", "Screening", "Interview", "Offered", "Rejected", "Not Interested"]
+        valid_statuses = [
+            "To Apply", "Shortlisted", "Applied", "Screening", "Interview Scheduling",
+            "Interview", "Offered", "Rejected", "Closed", "Withdrawn", "Not Interested",
+        ]
         canonical_status = next((s for s in valid_statuses if s.lower() == new_status.lower()), None)
         if not canonical_status:
             return None
@@ -545,7 +553,7 @@ class CareerChatAgent:
                 db=self.db,
                 company_name=focused_comp,
                 job_title=focused_role,
-                threshold=0.82
+                threshold=SEMANTIC_CACHE_THRESHOLD
             )
             if cached_hit:
                 actions_taken.append({

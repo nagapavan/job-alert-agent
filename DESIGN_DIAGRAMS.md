@@ -33,6 +33,7 @@ This document serves as the master architectural reference and design blueprint 
 18. [Full-Stack Dual-Sink Observability & Request Tracing Layer](#18-full-stack-dual-sink-observability--request-tracing-layer)
 19. [Text-Mode Architecture, Deployment & Module Dependency Map](#19-text-mode-architecture-deployment--module-dependency-map)
 20. [Structured Match Analysis, Interview Prep & No-Fabrication](#20-structured-match-analysis-interview-prep--no-fabrication)
+21. [Discovery Status Honesty & Background Gmail Sync](#21-discovery-status-honesty--background-gmail-sync)
 
 ---
 
@@ -220,8 +221,9 @@ flowchart TD
     C -->|Greenhouse| D["boards.greenhouse.io/<slug>"]
     C -->|Lever| E["jobs.lever.co/<slug>"]
     C -->|Ashby| F["jobs.ashbyhq.com/<slug>"]
+    C -->|ADP Workforce Now| ADP["workforcenow.adp.com (cid/ccId board)"]
     C -->|Workday / Custom| G["Root Career Domain"]
-    D & E & F & G --> H["Auto-Update Company.careers_url & Company.domain in Database"]
+    D & E & F & ADP & G --> H["Auto-Update Company.careers_url & Company.domain in Database"]
     H --> I["Future ATS Discovery Scans Query Official Direct REST API Firsthand"]
 ```
 
@@ -1057,7 +1059,8 @@ Illustrates the zero-token deterministic technical requirement extraction, candi
 ```mermaid
 flowchart TD
     subgraph OpenDossier ["1.0 Job Dossier Trigger"]
-        UserClick["User clicks 'View Dossier' on Job Card"] --> OpenModal["1.1 Open Job Details Drawer (details-modal)"]
+        UserClick["User selects a job row or clicks 'View Dossier'"] --> OpenModal["1.1 Open Job Details Panel (details-modal)"]
+        OpenModal --> DockMode["1.1.1 >=1500px: dock column (--dock-width 520-580px)\n<1500px: slide-over drawer"]
         OpenModal --> ReqSkills["1.2 Dispatch GET /api/jobs/{id}/skills-alignment"]
         OpenModal --> ReqTeam["1.3 Dispatch GET /api/jobs/{id}/hiring-team"]
     end
@@ -1270,7 +1273,7 @@ GPU inference (the queue enforces this).
 **Shutdown:** uvicorn owns `SIGTERM`/`SIGINT`; the drain runs from the ASGI shutdown lifecycle
 (`backend/shutdown.py::run_shutdown`) — scheduler → task engine → LLM queue → browser-profile locks
 last, bounded to 10 s and idempotent. Do not register custom signal handlers (they break
-`--reload`). `GET /api/health` reports `shutting_down: true` mid-drain. See `AGENTS.md` §12.11.
+`--reload`). `GET /api/health` reports `shutting_down: true` mid-drain. See `DESIGN.md` §12.11.
 
 ### 19.4 Storage & Persistence Layout
 
@@ -1346,3 +1349,59 @@ scheduler and once at startup.
 
 
 
+
+---
+
+## 21. Discovery Status Honesty & Background Gmail Sync
+
+Every discovery channel records its own outcome, and a run's status is an aggregate of those
+outcomes rather than a blanket `success`. This is what lets the Operations log distinguish
+"nothing to find" from "this channel is dead".
+
+```mermaid
+flowchart LR
+    subgraph Channels ["1.0 Channels (each records one outcome)"]
+        ATS["ATS portals\n(_execute_ats_scrape)"]
+        GJO["Google Jobs\n(queries + cooldown)"]
+        GML["Gmail\n(API or browser fallback)"]
+        LNK["LinkedIn\n(session-driven)"]
+    end
+
+    ATS & GJO & GML & LNK --> REC["channel_status.record(outcomes, channel, outcome, reason)"]
+
+    REC --> AGG{"channel_status.aggregate_status"}
+    AGG -->|"no degradation"| OK["OperationLog.status = success"]
+    AGG -->|"every requested channel raised"| FAIL["OperationLog.status = Failed"]
+    AGG -->|"anything else degraded"| PART["OperationLog.status = Partial"]
+
+    REC --> DET["details_json = {details, channels:[{channel, outcome, reason}]}"]
+    OK & FAIL & PART --> LOG[("operation_logs")]
+    LOG --> UI["SPA Operations & Sync History\n(per-channel breakdown + degraded reason)"]
+```
+
+Outcome vocabulary (`backend/channel_status.py`): `ok`, `skipped_flag`, `not_connected`,
+`dependency_missing`, `degraded_zero`, `cooling_down`, `error`. `skipped_flag` (the operator turned
+the channel off) is **not** a degradation; `degraded_zero` (the channel ran but a precondition
+failed, so zero means nothing) is.
+
+### 21.1 Gmail sync as a first-class task
+
+```mermaid
+sequenceDiagram
+    participant SPA
+    participant API as POST /api/tasks/sync/gmail
+    participant TE as task_engine
+    participant RUN as _run_gmail_sync_task_runner
+    participant DB as operation_logs
+
+    SPA->>API: queue sync (403 disabled / 400 not connected)
+    API->>TE: submit_task(gmail_sync, total_steps=4)
+    API-->>SPA: 202 {task_id, QUEUED}
+    TE->>RUN: fetch → classify → apply → done (progress_cb)
+    RUN->>DB: OperationLog(gmail_sync, status, details_json)
+    TE-->>SPA: SSE COMPLETED → refresh Gmail card, review queue, operations log
+```
+
+`POST /api/gmail/sync` remains the synchronous form for API/CLI callers: it runs the same
+`_execute_gmail_sync` and therefore writes the same record, raising 502 only after the `Failed`
+row is persisted. A zero-event API run is `degraded_zero` (→ `Partial`), never `ok`.

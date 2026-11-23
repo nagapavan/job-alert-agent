@@ -1,7 +1,18 @@
+import os
 import sys
+import tempfile
 import warnings
 from pathlib import Path
 import pytest
+
+# Importing backend.main runs setup_observability(), init_db() and scheduler.start() at module
+# scope, so these two settings must be in place BEFORE that import happens. Without them a plain
+# `pytest` flips the operator's live database to WAL, runs ~40 ALTER TABLE migrations on it, and
+# starts a real discovery scheduler thread that can fire a browser run mid-suite.
+os.environ.setdefault("JOB_ALERT_AGENT_NO_SCHEDULER", "1")
+os.environ.setdefault(
+    "DATABASE_URL", f"sqlite:///{Path(tempfile.mkdtemp(prefix='jaa-test-')) / 'import-time.db'}"
+)
 
 # Suppress upstream Starlette/FastAPI TestClient httpx deprecation warning
 warnings.filterwarnings(
@@ -119,6 +130,14 @@ def neutralize_robots(monkeypatch):
     yield
 
 
+def _refuse_browser_spawn(*_args, **_kwargs):
+    raise RuntimeError(
+        "A test tried to launch a real browser. Mock the module the caller imports "
+        "(e.g. patch('backend.routers.google_jobs.sync_playwright')) - a patch on a module "
+        "that no longer owns the name lets the real browser run and hits the live site."
+    )
+
+
 @pytest.fixture(autouse=True)
 def prevent_real_browser_spawns(tmp_path, monkeypatch):
     """
@@ -128,10 +147,21 @@ def prevent_real_browser_spawns(tmp_path, monkeypatch):
     Also isolates the persistent Chrome profile directory to a per-test temp path so the
     suite is hermetic even when a real browser currently holds the live profile lock
     (otherwise get_persistent_browser_context raises BrowserProfileBusy and spoils tests).
+
+    The launch guard is on ``BrowserType`` itself, not on one module's imported name: every
+    module that does ``from playwright.sync_api import sync_playwright`` binds its own reference
+    at import time, so patching a single module's name cannot protect the others. A stale
+    ``patch("backend.main.sync_playwright")`` in a test whose code moved to a router used to let
+    the real browser run and hit Google for Jobs (2026-11-18: seven live fetches, interstitial).
     """
     monkeypatch.setattr(
         "backend.playwright_app.CHROME_PROFILE_DIR", tmp_path / "chrome_profile"
     )
+    for _target in (
+        "playwright.sync_api.BrowserType.launch",
+        "playwright.sync_api.BrowserType.launch_persistent_context",
+    ):
+        monkeypatch.setattr(_target, _refuse_browser_spawn)
 
     with patch("backend.main.sync_playwright", MagicMock()):
         yield
@@ -143,16 +173,37 @@ def stub_discovery_llm_scoring(monkeypatch):
     Keep the suite hermetic: discovery ingestion (ATS/Google/LinkedIn/Hirist) scores jobs through
     the LLM-backed requirement engine. Stub it to an empty assessment so tests never call a real
     model. Tests that exercise scoring/endpoints patch ``assess_job_requirements`` themselves.
+
+    Patched in every module that calls it: ``backend.job_scoring`` holds its own reference bound at
+    import time and is what the ingestion paths reach, so patching ``backend.main`` alone was
+    vacuous once the scoring pipeline moved out (2026-11-18).
     """
-    from backend import main
+    from backend import job_scoring, main
     from backend.match_scoring import RequirementAssessment, compute_match
 
     def _empty(*args, **kwargs):
         assessment = RequirementAssessment(requirements=[])
         return assessment, compute_match(assessment)
 
-    if hasattr(main, "assess_job_requirements"):
-        monkeypatch.setattr(main, "assess_job_requirements", _empty)
+    for module in (job_scoring, main):
+        if hasattr(module, "assess_job_requirements"):
+            monkeypatch.setattr(module, "assess_job_requirements", _empty)
+
+
+def route_paths(app) -> list:
+    """Flatten ``app.routes`` into a path list, included routers included.
+
+    This FastAPI version keeps ``include_router`` as a single ``_IncludedRouter`` entry, so a plain
+    ``getattr(route, "path")`` sweep silently misses every route that was extracted into a router.
+    """
+    paths = []
+    for route in app.routes:
+        included = getattr(route, "original_router", None)
+        if included is not None:
+            paths.extend(getattr(r, "path", None) for r in included.routes)
+        else:
+            paths.append(getattr(route, "path", None))
+    return paths
 
 
 def override_get_db():

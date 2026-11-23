@@ -232,6 +232,38 @@ def countries_for_cities(cities: Iterable[str]) -> Set[str]:
     return countries_for_terms(cities)
 
 
+@functools.lru_cache(maxsize=1)
+def _primary_city_names() -> Set[str]:
+    """Lowercased *primary* city names from the gazetteer (alternate names excluded)."""
+    names: Set[str] = set()
+    try:
+        import geonamescache
+
+        for c in geonamescache.GeonamesCache().get_cities().values():
+            name = (c.get("name") or "").strip().lower()
+            if name:
+                names.add(name)
+    except Exception as exc:  # pragma: no cover - package missing
+        logger.debug(f"Primary city names unavailable: {exc}")
+    return names
+
+
+def is_place_name(term: str) -> bool:
+    """True when ``term`` names a place well enough to be treated as a location.
+
+    Only a curated alias or a city's **primary** name qualifies. Gazetteer *alternate* names are
+    deliberately excluded: "NLP" is an alternate name for Mbombela (ZA), and accepting it stripped
+    the role qualifier from "Staff Software Engineer - NLP", leaving "Staff Software Engineer" —
+    a different role that then matched the wrong application.
+    """
+    t = (term or "").strip().lower()
+    if not t:
+        return False
+    if t in _city_aliases():
+        return True
+    return t in _primary_city_names()
+
+
 def is_foreign_restricted(text: str, target_countries: Iterable[str]) -> bool:
     """
     True when the location references a country outside the target set. A location with no

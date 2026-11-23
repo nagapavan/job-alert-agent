@@ -3,7 +3,7 @@
 Backend-orchestrated, feature-flag-aware one-shot sync. Single background task via `task_engine`
 (unified progress/SSE/cancel). Stages run **serially** (single persistent browser profile).
 Scope: discovery (ATS + Google Jobs + optional LinkedIn) **and** application status sync.
-JobSpy stays an automatic fallback (with explicit log entries). UI: one button on Job Feed only.
+UI: one button on Job Feed only.
 
 ## Decisions
 - Orchestrator reads flags server-side (`get_feature_flags`); frontend only displays the enabled count.
@@ -16,7 +16,7 @@ JobSpy stays an automatic fallback (with explicit log entries). UI: one button o
 |---|------|--------|
 | T1 | Backend: extract `_execute_ats_scrape()` helper; add optional `cancel_token`/`progress_cb` | Done |
 | T2 | Backend: extract `_execute_external_sync()` helper; add optional `cancel_token`/`progress_cb` | Done |
-| T3 | Backend: JobSpy fallback log entries (info/debug) | Done |
+| T3 | ~~Backend: JobSpy fallback log entries~~ | Removed — JobSpy was deleted (2026-11) |
 | T4 | Backend: add `_run_sync_all_task_runner()` orchestrator | Done |
 | T5 | Backend: add `POST /api/tasks/sync/all` endpoint | Done |
 | T6 | Frontend: Sync All button on Job Feed radar bar + enabled-count state | Done |

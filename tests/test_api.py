@@ -440,15 +440,8 @@ def test_multi_resume_switching_and_deletion():
 # -------------------------------------------------------------
 # Integration Tests: Phase 5 Endpoints (Scrape, Apply, Chat)
 # -------------------------------------------------------------
-@patch("backend.main.gather_company_intelligence")
-@patch("backend.main.scrape_greenhouse_jobs")
-def test_trigger_jobs_scrape(mock_gh, mock_intel):
-    mock_intel.return_value = {
-        "description": "Leading payments infrastructure company.",
-        "recent_news": "Launched Stripe Billing in 5 new countries.",
-        "salary_insights": "$170k - $240k",
-        "hiring_process": "Recruiter -> Coding -> System Design",
-    }
+@patch("backend.scraper.scrape_greenhouse_jobs")
+def test_trigger_jobs_scrape(mock_gh):
     mock_gh.return_value = [
         {
             "title": "Staff Backend Engineer - Payments",
@@ -499,12 +492,12 @@ def test_trigger_jobs_scrape(mock_gh, mock_intel):
     assert "stopped" in stop_li_res.json()["message"]
 
 
-@patch("backend.main.scrape_workday_jobs")
-@patch("backend.main.scrape_workable_jobs")
-@patch("backend.main.scrape_smartrecruiters_jobs")
-@patch("backend.main.scrape_ashby_jobs")
-@patch("backend.main.scrape_lever_jobs")
-@patch("backend.main.scrape_greenhouse_jobs")
+@patch("backend.scraper.scrape_workday_jobs")
+@patch("backend.scraper.scrape_workable_jobs")
+@patch("backend.scraper.scrape_smartrecruiters_jobs")
+@patch("backend.scraper.scrape_ashby_jobs")
+@patch("backend.scraper.scrape_lever_jobs")
+@patch("backend.scraper.scrape_greenhouse_jobs")
 def test_trigger_jobs_scrape_forwards_filters_to_new_portals(
     mock_gh, mock_lev, mock_ashby, mock_sr, mock_wk, mock_wd
 ):
@@ -532,20 +525,19 @@ def test_trigger_jobs_scrape_forwards_filters_to_new_portals(
             },
         },
     )
-    with patch("backend.main.gather_company_intelligence"):
-        comp = client.post(
-            "/api/companies",
-            json={"name": "AcmePortalTest"},
-        ).json()
-        res = client.post(
-            "/api/jobs/scrape",
-            json={
-                "company_id": comp["id"],
-                "target_titles": "backend engineer",
-                "target_locations": "india",
-                "work_mode": "remote",
-            },
-        )
+    comp = client.post(
+        "/api/companies",
+        json={"name": "AcmePortalTest"},
+    ).json()
+    res = client.post(
+        "/api/jobs/scrape",
+        json={
+            "company_id": comp["id"],
+            "target_titles": "backend engineer",
+            "target_locations": "india",
+            "work_mode": "remote",
+        },
+    )
     assert res.status_code == 200
 
     assert mock_sr.called and mock_wk.called and mock_wd.called
@@ -559,12 +551,12 @@ def test_trigger_jobs_scrape_forwards_filters_to_new_portals(
         assert kwargs["careers_url"] is None
 
 
-@patch("backend.main.scrape_workday_jobs")
-@patch("backend.main.scrape_workable_jobs")
-@patch("backend.main.scrape_smartrecruiters_jobs")
-@patch("backend.main.scrape_ashby_jobs")
-@patch("backend.main.scrape_lever_jobs")
-@patch("backend.main.scrape_greenhouse_jobs")
+@patch("backend.scraper.scrape_workday_jobs")
+@patch("backend.scraper.scrape_workable_jobs")
+@patch("backend.scraper.scrape_smartrecruiters_jobs")
+@patch("backend.scraper.scrape_ashby_jobs")
+@patch("backend.scraper.scrape_lever_jobs")
+@patch("backend.scraper.scrape_greenhouse_jobs")
 def test_trigger_jobs_scrape_pins_company_to_its_ats_board(
     mock_gh, mock_lev, mock_ashby, mock_sr, mock_wk, mock_wd
 ):
@@ -587,18 +579,17 @@ def test_trigger_jobs_scrape_pins_company_to_its_ats_board(
             },
         },
     )
-    with patch("backend.main.gather_company_intelligence"):
-        comp = client.post(
-            "/api/companies",
-            json={
-                "name": "AcmePinnedPortal",
-                "careers_url": "https://apply.workable.com/acmepinned/",
-            },
-        ).json()
-        res = client.post(
-            "/api/jobs/scrape",
-            json={"company_id": comp["id"]},
-        )
+    comp = client.post(
+        "/api/companies",
+        json={
+            "name": "AcmePinnedPortal",
+            "careers_url": "https://apply.workable.com/acmepinned/",
+        },
+    ).json()
+    res = client.post(
+        "/api/jobs/scrape",
+        json={"company_id": comp["id"]},
+    )
     assert res.status_code == 200
 
     assert mock_wk.called
@@ -708,10 +699,10 @@ def test_frontend_static_serving():
     assert "Job Alert Agent" in res.text
 
 
-@patch("backend.main.sync_playwright")
-@patch("backend.main.scan_and_sync_linkedin_saved_jobs")
-@patch("backend.main.scan_linkedin_job_alerts")
-@patch("backend.main.scan_linkedin_job_recommendations")
+@patch("backend.routers.linkedin.sync_playwright")
+@patch("backend.routers.linkedin.scan_and_sync_linkedin_saved_jobs")
+@patch("backend.routers.linkedin.scan_linkedin_job_alerts")
+@patch("backend.routers.linkedin.scan_linkedin_job_recommendations")
 def test_linkedin_sync_endpoint(mock_recs, mock_alerts, mock_saved, mock_pw):
     mock_alerts.return_value = []
     # Setup mock recommendations
@@ -769,17 +760,17 @@ def test_linkedin_sync_endpoint(mock_recs, mock_alerts, mock_saved, mock_pw):
     rec_jobs = client.get("/api/jobs").json()
     assert any(j["title"] == "Staff ML Infrastructure Engineer" for j in rec_jobs)
 
-    # Verify closed job was marked as Rejected and logged
+    # Verify the closed posting was marked Closed (not Rejected) and logged
     closed_job = client.get(f"/api/jobs/{job['id']}").json()
-    assert closed_job["status"] == "Rejected"
+    assert closed_job["status"] == "Closed"
     events = client.get(f"/api/jobs/{job['id']}/events").json()
     assert any("Closed on LinkedIn" in e["description"] for e in events)
 
 
-@patch("backend.main.sync_playwright")
-@patch("backend.main.scan_and_sync_linkedin_saved_jobs")
-@patch("backend.main.scan_linkedin_job_alerts")
-@patch("backend.main.scan_linkedin_job_recommendations")
+@patch("backend.routers.linkedin.sync_playwright")
+@patch("backend.routers.linkedin.scan_and_sync_linkedin_saved_jobs")
+@patch("backend.routers.linkedin.scan_linkedin_job_alerts")
+@patch("backend.routers.linkedin.scan_linkedin_job_recommendations")
 def test_linkedin_saved_job_promotes_not_interested_to_shortlisted(
     mock_recs, mock_alerts, mock_saved, mock_pw
 ):
@@ -823,12 +814,12 @@ def test_linkedin_saved_job_promotes_not_interested_to_shortlisted(
     assert updated["status"] == "Shortlisted"
 
 
-@patch("backend.main.evaluate_job_due_diligence")
-@patch("backend.main.generate_embeddings")
-@patch("backend.main.check_semantic_dismissal")
-@patch("backend.main.get_db")
-@patch("backend.main.scan_and_sync_linkedin_saved_jobs")
-@patch("backend.main.scan_linkedin_job_alerts")
+@patch("backend.routers.linkedin.evaluate_job_due_diligence")
+@patch("backend.routers.linkedin.generate_embeddings")
+@patch("backend.dismissal.check_semantic_dismissal")
+@patch("backend.routers.linkedin.get_db")
+@patch("backend.routers.linkedin.scan_and_sync_linkedin_saved_jobs")
+@patch("backend.routers.linkedin.scan_linkedin_job_alerts")
 @patch("backend.playwright_app.is_profile_in_use", return_value=False)
 def test_scheduled_linkedin_sync_alerts_use_valid_kwargs(
     mock_in_use,
@@ -891,10 +882,10 @@ def test_scheduled_linkedin_sync_alerts_use_valid_kwargs(
     assert "max_alerts" in kwargs
 
 
-@patch("backend.main.fetch_linkedin_job_details")
+@patch("backend.routers.linkedin.fetch_linkedin_job_details")
 def test_linkedin_enrich_saved_job_repairs_merged_title_and_employer(mock_details):
     """A collapsed card ("TitleCompany" + placeholder employer) is repaired from the detail page."""
-    from backend.main import _linkedin_enrich_saved_job
+    from backend.routers.linkedin import _linkedin_enrich_saved_job
 
     mock_details.return_value = {
         "description": "About the job\nBuild large-scale data systems in Java and Spark.",
@@ -916,9 +907,9 @@ def test_linkedin_enrich_saved_job_repairs_merged_title_and_employer(mock_detail
     assert desc.startswith("About the job")
 
 
-@patch("backend.main.fetch_linkedin_job_details")
+@patch("backend.routers.linkedin.fetch_linkedin_job_details")
 def test_linkedin_enrich_saved_job_is_noop_on_fetch_failure(mock_details):
-    from backend.main import _linkedin_enrich_saved_job
+    from backend.routers.linkedin import _linkedin_enrich_saved_job
 
     mock_details.side_effect = RuntimeError("browser unavailable")
     item = {
@@ -1436,8 +1427,10 @@ def test_user_preferences_roundtrip_and_feature_flags():
     assert data["features"]["ats_smartrecruiters"] is False
     assert data["features"]["ats_workable"] is False
     assert data["features"]["ats_workday"] is False
-    # Amazon is blocklisted by default.
-    assert "amazon" in (data["excluded_companies"] or "").lower()
+    # Employers whose published terms forbid automated access are blocklisted by default.
+    seeded = (data["excluded_companies"] or "").lower()
+    for token in ("amazon", "booking.com", "ebay", "heineken", "target.com"):
+        assert token in seeded
 
     upd = client.put(
         "/api/preferences",
@@ -1551,55 +1544,52 @@ def test_skills_insights_aggregates_gaps(db_session):
     assert share_map["React"] > share_map["Kafka"]  # ranked by frequency
 
 
-@patch("backend.main.scrape_greenhouse_jobs")
+@patch("backend.scraper.scrape_greenhouse_jobs")
 def test_trigger_jobs_scrape_skips_disabled_portal(mock_gh):
     """A disabled portal flag must skip that scanner server-side."""
     mock_gh.return_value = []
     client.put("/api/preferences", json={"features": {"ats_greenhouse": False}})
-    with patch("backend.main.gather_company_intelligence"):
-        comp = client.post(
-            "/api/companies",
-            json={
-                "name": "GateDisabledTest",
-                "careers_url": "https://boards.greenhouse.io/gatedisabledtest",
-            },
-        ).json()
-        res = client.post("/api/jobs/scrape", json={"company_id": comp["id"]})
+    comp = client.post(
+        "/api/companies",
+        json={
+            "name": "GateDisabledTest",
+            "careers_url": "https://boards.greenhouse.io/gatedisabledtest",
+        },
+    ).json()
+    res = client.post("/api/jobs/scrape", json={"company_id": comp["id"]})
     assert res.status_code == 200
     mock_gh.assert_not_called()
 
 
-@patch("backend.main.scrape_greenhouse_jobs")
+@patch("backend.scraper.scrape_greenhouse_jobs")
 def test_trigger_jobs_scrape_master_switch_disables_all_ats(mock_gh):
     mock_gh.return_value = []
     client.put("/api/preferences", json={"features": {"ats_portals": False}})
-    with patch("backend.main.gather_company_intelligence"):
-        comp = client.post(
-            "/api/companies",
-            json={
-                "name": "MasterOffTest",
-                "careers_url": "https://boards.greenhouse.io/masterofftest",
-            },
-        ).json()
-        res = client.post("/api/jobs/scrape", json={"company_id": comp["id"]})
+    comp = client.post(
+        "/api/companies",
+        json={
+            "name": "MasterOffTest",
+            "careers_url": "https://boards.greenhouse.io/masterofftest",
+        },
+    ).json()
+    res = client.post("/api/jobs/scrape", json={"company_id": comp["id"]})
     assert res.status_code == 200
     mock_gh.assert_not_called()
 
 
-@patch("backend.main.scrape_greenhouse_jobs")
+@patch("backend.scraper.scrape_greenhouse_jobs")
 def test_trigger_jobs_scrape_skips_excluded_company(mock_gh):
     """Companies on the blocklist (default includes 'amazon') are never scanned."""
     mock_gh.return_value = []
-    with patch("backend.main.gather_company_intelligence"):
-        comp = client.post(
-            "/api/companies",
-            json={
-                "name": "AmazonExcludedTest",
-                "domain": "amazon-excluded.test",
-                "careers_url": "https://boards.greenhouse.io/amazonexcludedtest",
-            },
-        ).json()
-        res = client.post("/api/jobs/scrape", json={"company_id": comp["id"]})
+    comp = client.post(
+        "/api/companies",
+        json={
+            "name": "AmazonExcludedTest",
+            "domain": "amazon-excluded.test",
+            "careers_url": "https://boards.greenhouse.io/amazonexcludedtest",
+        },
+    ).json()
+    res = client.post("/api/jobs/scrape", json={"company_id": comp["id"]})
     assert res.status_code == 200
     mock_gh.assert_not_called()
     audit = client.get("/api/jobs/scrape-audit").json()
@@ -1621,6 +1611,28 @@ def test_preferences_strips_legacy_remote_pseudo_city(db_session):
     assert data["target_cities"] == "Dublin, Cork"
     # Persisted normalized value is returned on subsequent reads too
     assert client.get("/api/preferences").json()["target_cities"] == "Dublin, Cork"
+
+
+def test_preferences_publish_country_hub_suggestions(db_session):
+    """The SPA's country/hub suggestions ship with the preferences payload (no second request)."""
+    hubs = client.get("/api/preferences").json()["country_hubs"]
+    assert "all" in hubs
+    assert len(hubs) > 10
+    entry = hubs["all"]
+    assert entry["name"] and entry["flag"] and entry["hubs"]
+
+
+def test_blocklist_seeds_cover_careers_subdomains_without_word_collisions(db_session):
+    """Seeded employers are matched on domain, so an unrelated company sharing a common word survives."""
+    from backend.database import DEFAULT_EXCLUDED_COMPANIES, is_company_excluded
+
+    assert is_company_excluded("Amazon Web Services", "aws.amazon.com", db_session)
+    assert is_company_excluded("Target", "careers.target.com", db_session)
+    assert is_company_excluded("HEINEKEN", "careers.theheinekencompany.com", db_session)
+    # "target" alone is never a token: a company that merely contains the word is not blocked.
+    assert "target," not in DEFAULT_EXCLUDED_COMPANIES + ","
+    assert not is_company_excluded("Targeted Solutions", "targetedsolutions.com", db_session)
+    assert not is_company_excluded("Unrelated Labs", "unrelated.example", db_session)
 
 
 def test_confirm_submission_endpoint(db_session):
@@ -1701,7 +1713,7 @@ def test_linkedin_sync_route_requires_consent():
         "/api/preferences",
         json={"features": {"linkedin_sync": True}, "consents": {"linkedin_sync": {"ack": True}}},
     )
-    with patch("backend.main.has_consent", return_value=False):
+    with patch("backend.routers.linkedin.has_consent", return_value=False):
         res = client.post("/api/linkedin/sync")
     assert res.status_code == 403
 
@@ -2242,3 +2254,71 @@ def test_scoring_config_defaults_and_roundtrip():
     assert client.get("/api/preferences").json()["scoring_config"]["good"] == 60.0
 
 
+
+
+# -------------------------------------------------------------
+# Unknown-path attribution (issue #93)
+# -------------------------------------------------------------
+def test_unknown_path_404_logs_caller_headers(caplog):
+    """A 404 storm cannot be attributed without caller identity; the log line must carry it."""
+    import logging as _logging
+
+    with caplog.at_level(_logging.INFO, logger="api"):
+        res = client.get(
+            "/health",
+            headers={"User-Agent": "Probe/1.0", "Referer": "http://example.test/dashboard"},
+        )
+
+    assert res.status_code == 404
+    line = next(r.getMessage() for r in caplog.records if "/health" in r.getMessage())
+    assert "ua=Probe/1.0" in line
+    assert "referer=http://example.test/dashboard" in line
+
+
+def test_unknown_path_404_log_line_cannot_be_injected(caplog):
+    """Header values are flattened so a crafted UA cannot forge extra log lines."""
+    import logging as _logging
+
+    with caplog.at_level(_logging.INFO, logger="api"):
+        client.get("/health", headers={"User-Agent": "evil\nINFO forged line"})
+
+    line = next(r.getMessage() for r in caplog.records if "/health" in r.getMessage())
+    assert "\n" not in line
+    assert "evilINFO forged line" in line
+
+
+def test_log_safe_header_truncates_and_defaults():
+    from backend.main import _log_safe_header
+
+    assert _log_safe_header(None) == "-"
+    assert _log_safe_header("") == "-"
+    assert _log_safe_header("a" * 500) == "a" * 200
+
+
+def test_status_update_to_the_same_status_writes_no_event(db_session):
+    """A no-op selection must not append a 'Shortlisted -> Shortlisted' timeline row.
+
+    Job 238 carries five writes in twelve seconds, one of them a no-op: the SPA's status
+    <select> fires `change` even when the same option is re-picked.
+    """
+    from backend.database import ApplicationEvent, Company, Job
+
+    comp = Company(name="Globex")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(company_id=comp.id, title="Staff Software Engineer", status="Shortlisted")
+    db_session.add(job)
+    db_session.commit()
+
+    before = (
+        db_session.query(ApplicationEvent).filter(ApplicationEvent.job_id == job.id).count()
+    )
+    res = client.patch(f"/api/jobs/{job.id}/status", json={"status": "Shortlisted"})
+
+    assert res.status_code == 200
+    assert res.json()["status"] == "Shortlisted"
+    db_session.expire_all()
+    after = (
+        db_session.query(ApplicationEvent).filter(ApplicationEvent.job_id == job.id).count()
+    )
+    assert after == before
