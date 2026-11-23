@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import datetime
+from typing import Optional
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text, 
     DateTime, Float, ForeignKey, Boolean, TypeDecorator, UniqueConstraint,

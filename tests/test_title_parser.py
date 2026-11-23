@@ -99,9 +99,19 @@ def test_resolve_company_name_collapses_synonyms(variant, expected):
     assert resolve_company_name(variant, known) == expected
 
 
-def test_resolve_company_name_uses_the_synonym_file():
-    # "F5 Networks" is declared as an alias of F5 in data/company_synonyms.json.
-    assert resolve_company_name("F5 Networks", ["F5"]) == "F5"
+def test_resolve_company_name_uses_the_synonym_file(tmp_path, monkeypatch):
+    """The synonym table is read from data/company_synonyms.json (a local, gitignored file),
+    so the test supplies its own fixture instead of depending on the operator's data."""
+    import json
+
+    from backend import title_parser
+
+    synonyms = tmp_path / "company_synonyms.json"
+    synonyms.write_text(json.dumps({"F5": ["F5 Networks"]}), encoding="utf-8")
+    monkeypatch.setattr(title_parser, "_SYNONYMS_FILE", synonyms)
+    monkeypatch.setattr(title_parser, "_synonyms_cache", None)
+
+    assert title_parser.resolve_company_name("F5 Networks", ["F5"]) == "F5"
 
 
 def test_bucket_companies_are_recognised():

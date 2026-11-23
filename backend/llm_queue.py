@@ -227,6 +227,17 @@ class LLMQueueManager:
                 self._queue.task_done()
                 break
 
+            if not self._running:
+                # stop() flipped the flag while this worker was blocked in get(); the task it
+                # just picked up must not be dispatched, and its caller must not wait out the
+                # timeout. (The check at the top of the loop already passed.)
+                if not task.future.done():
+                    task.future.set_exception(
+                        RuntimeError("LLM queue stopped before this task ran.")
+                    )
+                self._queue.task_done()
+                continue
+
             if task.future.cancelled():
                 self._queue.task_done()
                 continue

@@ -76,7 +76,7 @@ def _resume_provenance_context(db: Session) -> dict:
     }
 
 
-def _apply_score_provenance(job_out: "JobOut", job: Job, ctx: dict) -> "JobOut":
+def _apply_score_provenance(job_out: "JobOut", job: "Job", ctx: dict) -> "JobOut":
     """Label a serialized job with the state of the resume version that produced its score.
 
     ``current`` also covers rows scored before provenance existed: unknown is treated as current
@@ -98,7 +98,7 @@ def _apply_score_provenance(job_out: "JobOut", job: Job, ctx: dict) -> "JobOut":
     return job_out
 
 
-def _attach_outreach_guidance(db: Session, job: Job, job_out: "JobOut") -> "JobOut":
+def _attach_outreach_guidance(db: Session, job: "Job", job_out: "JobOut") -> "JobOut":
     """Attach human-in-the-loop talking points when the job has an outreach draft (issue #27).
 
     Derived on read from the JD and the active resume, so nothing is persisted and no score is
@@ -127,7 +127,7 @@ def _attach_outreach_guidance(db: Session, job: Job, job_out: "JobOut") -> "JobO
     return job_out
 
 
-def _job_out(db: Session, job: Job, ctx: Optional[dict] = None) -> "JobOut":
+def _job_out(db: Session, job: "Job", ctx: Optional[dict] = None) -> "JobOut":
     """Serialize a job with company name and score provenance attached."""
     job_out = JobOut.model_validate(job)
     job_out.company_name = job.company.name if job.company else None
