@@ -371,6 +371,57 @@ SHORT_DOMAINS = {
 }
 
 
+# Query parameters that carry tracking data only. Posting ids (``jobId``, ``gh_jid``, ``cid``,
+# ``lever-origin`` is tracking but ``lever-source`` too) must survive: stripping the whole query
+# collapsed distinct postings into one URL (findings 52/54).
+TRACKING_QUERY_KEYS = frozenset(
+    {
+        "ref", "referrer", "referer", "source", "src", "fbclid", "gclid", "msclkid",
+        "mc_cid", "mc_eid", "trk", "trkinfo", "trackingid", "gh_src", "lever-source",
+        "lever-origin", "originalSubdomain", "spm", "scid",
+    }
+)
+
+
+def strip_tracking_params(url: str) -> str:
+    """Removes only known tracking query params, keeping posting ids in the query."""
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:  # noqa: BLE001 - an unparseable URL is returned as-is
+        return url
+    if not parsed.query:
+        return url
+    kept = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if not key.lower().startswith("utm_") and key.lower() not in TRACKING_QUERY_KEYS
+    ]
+    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(kept)))
+
+
+def normalize_job_url(url: str) -> str:
+    """Comparable form of a posting URL for dedupe: no tracking params, no fragment, no trailing
+    slash, lowercase scheme/host, ``www.`` dropped (finding 52)."""
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+    except Exception:  # noqa: BLE001
+        return url.strip()
+    scheme = (parsed.scheme or "https").lower()
+    netloc = (parsed.netloc or "").lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    path = parsed.path.rstrip("/")
+    return strip_tracking_params(
+        urllib.parse.urlunparse(
+            parsed._replace(scheme=scheme, netloc=netloc, path=path, fragment="")
+        )
+    )
+
+
 def unwrap_shortened_url(raw_url: str, timeout: int = 5) -> str:
     """
     Follows HTTP redirects for shortened URLs (lnkd.in, bit.ly, t.co, etc.)
@@ -448,8 +499,9 @@ def extract_portal_info_from_job_url(
         except Exception:
             pass
 
+    # Keep the query: ADP uses ?cid=&jobId=, Greenhouse ?gh_jid=. Only tracking params go.
     clean_apply_url = (
-        raw_url.split("?")[0] if "linkedin.com" not in raw_url else raw_url
+        strip_tracking_params(raw_url) if "linkedin.com" not in raw_url else raw_url
     )
     try:
         parsed = urllib.parse.urlparse(raw_url)
@@ -522,9 +574,8 @@ def extract_portal_info_from_job_url(
             careers_url = f"{parsed.scheme}://{parsed.netloc}"
         domain = hostname.replace("www.", "")
 
-    if not domain and company_name:
-        domain = f"{company_name.lower().replace(' ', '')}.com"
-
+    # No fabricated "<name>.com" fallback: the attribution matcher trusts `domain`, and inventing
+    # one files mail and dedupe against a host that may belong to someone else (finding 55).
     return {
         "canonical_apply_url": clean_apply_url,
         "careers_url": careers_url,
@@ -807,11 +858,39 @@ def scrape_adp_workforce_now_jobs(
     )
 
 
-def scrape_uber_jobs() -> List[Dict[str, str]]:
+def is_uber_company(name: str) -> bool:
+    """True only when ``name`` is Uber itself, not an employer whose name starts with "uber"."""
+    tokens = re.sub(r"[^a-z0-9 ]", " ", (name or "").lower())
+    tokens = re.sub(r"\s+", " ", tokens).strip().split()
+    return bool(tokens) and tokens[0] == "uber"
+
+
+def scrape_uber_jobs(pacer=None) -> List[Dict[str, str]]:
     """
     Fetches live job listings from Uber's public careers search API.
+
+    Goes through the same permission gate and pacer as everything else: this is an unofficial
+    endpoint the operator opted into, not a licence to post to uber.com unpaced.
     """
     url = "https://www.uber.com/api/loadSearchJobsResults"
+    if not may_fetch(url):
+        logger.info("Uber careers API is disallowed by robots/AI-use policy; skipping.")
+        return []
+    if pacer is None:
+        try:
+            from backend.ats.engine import active_pacer
+
+            pacer = active_pacer()
+        except Exception:  # noqa: BLE001 - pacing is best-effort
+            pacer = None
+    if pacer is not None:
+        try:
+            if not pacer.allow(url):
+                logger.info("Uber careers API skipped: host is cooling down or over its ceiling.")
+                return []
+            pacer.wait(url)
+        except Exception:  # noqa: BLE001
+            pass
     headers = {**HEADERS, "content-type": "application/json", "x-csrf-token": "x"}
     payload = {"params": {"query": "", "limit": 40}}
     try:
@@ -2336,7 +2415,42 @@ CLOSED_JOB_MARKERS = (
 )
 
 
-def probe_job_url_active(job_url: str, timeout: int = 10) -> bool:
+def _probe_get(url: str, *, pacer=None, timeout: int = 10):
+    """Permission-gated, paced GET shared by the requisition-liveness probes (finding 40).
+
+    Returns the response, or None when the request may not be made right now (robots/AI-use
+    deny, host cooling down, or the per-run ceiling). Callers treat None as "unknown", which
+    their existing policy maps to "assume active": a refused request must never look like a
+    closed requisition and auto-reject a real application.
+    """
+    if not may_fetch(url):
+        logger.info(f"Liveness probe skipped: policy disallows {url}")
+        return None
+    if pacer is None:
+        try:
+            from backend.ats.engine import active_pacer
+
+            pacer = active_pacer()
+        except Exception:  # noqa: BLE001 - pacing is best-effort
+            pacer = None
+    if pacer is not None:
+        try:
+            if not pacer.allow(url):
+                logger.info(
+                    f"Liveness probe skipped: {url} is cooling down or over its run ceiling."
+                )
+                return None
+            pacer.wait(url)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return requests.get(url, headers=HEADERS, timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Liveness probe request failed for {url}: {e}")
+        return None
+
+
+def probe_job_url_active(job_url: str, timeout: int = 10, pacer=None) -> bool:
     """
     Portal-agnostic requisition probe, shared as the fallback for every ATS probe.
 
@@ -2346,17 +2460,17 @@ def probe_job_url_active(job_url: str, timeout: int = 10) -> bool:
     """
     if not job_url or not job_url.strip():
         return False
-    try:
-        res = requests.get(job_url, headers=HEADERS, timeout=timeout)
-        if res.status_code in (404, 410):
+    res = _probe_get(job_url, pacer=pacer, timeout=timeout)
+    if res is None:
+        # Refused or unreachable: unknown, never "closed".
+        return True
+    if res.status_code in (404, 410):
+        return False
+    if res.status_code == 200:
+        text = (res.text or "").lower()
+        if any(marker in text for marker in CLOSED_JOB_MARKERS):
             return False
-        if res.status_code == 200:
-            text = (res.text or "").lower()
-            if any(marker in text for marker in CLOSED_JOB_MARKERS):
-                return False
-            return True
-    except Exception as e:
-        logger.debug(f"Generic job-active probe failed for {job_url}: {e}")
+        return True
     return True
 
 
@@ -2374,7 +2488,7 @@ def _extract_lever_slug_and_posting_id(job_url: str) -> Tuple[str, str]:
         return "", ""
 
 
-def probe_lever_job_active(job_url: str) -> bool:
+def probe_lever_job_active(job_url: str, pacer=None) -> bool:
     """
     Probes a Lever posting via the Public Postings API.
 
@@ -2389,16 +2503,14 @@ def probe_lever_job_active(job_url: str) -> bool:
     slug, posting_id = _extract_lever_slug_and_posting_id(job_url)
     if slug and posting_id:
         api_url = f"https://api.lever.co/v0/postings/{slug}/{posting_id}"
-        try:
-            res = requests.get(api_url, headers=HEADERS, timeout=10)
+        res = _probe_get(api_url, pacer=pacer)
+        if res is not None:
             if res.status_code == 200:
                 return True
             if res.status_code in (404, 410):
                 return False
-        except Exception as e:
-            logger.debug(f"Lever API probe failed for {api_url}: {e}")
 
-    return probe_job_url_active(job_url)
+    return probe_job_url_active(job_url, pacer=pacer)
 
 
 def _extract_smartrecruiters_slug_and_posting_id(job_url: str) -> Tuple[str, str]:
@@ -2430,7 +2542,7 @@ def _extract_smartrecruiters_slug_and_posting_id(job_url: str) -> Tuple[str, str
     return slug, posting_id
 
 
-def probe_smartrecruiters_job_active(job_url: str) -> bool:
+def probe_smartrecruiters_job_active(job_url: str, pacer=None) -> bool:
     """
     Probes a SmartRecruiters posting via the public Posting API.
 
@@ -2446,21 +2558,22 @@ def probe_smartrecruiters_job_active(job_url: str) -> bool:
         api_url = (
             f"https://api.smartrecruiters.com/v1/companies/{slug}/postings/{posting_id}"
         )
-        try:
-            res = requests.get(api_url, headers=HEADERS, timeout=10)
+        res = _probe_get(api_url, pacer=pacer)
+        if res is not None:
             if res.status_code == 200:
-                data = res.json() or {}
+                try:
+                    data = res.json() or {}
+                except Exception:  # noqa: BLE001 - a bad body is not a closed posting
+                    data = {}
                 active = data.get("active")
                 return True if active is None else bool(active)
             if res.status_code in (404, 410):
                 return False
-        except Exception as e:
-            logger.debug(f"SmartRecruiters API probe failed for {api_url}: {e}")
 
-    return probe_job_url_active(job_url)
+    return probe_job_url_active(job_url, pacer=pacer)
 
 
-def probe_greenhouse_job_active(job_url: str) -> bool:
+def probe_greenhouse_job_active(job_url: str, pacer=None) -> bool:
     """
     Probes if a Greenhouse job requisition remains actively open via Public API or HTTP probe.
     """
@@ -2479,14 +2592,12 @@ def probe_greenhouse_job_active(job_url: str) -> bool:
 
     if slug and job_id:
         api_url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs/{job_id}"
-        try:
-            res = requests.get(api_url, headers=HEADERS, timeout=10)
+        res = _probe_get(api_url, pacer=pacer)
+        if res is not None:
             if res.status_code == 200:
                 return True
             elif res.status_code in [404, 410]:
                 return False
-        except Exception as e:
-            logger.debug(f"Greenhouse API probe failed for {api_url}: {e}")
 
     # Fallback to the shared, portal-agnostic HTTP probe
-    return probe_job_url_active(job_url)
+    return probe_job_url_active(job_url, pacer=pacer)

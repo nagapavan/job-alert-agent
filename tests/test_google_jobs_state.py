@@ -88,3 +88,41 @@ class TestChannelDefault:
         from backend.database import DEFAULT_FEATURE_FLAGS
 
         assert DEFAULT_FEATURE_FLAGS["google_jobs"] is False
+
+
+class TestRunOutcomeHonesty:
+    def test_a_run_where_every_query_errored_keeps_the_cooldown(self, monkeypatch):
+        """No query reached Google, so the run says nothing about the block (finding 50)."""
+        monkeypatch.setattr(gjs, "COOLDOWN_HOURS", 24.0)
+        gjs.record_block("blocked")
+
+        gjs.record_run(queries_used=1, total=3, reached=0)
+
+        assert gjs.cooling_down_until() is not None
+
+    def test_a_run_that_reached_google_clears_the_cooldown(self, monkeypatch):
+        monkeypatch.setattr(gjs, "COOLDOWN_HOURS", 24.0)
+        gjs.record_block("blocked")
+
+        gjs.record_run(queries_used=1, total=3, reached=1)
+
+        assert gjs.cooling_down_until() is None
+
+    def test_an_unwritable_state_file_warns_instead_of_lying(self, tmp_path, caplog):
+        """`record_block` must not pretend the cooldown survived (finding 49)."""
+        blocked_path = tmp_path / "state-dir"
+        blocked_path.mkdir()
+        original = gjs.STATE_PATH
+        gjs.STATE_PATH = blocked_path
+        try:
+            with caplog.at_level("WARNING"):
+                until = gjs.record_block("blocked")
+        finally:
+            gjs.STATE_PATH = original
+
+        assert until is not None
+        assert gjs.last_save_error()
+        assert any(
+            "Could not persist Google Jobs state" in record.getMessage()
+            for record in caplog.records
+        )

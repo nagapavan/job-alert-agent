@@ -130,3 +130,41 @@ def test_clear_active_pacer_resets_run_state():
     engine.set_active_pacer(run2)
     assert run2.allow("https://a.example.com/1") is True
     engine.clear_active_pacer()
+
+
+def test_a_cooldown_survives_into_the_next_run(tmp_path):
+    """A 429'd host must not be re-hit at full speed by the next run (finding 48)."""
+    state = tmp_path / "host_cooldowns.json"
+    first = HostPacer(
+        0.0, cooldown_seconds=120.0, persist_path=state, _sleep=lambda s: None,
+        _monotonic=lambda: 0.0,
+    )
+    first.note_failure("https://a.example.com/1")
+    assert state.exists()
+
+    second = HostPacer(
+        0.0, cooldown_seconds=120.0, persist_path=state, _sleep=lambda s: None,
+        _monotonic=lambda: 0.0,
+    )
+    assert second.allow("https://a.example.com/2") is False
+    assert second.refusal_reason("https://a.example.com/2") == "cooldown"
+
+
+def test_a_ceiling_refusal_records_why():
+    p = HostPacer(0.0, max_requests_per_run=1, _sleep=lambda s: None)
+    assert p.allow("https://a.example.com/1") is True
+    p.wait("https://a.example.com/1")
+    assert p.allow("https://a.example.com/2") is False
+    assert p.refusal_reason("https://a.example.com/2") == "ceiling"
+    assert p.refusals() == {"a.example.com": "ceiling"}
+
+
+def test_a_success_clears_a_persisted_cooldown(tmp_path):
+    state = tmp_path / "host_cooldowns.json"
+    first = HostPacer(0.0, cooldown_seconds=120.0, persist_path=state, _sleep=lambda s: None)
+    first.note_failure("https://a.example.com/1")
+
+    second = HostPacer(0.0, cooldown_seconds=120.0, persist_path=state, _sleep=lambda s: None)
+    assert second.allow("https://a.example.com/2") is False
+    second.note_success("https://a.example.com/2")
+    assert second.allow("https://a.example.com/2") is True

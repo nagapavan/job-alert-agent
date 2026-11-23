@@ -108,3 +108,15 @@ def test_bucket_companies_are_recognised():
     assert is_bucket_company("LinkedIn Network")
     assert is_bucket_company("Unknown Company")
     assert not is_bucket_company("Acme")
+
+
+def test_known_name_prefix_is_a_word_sequence_not_a_substring():
+    """Known "Meta" must not swallow "Metabase" (finding 56)."""
+    known = ["Meta", "Uber", "Acme Corp"]
+
+    assert resolve_company_name("Metabase", known) == "Metabase"
+    assert resolve_company_name("Meta Platforms", known) == "Meta"
+    assert resolve_company_name("Uber Technologies Inc", known) == "Uber"
+    # Legal suffixes are stripped on both sides before the token comparison.
+    assert resolve_company_name("Acme Corporation", known) == "Acme Corp"
+    assert resolve_company_name("Globex", known) == "Globex"

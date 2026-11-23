@@ -73,8 +73,9 @@ def test_check_greenhouse_application_status_closed(mock_get):
     assert res["is_active"] is False
     assert any(k in res["status"].lower() for k in ["closed", "no longer accepting", "inactive"])
 
+@patch("backend.scraper.may_fetch", return_value=True)
 @patch("backend.scraper.requests.get")
-def test_probe_greenhouse_job_active_api_success(mock_get):
+def test_probe_greenhouse_job_active_api_success(mock_get, _mock_may_fetch):
     """Verifies that probe_greenhouse_job_active confirms active requisition via Public Board API."""
     mock_resp = MagicMock()
     mock_resp.status_code = 200
@@ -84,8 +85,9 @@ def test_probe_greenhouse_job_active_api_success(mock_get):
     url = "https://boards.greenhouse.io/stripe/jobs/12345"
     assert probe_greenhouse_job_active(url) is True
 
+@patch("backend.scraper.may_fetch", return_value=True)
 @patch("backend.scraper.requests.get")
-def test_probe_greenhouse_job_active_api_closed(mock_get):
+def test_probe_greenhouse_job_active_api_closed(mock_get, _mock_may_fetch):
     """Verifies that probe_greenhouse_job_active flags closed requisition when API returns 404."""
     mock_resp = MagicMock()
     mock_resp.status_code = 404
@@ -1164,3 +1166,69 @@ def test_external_sync_operation_log_carries_structured_changes(db_session, monk
     assert payload["status_changes"][0]["job_id"] == job.id
     assert payload["status_changes"][0]["to"] == "Rejected"
     assert any("Backend Engineer" in d for d in payload["details"])
+
+
+# -------------------------------------------------------------
+# Liveness probes go through the permission gate and pacer (finding 40)
+# -------------------------------------------------------------
+
+def test_probe_is_skipped_when_policy_disallows_the_host():
+    """A refused request must read as "unknown", never as a closed requisition."""
+    with patch("backend.scraper.may_fetch", return_value=False), patch(
+        "backend.scraper.requests.get"
+    ) as get:
+        assert probe_greenhouse_job_active(
+            "https://boards.greenhouse.io/acme/jobs/1"
+        ) is True
+        assert probe_job_url_active("https://acme.example/jobs/1") is True
+
+    get.assert_not_called()
+
+
+def test_probe_honours_the_pacer_refusal_and_does_not_request():
+    class RefusingPacer:
+        def __init__(self):
+            self.asked = []
+
+        def allow(self, url):
+            self.asked.append(url)
+            return False
+
+        def wait(self, url):
+            raise AssertionError("wait must not run when allow() refuses")
+
+    pacer = RefusingPacer()
+    with patch("backend.scraper.may_fetch", return_value=True), patch(
+        "backend.scraper.requests.get"
+    ) as get:
+        assert probe_lever_job_active("https://jobs.lever.co/acme/1", pacer=pacer) is True
+
+    assert pacer.asked
+    get.assert_not_called()
+
+
+def test_probe_waits_before_requesting_when_the_pacer_allows():
+    class AllowingPacer:
+        def __init__(self):
+            self.events = []
+
+        def allow(self, url):
+            self.events.append(("allow", url))
+            return True
+
+        def wait(self, url):
+            self.events.append(("wait", url))
+
+    pacer = AllowingPacer()
+    resp = MagicMock()
+    resp.status_code = 404
+    with patch("backend.scraper.may_fetch", return_value=True), patch(
+        "backend.scraper.requests.get", return_value=resp
+    ):
+        assert probe_greenhouse_job_active(
+            "https://boards.greenhouse.io/acme/jobs/1", pacer=pacer
+        ) is False
+
+    urls = [url for kind, url in pacer.events]
+    assert all("boards-api.greenhouse.io" in url or "boards.greenhouse.io" in url for url in urls)
+    assert ("wait", pacer.events[0][1]) in pacer.events

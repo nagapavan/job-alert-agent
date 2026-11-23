@@ -255,8 +255,9 @@ def test_scrape_ashby_jobs(mock_get):
 # -------------------------------------------------------------
 # Unit Tests: Uber Careers Scraper
 # -------------------------------------------------------------
+@patch("backend.scraper.may_fetch", return_value=True)
 @patch("backend.scraper.requests.post")
-def test_scrape_uber_jobs(mock_post):
+def test_scrape_uber_jobs(mock_post, _mock_may_fetch):
     mock_json = {
         "data": {
             "results": [
@@ -963,3 +964,81 @@ def test_scrape_workday_jobs_applies_filters(mock_post, mock_get):
     assert len(jobs) == 1
     assert jobs[0]["title"] == "Staff Software Engineer"
     assert all("Designer" not in j["title"] for j in jobs)
+
+
+def test_uber_match_is_exact_not_substring():
+    """"Uberflip" must not reach Uber's internal careers API (finding 72)."""
+    from backend.scraper import is_uber_company
+
+    assert is_uber_company("Uber")
+    assert is_uber_company("Uber Technologies Inc")
+    assert not is_uber_company("Uberflip")
+    assert not is_uber_company("Globex")
+
+
+def test_uber_scrape_goes_through_the_permission_gate_and_pacer():
+    """Uber's API is inside the polite stack now (finding 39)."""
+    from backend import scraper
+
+    class RefusingPacer:
+        def __init__(self):
+            self.asked = []
+
+        def allow(self, url):
+            self.asked.append(url)
+            return False
+
+        def wait(self, url):
+            raise AssertionError("wait must not run when allow() refuses")
+
+    pacer = RefusingPacer()
+    with patch.object(scraper, "may_fetch", return_value=True), patch.object(
+        scraper.requests, "post"
+    ) as post:
+        assert scraper.scrape_uber_jobs(pacer=pacer) == []
+
+    assert pacer.asked == ["https://www.uber.com/api/loadSearchJobsResults"]
+    post.assert_not_called()
+
+    with patch.object(scraper, "may_fetch", return_value=False), patch.object(
+        scraper.requests, "post"
+    ) as post:
+        assert scraper.scrape_uber_jobs(pacer=RefusingPacer()) == []
+    post.assert_not_called()
+
+
+# -------------------------------------------------------------
+# URL normalisation, tracking params and employer domains (#52/#54/#55)
+# -------------------------------------------------------------
+
+def test_normalize_job_url_ignores_tracking_and_cosmetic_differences():
+    from backend.scraper import normalize_job_url
+
+    base = normalize_job_url("https://acme.example/jobs/1")
+    assert normalize_job_url("https://WWW.acme.example/jobs/1/") == base
+    assert normalize_job_url("https://acme.example/jobs/1?utm_source=x&ref=y") == base
+    assert normalize_job_url("https://acme.example/jobs/1#apply") == base
+    # A query-carried posting id is part of the identity, not tracking.
+    assert normalize_job_url("https://acme.example/jobs?jobId=42") != base
+    assert "jobId=42" in normalize_job_url("https://acme.example/jobs?jobId=42&utm_medium=x")
+
+
+def test_strip_tracking_params_keeps_posting_ids():
+    from backend.scraper import strip_tracking_params
+
+    assert (
+        strip_tracking_params("https://acme.example/j?cid=7&jobId=42&utm_source=x&ref=y")
+        == "https://acme.example/j?cid=7&jobId=42"
+    )
+    assert (
+        strip_tracking_params("https://boards.greenhouse.io/a/jobs/1?gh_jid=9&gh_src=abc")
+        == "https://boards.greenhouse.io/a/jobs/1?gh_jid=9"
+    )
+
+
+def test_portal_info_no_longer_invents_a_domain():
+    from backend.scraper import extract_portal_info_from_job_url
+
+    info = extract_portal_info_from_job_url("not a url", "Acme Technologies")
+
+    assert not info or not info.get("domain")

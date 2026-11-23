@@ -693,6 +693,41 @@ def is_company_excluded(name: str, domain: str, db) -> bool:
     return any(tok in haystack for tok in tokens)
 
 
+def known_company_names(db, limit: int = 2000) -> list:
+    """The stored employer names, for alias/synonym resolution at ingestion (finding 57).
+
+    Bounded and name-only so the call is cheap enough to run once per ingestion batch.
+    """
+    try:
+        rows = (
+            db.query(Company.name)
+            .filter(Company.name.isnot(None))
+            .limit(limit)
+            .all()
+        )
+        return [row[0] for row in rows if row[0]]
+    except Exception:  # noqa: BLE001 - resolution is an enhancement, never a blocker
+        return []
+
+
+def find_or_create_company(db, name: str, domain: Optional[str] = None):
+    """Find-or-create the employer for an ingestion path, honouring the blocklist (finding 43).
+
+    Returns ``(company, created)``, or ``(None, False)`` when the name/domain is blocklisted.
+    Ingestion callers must skip the posting in that case: the ATS path already did, and every
+    other channel used to re-create the excluded employer.
+    """
+    if is_company_excluded(name, domain or "", db):
+        return None, False
+    company = db.query(Company).filter(Company.name.ilike(name)).first()
+    if company:
+        return company, False
+    company = Company(name=name, domain=domain)
+    db.add(company)
+    db.flush()
+    return company, True
+
+
 engine = None
 SessionLocal = None
 

@@ -19,7 +19,7 @@ from playwright.sync_api import sync_playwright
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from backend import linkedin_scan_queue
+from backend import channel_status, linkedin_scan_queue
 from backend.ai_helper import generate_embeddings, token_tracker
 from backend.config import (
     LINKEDIN_AUTOMATION_PACING_SECONDS,
@@ -30,6 +30,8 @@ from backend.database import (
     ApplicationEvent,
     Company,
     Job,
+    find_or_create_company,
+    known_company_names,
     OperationLog,
     Resume,
     get_db,
@@ -51,7 +53,7 @@ from backend.playwright_app import (
 from backend.preference_filter import PreferenceFilter
 from backend.scraper import evaluate_job_due_diligence, extract_portal_info_from_job_url
 from backend.task_engine import CancellationToken, task_engine
-from backend.title_parser import safe_company_name as _safe_company_name
+from backend.title_parser import resolve_company_name, safe_company_name as _safe_company_name
 
 logger = logging.getLogger(__name__)
 
@@ -93,17 +95,12 @@ class LinkedInLastSyncOut(BaseModel):
     has_sync: bool = False
 
 
-def _linkedin_upsert_company(db: Session, raw_name: Optional[str]) -> Company:
-    """Find or create the employer row for a LinkedIn posting (flush assigns the id)."""
+def _linkedin_upsert_company(db: Session, raw_name: Optional[str]) -> Optional[Company]:
+    """Find or create the employer row, or None when the employer is blocklisted (finding 43)."""
     comp_name = _safe_company_name(raw_name, "LinkedIn Network")
-    comp = db.query(Company).filter(Company.name.ilike(comp_name)).first()
-    if not comp:
-        comp = Company(
-            name=comp_name,
-            domain=f"{comp_name.lower().replace(' ', '')}.com",
-        )
-        db.add(comp)
-        db.flush()
+    # Alias/synonym resolution against the stored employers (finding 57).
+    comp_name = resolve_company_name(comp_name, known_company_names(db)) or comp_name
+    comp, _created = find_or_create_company(db, comp_name)
     return comp
 
 
@@ -167,6 +164,30 @@ def _linkedin_enrich_saved_job(page, item: Dict[str, Any]) -> str:
     if details.get("canonical_url"):
         item["url"] = details["canonical_url"]
     return (details.get("description") or "").strip()
+
+
+
+def _find_closed_saved_job(db, item):
+    """The stored row a closed saved-listing refers to, scoped to the card's employer.
+
+    Matching on title alone closed the first job with that title at *any* employer and wrote a
+    status event for it. A card whose employer does not resolve may match on exact URL only.
+    """
+    url = item.get("url") or ""
+    company_name = (item.get("company") or "").strip()
+    if company_name:
+        company = db.query(Company).filter(Company.name.ilike(company_name)).first()
+        if not company:
+            return None
+        return (
+            db.query(Job)
+            .filter(Job.company_id == company.id)
+            .filter((Job.title.ilike(item.get("title", ""))) | (Job.url == url))
+            .first()
+        )
+    if url:
+        return db.query(Job).filter(Job.url == url).first()
+    return None
 
 
 def _linkedin_find_existing_job(
@@ -533,6 +554,8 @@ def _sync_linkedin_alerts_and_saved(db: Session) -> LinkedInSyncResponse:
 
                 for rec in all_alert_items:
                     comp = _linkedin_upsert_company(db, rec.get("company"))
+                    if comp is None:
+                        continue
 
                     # Resolve external portal link if available
                     resolved_url, portal_info = _linkedin_resolve_portal(
@@ -647,14 +670,7 @@ def _sync_linkedin_alerts_and_saved(db: Session) -> LinkedInSyncResponse:
                 for item in saved_jobs:
                     if item.get("is_closed"):
                         # Find job in DB
-                        matched_job = (
-                            db.query(Job)
-                            .filter(
-                                (Job.title.ilike(item["title"]))
-                                | (Job.url == item.get("url", "___"))
-                            )
-                            .first()
-                        )
+                        matched_job = _find_closed_saved_job(db, item)
 
                         if matched_job:
                             # Only close pre-application states; never clobber active progress
@@ -693,6 +709,8 @@ def _sync_linkedin_alerts_and_saved(db: Session) -> LinkedInSyncResponse:
                                 saved_jd = _linkedin_enrich_saved_job(page, item) or saved_jd
 
                             comp = _linkedin_upsert_company(db, item.get("company"))
+                            if comp is None:
+                                continue
 
                             resolved_url, _portal_info = _linkedin_resolve_portal(
                                 comp, item.get("url", ""), comp.name
@@ -817,17 +835,21 @@ def _sync_linkedin_alerts_and_saved(db: Session) -> LinkedInSyncResponse:
 
     except Exception as e:
         logger.error(f"Error during LinkedIn sync: {e}")
-        total_processed = recs_found + saved_checked
-        return LinkedInSyncResponse(
-            total_processed=total_processed,
-            recommendations_found=recs_found,
-            recommendations_added=recs_added,
-            saved_jobs_checked=saved_checked,
-            saved_jobs_added=0,
-            already_existing=already_existing,
-            dismissed_filtered=dismissed_filtered,
-            closed_jobs_pruned=closed_pruned,
-            message=f"LinkedIn sync completed with notice: {str(e)}",
+        # Rows counted before a failed commit were never persisted, so report zeros and a
+        # non-200: a 200 with inflated counts is indistinguishable from a clean run (finding 59).
+        return JSONResponse(
+            status_code=500,
+            content={
+                "total_processed": recs_found + saved_checked,
+                "recommendations_found": recs_found,
+                "recommendations_added": 0,
+                "saved_jobs_checked": saved_checked,
+                "saved_jobs_added": 0,
+                "already_existing": already_existing,
+                "dismissed_filtered": dismissed_filtered,
+                "closed_jobs_pruned": 0,
+                "message": f"LinkedIn sync failed: {str(e)}",
+            },
         )
 
     return LinkedInSyncResponse(
@@ -966,14 +988,7 @@ def _run_linkedin_sync_task_runner(
                     )
                     for item in saved_jobs or []:
                         if item.get("is_closed"):
-                            matched_job = (
-                                db.query(Job)
-                                .filter(
-                                    (Job.title.ilike(item.get("title", "")))
-                                    | (Job.url == item.get("url", "___"))
-                                )
-                                .first()
-                            )
+                            matched_job = _find_closed_saved_job(db, item)
                             if matched_job and matched_job.status in (
                                 "To Apply",
                                 "Shortlisted",
@@ -1004,6 +1019,8 @@ def _run_linkedin_sync_task_runner(
                                     saved_jd = _linkedin_enrich_saved_job(_get_enrichment_page(), item) or saved_jd
 
                                 comp = _linkedin_upsert_company(db, item.get("company"))
+                                if comp is None:
+                                    continue
 
                                 resolved_url, _portal_info = _linkedin_resolve_portal(
                                     comp, item.get("url", ""), comp.name
@@ -1108,6 +1125,8 @@ def _run_linkedin_sync_task_runner(
                         alerts_filtered += 1
                         continue
                     comp = _linkedin_upsert_company(db, rec.get("company"))
+                    if comp is None:
+                        continue
 
                     resolved_url, portal_info = _linkedin_resolve_portal(
                         comp, rec.get("url", ""), comp.name
@@ -1131,10 +1150,40 @@ def _run_linkedin_sync_task_runner(
                         )
                         dismissal_match = dismissal.match
                         job_status = dismissal.status
+                        # Same scoring path the manual sync uses: a hardcoded 0 made every
+                        # Sync-All-discovered alert look worthless next to scored rows (finding 58).
                         match_score = 0
-                        match_analysis = (
-                            dismissal.analysis or "Direct LinkedIn Job Alert match."
-                        )
+                        match_analysis = None
+                        match_scored = False
+                        score_method = match_scored_at = match_band = apply_recommendation = None
+                        strengths = []
+                        gaps = []
+                        partials = []
+                        if not dismissal_match:
+                            (
+                                match_score,
+                                engine_analysis,
+                                match_scored,
+                                score_method,
+                                match_scored_at,
+                                match_band,
+                                apply_recommendation,
+                                strengths,
+                                gaps,
+                                partials,
+                            ) = _score_job_with_engine(
+                                db,
+                                resume_text,
+                                rec.get("description") or "",
+                                parsed_resume=parsed_resume,
+                                job_title=rec.get("title") or "",
+                            )
+                            if engine_analysis:
+                                match_analysis = engine_analysis
+                        if not match_analysis:
+                            match_analysis = (
+                                dismissal.analysis or "Direct LinkedIn Job Alert match."
+                            )
 
                         dd = evaluate_job_due_diligence(
                             job_title=rec.get("title", ""),
@@ -1156,6 +1205,15 @@ def _run_linkedin_sync_task_runner(
                             sync_batch_id=sync_batch_id,
                             match_score=match_score,
                             match_analysis=match_analysis,
+                            match_scored=match_scored,
+                            score_method=score_method,
+                            match_scored_at=match_scored_at,
+                            **(_score_provenance(db) if match_scored else {}),
+                            match_band=match_band,
+                            apply_recommendation=apply_recommendation,
+                            match_strengths_json=json.dumps(strengths) if match_scored else None,
+                            match_gaps_json=json.dumps(gaps) if match_scored else None,
+                            match_partials_json=json.dumps(partials) if match_scored else None,
                             is_ghost_job=dd.get("is_ghost_job", False),
                             embedding=job_emb,
                         )
@@ -1175,17 +1233,46 @@ def _run_linkedin_sync_task_runner(
                 total_steps=3,
             )
 
+        # Record a per-scan channel outcome, so "no saved jobs" and "the scan blew up" stop
+        # looking identical in the run details (finding 60).
+        outcomes: List[Dict[str, Any]] = []
+        saved_error = next((e for e in scan_errors if e.startswith("saved_jobs:")), None)
+        alerts_error = next((e for e in scan_errors if e.startswith("alerts:")), None)
+        if saved_error:
+            channel_status.record(
+                outcomes, "linkedin_saved_jobs", channel_status.ERROR, saved_error
+            )
+        else:
+            channel_status.record(
+                outcomes,
+                "linkedin_saved_jobs",
+                channel_status.OK,
+                f"{saved_count} saved job(s) scanned/ingested",
+            )
+        if alerts_error:
+            channel_status.record(
+                outcomes, "linkedin_alerts", channel_status.ERROR, alerts_error
+            )
+        else:
+            channel_status.record(
+                outcomes,
+                "linkedin_alerts",
+                channel_status.OK,
+                f"{alerts_count} alert(s) ingested, {alerts_filtered} filtered",
+            )
+
+        # A run where both scans raised is not a completed sync: it reports the failure
+        # instead, so "no saved jobs" and "LinkedIn automation broke" stop looking identical.
+        stopped_by_request = linkedin_cancel_event.is_set()
+        log_status = (
+            "Failed"
+            if len(scan_errors) >= 2
+            else ("Partial" if (scan_errors or stopped_by_request) else "Completed")
+        )
+
         # Record a linkedin_sync OperationLog so the "N new from sync" review banner (which reads
         # the latest linkedin_sync log) reflects background/Sync-All runs, not just manual syncs.
         try:
-            # A run where both scans raised is not a completed sync: it reports the failure
-            # instead, so "no saved jobs" and "LinkedIn automation broke" stop looking identical.
-            stopped_by_request = linkedin_cancel_event.is_set()
-            log_status = (
-                "Failed"
-                if len(scan_errors) >= 2
-                else ("Partial" if (scan_errors or stopped_by_request) else "Completed")
-            )
             db.add(OperationLog(
                 operation_type="linkedin_sync",
                 status=log_status,
@@ -1207,6 +1294,7 @@ def _run_linkedin_sync_task_runner(
                         "closed_jobs_pruned": 0,
                         "sync_batch_id": sync_batch_id,
                         "total_added": total_found,
+                        "channels": outcomes,
                     }
                 ),
                 jobs_count=total_found,
@@ -1220,6 +1308,8 @@ def _run_linkedin_sync_task_runner(
             "alerts_ingested": alerts_count,
             "alerts_filtered_out_of_preference": alerts_filtered,
             "jobs_found": total_found,
+            "status": log_status,
+            "channels": outcomes,
         }
     finally:
         if scan_lock_held:

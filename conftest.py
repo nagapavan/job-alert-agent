@@ -71,6 +71,14 @@ def isolate_token_tracker_stats(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolate_pacing_cooldown_state(tmp_path, monkeypatch):
+    """Never read or write the real per-host cooldown file from a test run."""
+    monkeypatch.setattr(
+        "backend.ats.pacing.COOLDOWN_STATE_PATH", tmp_path / "host_cooldowns.json"
+    )
+
+
+@pytest.fixture(autouse=True)
 def isolate_llm_settings_file(tmp_path, monkeypatch):
     """
     Isolates persisted LLM/BYOK settings to a temporary file so tests never read or

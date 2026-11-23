@@ -21,12 +21,14 @@ from backend.ai_helper import generate_embeddings, token_tracker
 from backend.company_catalog import get_catalog_company
 from backend.config import decrypt_data
 from backend.database import (
+    CONSENT_REQUIRED_FEATURES,
     Company,
     Job,
     OperationLog,
     Resume,
     get_db,
     get_feature_flags,
+    has_consent,
     is_company_excluded,
 )
 from backend.dismissal import apply_dismissal_filter
@@ -234,250 +236,345 @@ def _execute_ats_scrape(
     # the per-run request ceiling. See docs/POLITE_CRAWLING_AND_WORKDAY.md §2.
     try:
         from backend.ats.engine import set_active_pacer
-        from backend.ats.pacing import build_pacer
+        from backend.ats.pacing import COOLDOWN_STATE_PATH, build_pacer
 
-        set_active_pacer(build_pacer())
+        # Cooldowns persist across runs (finding 48): a host that answered 429/503 last run is
+        # not re-hit at full speed by this one.
+        set_active_pacer(build_pacer(persist_path=COOLDOWN_STATE_PATH))
     except Exception as _pacing_err:  # noqa: BLE001 - pacing is best-effort
         logger.warning(f"Could not initialise scrape pacing: {_pacing_err}")
 
     global LATEST_SCRAPE_AUDIT
     audit_records = []
 
-    for comp in companies:
-        if cancel_token:
-            cancel_token.check()
-        if scrape_cancel_event.is_set():
-            logger.info("Job scraping cancelled by user.")
-            break
-
-        # Blocklist gate: never scan excluded employers/domains (e.g. Amazon).
-        if is_company_excluded(comp.name, comp.domain or comp.careers_url or "", db):
-            logger.info(f"Skipping scan for excluded company '{comp.name}'.")
-            audit_records.append(
-                {
-                    "company": comp.name,
-                    "portal_type": "Excluded",
-                    "careers_url": comp.careers_url or "",
-                    "status": "Excluded",
-                    "raw_found": 0,
-                    "added": 0,
-                    "diagnostics": "Skipped: company matches the excluded-companies blocklist.",
-                }
-            )
-            continue
-
-        # 1. Update company intelligence if empty from catalog or config
-        if not comp.recent_news or not comp.salary_insights:
-            cat_match = get_catalog_company(comp.name)
-            if cat_match:
-                comp.description = comp.description or cat_match.get("description")
-                comp.recent_news = cat_match.get("recent_news")
-                comp.salary_insights = cat_match.get("salary_insights")
-                comp.hiring_process = cat_match.get("hiring_process")
-                companies_updated += 1
-
-        discovered_jobs = []
-        comp_lower = comp.name.lower()
-
-        # A. Specialized company APIs (e.g. Uber) — opt-in (unofficial internal API)
-        if _ats_on and _flags.get("ats_uber") and "uber" in comp_lower:
-            discovered_jobs.extend(scraper.scrape_uber_jobs()[:35])
-
-        # B–C. Config-driven ATS portals (Greenhouse/Lever/Ashby/SmartRecruiters/Workable/Workday).
-        # One loop over data/ats_portals.json; each portal is gated by its own opt-in feature flag.
-        # A careers_url that *is* an ATS board pins the scan to that portal. Any other careers_url
-        # (auto-derived `https://www.<domain>/careers`, a direct portal) is never usable as a board
-        # slug, so those companies are probed by name instead (Uber (A) and Custom HTML (D) stay
-        # bespoke).
-        _pinned_portal = scraper.ats_for_url(comp.careers_url) if comp.careers_url else None
-        for _portal in _ATS_PORTALS:
-            if not (_ats_on and _flags.get(_portal.default_flag)):
-                continue
-            if _pinned_portal and _portal.id != _pinned_portal:
-                continue
-            _portal_fn = getattr(scraper, _portal.scraper_attr)
-            _portal_jobs = _portal_fn(
-                comp.name,
-                title_filters=title_filters,
-                city_filters=city_filters,
-                location_filters=loc_filters,
-                work_mode=wm_filter,
-                max_matches=35,
-                careers_url=comp.careers_url if _pinned_portal == _portal.id else None,
-            )
-            if _portal_jobs:
-                discovered_jobs.extend(_portal_jobs)
-
-        # D. Custom HTML portal scraper — opt-in (arbitrary HTML scraping)
-        if _ats_on and _flags.get("ats_custom_html") and comp.careers_url:
-            custom_jobs = scraper.scrape_custom_jobs(comp.careers_url)
-            if custom_jobs:
-                discovered_jobs.extend(custom_jobs[:35])
-
-        comp_raw_count = len(discovered_jobs)
-        total_found += comp_raw_count
-        comp_added = 0
-
-        # remove duplicates from discovered jobs based on url
-        unique_jobs = []
-        seen_urls = set()
-        for job in discovered_jobs:
-            if job["url"] not in seen_urls:
-                seen_urls.add(job["url"])
-                unique_jobs.append(job)
-        discovered_jobs = unique_jobs
-
-        # 3. Process each discovered job
-        for j in discovered_jobs:
+    try:
+        for comp in companies:
+            if cancel_token:
+                cancel_token.check()
             if scrape_cancel_event.is_set():
                 logger.info("Job scraping cancelled by user.")
                 break
 
-            # Semantic & Synonym Filtering via the shared preference gate
-            if not pref_filter.accepts(j.get("title", ""), j.get("location", ""), j.get("description", "")):
-                continue
-
-            existing = (
-                db.query(Job)
-                .filter(Job.company_id == comp.id, Job.title == j["title"])
-                .first()
-            )
-
-            if existing:
-                continue
-
-            # Evaluate due diligence / ghost job flags
-            dd = scraper.evaluate_job_due_diligence(
-                job_title=j["title"],
-                source_type=j.get("source_type", "Direct"),
-                portal_jobs=discovered_jobs,
-            )
-
-            # Negative role filter
-            dismissal = apply_dismissal_filter(
-                db, j["title"], j.get("description", ""), comp.name
-            )
-            dismissal_match = dismissal.match
-            job_status = dismissal.status
-            match_analysis = dismissal.analysis
-
-            # Requirement-coverage match score (deterministic engine).
-            match_score = 0
-            match_scored = False
-            score_method = match_scored_at = match_band = apply_recommendation = None
-            if not dismissal_match:
-                (
-                    match_score,
-                    engine_analysis,
-                    match_scored,
-                    score_method,
-                    match_scored_at,
-                    match_band,
-                    apply_recommendation,
-                    strengths,
-                    gaps,
-                    partials,
-                ) = _score_job_with_engine(
-                    db,
-                    resume_text,
-                    j.get("description") or "",
-                    parsed_resume=parsed_resume,
-                    job_title=j.get("title") or "",
+            # Blocklist gate: never scan excluded employers/domains (e.g. Amazon).
+            if is_company_excluded(comp.name, comp.domain or comp.careers_url or "", db):
+                logger.info(f"Skipping scan for excluded company '{comp.name}'.")
+                audit_records.append(
+                    {
+                        "company": comp.name,
+                        "portal_type": "Excluded",
+                        "careers_url": comp.careers_url or "",
+                        "status": "Excluded",
+                        "raw_found": 0,
+                        "added": 0,
+                        "diagnostics": "Skipped: company matches the excluded-companies blocklist.",
+                    }
                 )
-                if engine_analysis:
-                    match_analysis = engine_analysis
+                continue
 
-            job_emb = generate_embeddings(
-                f"{j['title']} {clean_job_description(j.get('description', '') or j['title'])}"
-            )
-            req_id, req_source = extract_requisition_id(j.get("url") or "")
-            new_job = Job(
-                company_id=comp.id,
-                title=j["title"],
-                description=j.get("description", ""),
-                url=j.get("url", comp.careers_url or ""),
-                requisition_id=req_id or None,
-                requisition_source=req_source or None,
-                salary_range=j.get("salary_range")
-                or comp.salary_insights
-                or "Competitive",
-                location=j.get("location", "Remote / Various"),
-                source=j.get("source", "Careers Portal"),
-                source_type=j.get("source_type", "Direct"),
-                status=job_status,
-                match_score=match_score,
-                match_analysis=match_analysis,
-                match_scored=match_scored,
-                score_method=score_method,
-                match_scored_at=match_scored_at,
-                **(_score_provenance(db) if match_scored else {}),
-                match_band=match_band,
-                apply_recommendation=apply_recommendation,
-                match_strengths_json=json.dumps(strengths) if match_scored else None,
-                match_gaps_json=json.dumps(gaps) if match_scored else None,
-                match_partials_json=json.dumps(partials) if match_scored else None,
-                cover_letter_draft=None,
-                tailored_resume_points=None,
-                cold_message_draft=None,
-                is_ghost_job=dd["is_ghost_job"],
-                repost_count=0,
-                embedding=job_emb,
-            )
-            db.add(new_job)
-            total_added += 1
-            comp_added += 1
+            # 1. Update company intelligence if empty from catalog or config
+            if not comp.recent_news or not comp.salary_insights:
+                cat_match = get_catalog_company(comp.name)
+                if cat_match:
+                    comp.description = comp.description or cat_match.get("description")
+                    comp.recent_news = cat_match.get("recent_news")
+                    comp.salary_insights = cat_match.get("salary_insights")
+                    comp.hiring_process = cat_match.get("hiring_process")
+                    companies_updated += 1
 
-        # Commit per company so the SQLite write lock is held for one portal fetch instead of the
-        # whole scan: a long run starved every other writer past the 30 s busy_timeout.
-        persist_error = None
-        try:
-            db.commit()
-        except Exception as commit_err:  # noqa: BLE001 - one failed batch must not abort the scan
-            persist_error = str(commit_err)[:200]
-            logger.warning(
-                f"Failed to persist scrape batch for '{comp.name}': {commit_err}"
-            )
+            discovered_jobs = []
+            comp_lower = comp.name.lower()
+            # A portal that raises must cost one audit row, not the rest of the scan (finding 46).
+            portal_errors: List[str] = []
+
             try:
-                db.rollback()
-            except Exception:  # noqa: BLE001 - recovery is best-effort
-                pass
-            total_added -= comp_added
+                from backend.ats.engine import active_pacer
+
+                _run_pacer = active_pacer()
+            except Exception:  # noqa: BLE001 - pacing is best-effort
+                _run_pacer = None
+            _refusals_before = _run_pacer.refusals() if _run_pacer is not None else {}
+
+            # A. Specialized company APIs (e.g. Uber) — opt-in (unofficial internal API)
+            if (
+                _ats_on
+                and _flags.get("ats_uber")
+                and has_consent(db, "ats_uber")
+                and scraper.is_uber_company(comp.name)
+            ):
+                try:
+                    discovered_jobs.extend(scraper.scrape_uber_jobs()[:35])
+                except Exception as portal_err:  # noqa: BLE001 - one portal cannot abort the scan
+                    portal_errors.append(f"uber: {portal_err}")
+                    logger.warning(f"Portal 'uber' failed for {comp.name}: {portal_err}")
+
+            # B–C. Config-driven ATS portals (Greenhouse/Lever/Ashby/SmartRecruiters/Workable/Workday).
+            # One loop over data/ats_portals.json; each portal is gated by its own opt-in feature flag.
+            # A careers_url that *is* an ATS board pins the scan to that portal. Any other careers_url
+            # (auto-derived `https://www.<domain>/careers`, a direct portal) is never usable as a board
+            # slug, so those companies are probed by name instead (Uber (A) and Custom HTML (D) stay
+            # bespoke).
+            _pinned_portal = scraper.ats_for_url(comp.careers_url) if comp.careers_url else None
+            for _portal in _ATS_PORTALS:
+                if not (_ats_on and _flags.get(_portal.default_flag)):
+                    continue
+                if (
+                    _portal.default_flag in CONSENT_REQUIRED_FEATURES
+                    and not has_consent(db, _portal.default_flag)
+                ):
+                    # A CONSENT_VERSION bump invalidates the stored acknowledgement while the flag
+                    # stays true, so the run must stop rather than keep scraping (finding 42).
+                    logger.info(
+                        f"Skipping portal '{_portal.id}' for {comp.name}: consent is not current."
+                    )
+                    continue
+                if _pinned_portal and _portal.id != _pinned_portal:
+                    continue
+                _portal_fn = getattr(scraper, _portal.scraper_attr)
+                try:
+                    _portal_jobs = _portal_fn(
+                        comp.name,
+                        title_filters=title_filters,
+                        city_filters=city_filters,
+                        location_filters=loc_filters,
+                        work_mode=wm_filter,
+                        max_matches=35,
+                        careers_url=comp.careers_url if _pinned_portal == _portal.id else None,
+                    )
+                except Exception as portal_err:  # noqa: BLE001 - one portal cannot abort the scan
+                    portal_errors.append(f"{_portal.id}: {portal_err}")
+                    logger.warning(
+                        f"Portal '{_portal.id}' failed for {comp.name}: {portal_err}"
+                    )
+                    continue
+                if _portal_jobs:
+                    discovered_jobs.extend(_portal_jobs)
+
+            # D. Custom HTML portal scraper — opt-in (arbitrary HTML scraping)
+            if (
+                _ats_on
+                and _flags.get("ats_custom_html")
+                and has_consent(db, "ats_custom_html")
+                and comp.careers_url
+            ):
+                try:
+                    custom_jobs = scraper.scrape_custom_jobs(comp.careers_url)
+                except Exception as portal_err:  # noqa: BLE001 - one portal cannot abort the scan
+                    portal_errors.append(f"custom_html: {portal_err}")
+                    logger.warning(
+                        f"Portal 'custom_html' failed for {comp.name}: {portal_err}"
+                    )
+                    custom_jobs = []
+                if custom_jobs:
+                    discovered_jobs.extend(custom_jobs[:35])
+
+            # A pacer refusal is a rate-limit signal, not "this employer has no jobs" (finding 47).
+            _refusals_after = _run_pacer.refusals() if _run_pacer is not None else {}
+            refused_hosts = {
+                host: reason
+                for host, reason in _refusals_after.items()
+                if _refusals_before.get(host) != reason
+            }
+
+            # Deduplicate on a normalised URL (tracking params, trailing slash, scheme/host case),
+            # so the same posting seen through two portals does not count twice, and report the
+            # audit's raw total after dedupe rather than before (finding 52).
+            unique_jobs = []
+            seen_urls = set()
+            for job in discovered_jobs:
+                key = scraper.normalize_job_url(job.get("url") or "")
+                if key and key in seen_urls:
+                    continue
+                seen_urls.add(key)
+                unique_jobs.append(job)
+            discovered_jobs = unique_jobs
+
+            comp_raw_count = len(discovered_jobs)
+            total_found += comp_raw_count
             comp_added = 0
 
-        status_text = (
-            "Success"
-            if comp_added > 0
-            else ("Filtered" if comp_raw_count > 0 else "0 Postings Found")
-        )
-        cat_match = get_catalog_company(comp.name)
-        comp_portal_type = (cat_match.get("portal_type") if cat_match else None) or (
-            "Greenhouse"
-            if "greenhouse" in (comp.careers_url or "").lower()
-            else "Direct"
-        )
-        diag_text = (
-            f"Found {comp_raw_count} postings, added {comp_added} matching targets."
-        )
-        if comp_raw_count == 0:
-            diag_text = f"No public API listings returned for {comp.name} ({comp_portal_type}). May require direct portal login or SPA renderer."
-        if persist_error:
-            status_text = "Failed"
+            # 3. Process each discovered job
+            for j in discovered_jobs:
+                if scrape_cancel_event.is_set():
+                    logger.info("Job scraping cancelled by user.")
+                    break
+
+                # Semantic & Synonym Filtering via the shared preference gate
+                if not pref_filter.accepts(j.get("title", ""), j.get("location", ""), j.get("description", "")):
+                    continue
+
+                # The requisition id names exactly one posting, so it dedupes retitled roles
+                # that the (company, title) key cannot (finding 53).
+                req_id, req_source = extract_requisition_id(j.get("url") or "")
+                existing = None
+                if req_id:
+                    existing = (
+                        db.query(Job)
+                        .filter(Job.company_id == comp.id, Job.requisition_id == req_id)
+                        .first()
+                    )
+                if existing is None:
+                    existing = (
+                        db.query(Job)
+                        .filter(Job.company_id == comp.id, Job.title == j["title"])
+                        .first()
+                    )
+
+                if existing:
+                    continue
+
+                # Evaluate due diligence / ghost job flags
+                dd = scraper.evaluate_job_due_diligence(
+                    job_title=j["title"],
+                    source_type=j.get("source_type", "Direct"),
+                    portal_jobs=discovered_jobs,
+                )
+
+                # Negative role filter
+                dismissal = apply_dismissal_filter(
+                    db, j["title"], j.get("description", ""), comp.name
+                )
+                dismissal_match = dismissal.match
+                job_status = dismissal.status
+                match_analysis = dismissal.analysis
+
+                # Requirement-coverage match score (deterministic engine).
+                match_score = 0
+                match_scored = False
+                score_method = match_scored_at = match_band = apply_recommendation = None
+                if not dismissal_match:
+                    (
+                        match_score,
+                        engine_analysis,
+                        match_scored,
+                        score_method,
+                        match_scored_at,
+                        match_band,
+                        apply_recommendation,
+                        strengths,
+                        gaps,
+                        partials,
+                    ) = _score_job_with_engine(
+                        db,
+                        resume_text,
+                        j.get("description") or "",
+                        parsed_resume=parsed_resume,
+                        job_title=j.get("title") or "",
+                    )
+                    if engine_analysis:
+                        match_analysis = engine_analysis
+
+                job_emb = generate_embeddings(
+                    f"{j['title']} {clean_job_description(j.get('description', '') or j['title'])}"
+                )
+                new_job = Job(
+                    company_id=comp.id,
+                    title=j["title"],
+                    description=j.get("description", ""),
+                    url=j.get("url", comp.careers_url or ""),
+                    requisition_id=req_id or None,
+                    requisition_source=req_source or None,
+                    salary_range=j.get("salary_range")
+                    or comp.salary_insights
+                    or "Competitive",
+                    location=j.get("location", "Remote / Various"),
+                    source=j.get("source", "Careers Portal"),
+                    source_type=j.get("source_type", "Direct"),
+                    status=job_status,
+                    match_score=match_score,
+                    match_analysis=match_analysis,
+                    match_scored=match_scored,
+                    score_method=score_method,
+                    match_scored_at=match_scored_at,
+                    **(_score_provenance(db) if match_scored else {}),
+                    match_band=match_band,
+                    apply_recommendation=apply_recommendation,
+                    match_strengths_json=json.dumps(strengths) if match_scored else None,
+                    match_gaps_json=json.dumps(gaps) if match_scored else None,
+                    match_partials_json=json.dumps(partials) if match_scored else None,
+                    cover_letter_draft=None,
+                    tailored_resume_points=None,
+                    cold_message_draft=None,
+                    is_ghost_job=dd["is_ghost_job"],
+                    repost_count=0,
+                    embedding=job_emb,
+                )
+                db.add(new_job)
+                total_added += 1
+                comp_added += 1
+
+            # Commit per company so the SQLite write lock is held for one portal fetch instead of the
+            # whole scan: a long run starved every other writer past the 30 s busy_timeout.
+            persist_error = None
+            try:
+                db.commit()
+            except Exception as commit_err:  # noqa: BLE001 - one failed batch must not abort the scan
+                persist_error = str(commit_err)[:200]
+                logger.warning(
+                    f"Failed to persist scrape batch for '{comp.name}': {commit_err}"
+                )
+                try:
+                    db.rollback()
+                except Exception:  # noqa: BLE001 - recovery is best-effort
+                    pass
+                total_added -= comp_added
+                comp_added = 0
+
+            status_text = (
+                "Success"
+                if comp_added > 0
+                else ("Filtered" if comp_raw_count > 0 else "0 Postings Found")
+            )
+            status_note = ""
+            if portal_errors:
+                status_note = "Portal error(s): " + "; ".join(portal_errors)[:200]
+                if comp_added == 0:
+                    status_text = "Failed"
+            elif refused_hosts and comp_raw_count == 0:
+                status_text = "Rate limited"
+                status_note = "Pacer refused: " + ", ".join(
+                    f"{host} ({reason})" for host, reason in sorted(refused_hosts.items())
+                )
+            cat_match = get_catalog_company(comp.name)
+            comp_portal_type = (cat_match.get("portal_type") if cat_match else None) or (
+                "Greenhouse"
+                if "greenhouse" in (comp.careers_url or "").lower()
+                else "Direct"
+            )
             diag_text = (
-                f"Found {comp_raw_count} postings, none persisted: batch write failed "
-                f"({persist_error})."
+                f"Found {comp_raw_count} postings, added {comp_added} matching targets."
+            )
+            if comp_raw_count == 0:
+                diag_text = f"No public API listings returned for {comp.name} ({comp_portal_type}). May require direct portal login or SPA renderer."
+            if persist_error:
+                status_text = "Failed"
+                diag_text = (
+                    f"Found {comp_raw_count} postings, none persisted: batch write failed "
+                    f"({persist_error})."
+                )
+            if status_note:
+                diag_text = f"{diag_text} {status_note}"
+
+            audit_records.append(
+                {
+                    "company": comp.name,
+                    "portal_type": comp_portal_type,
+                    "careers_url": comp.careers_url or "",
+                    "status": status_text,
+                    "raw_found": comp_raw_count,
+                    "added": comp_added,
+                    "diagnostics": diag_text,
+                }
             )
 
-        audit_records.append(
-            {
-                "company": comp.name,
-                "portal_type": comp_portal_type,
-                "careers_url": comp.careers_url or "",
-                "status": status_text,
-                "raw_found": comp_raw_count,
-                "added": comp_added,
-                "diagnostics": diag_text,
-            }
-        )
+    finally:
+        # Drop the run-level pacer on every exit path, including an unexpected abort, so a
+        # failed run cannot leave its counters/cooldowns active for the next one (finding 46).
+        try:
+            from backend.ats.engine import clear_active_pacer
+
+            clear_active_pacer()
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
 
     LATEST_SCRAPE_AUDIT = audit_records
     is_cancelled = scrape_cancel_event.is_set()
@@ -518,15 +615,6 @@ def _execute_ats_scrape(
 
     if progress_cb:
         progress_cb(step=1, label=msg, items_found=total_added, total_steps=1)
-
-    # Drop the run-level pacer: its per-host counters/cooldowns are run-scoped and must not leak
-    # into the next run. See backend/ats/engine.py::clear_active_pacer.
-    try:
-        from backend.ats.engine import clear_active_pacer
-
-        clear_active_pacer()
-    except Exception:  # noqa: BLE001 - best-effort cleanup
-        pass
 
     return ScrapeResponse(
         jobs_found=total_found,

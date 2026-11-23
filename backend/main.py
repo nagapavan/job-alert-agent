@@ -188,7 +188,9 @@ from backend.database import (
     EmailApplicationLink,
     EmailSuppression,
     PendingEmailApplication,
+    find_or_create_company,
     get_consents,
+    known_company_names,
     get_db,
     get_feature_flags,
     get_scoring_config,
@@ -262,7 +264,10 @@ from backend.scraper import (
 )
 from backend.requisition import extract_requisition_id
 from backend.task_engine import CancellationToken, task_engine
-from backend.title_parser import safe_company_name as _safe_company_name
+from backend.title_parser import (
+    resolve_company_name,
+    safe_company_name as _safe_company_name,
+)
 
 # Graceful shutdown is driven entirely by the ASGI lifespan (see `_lifespan` below). We
 # deliberately do NOT register our own signal handlers: uvicorn owns SIGTERM/SIGINT and calls the
@@ -4292,13 +4297,11 @@ def _ensure_tracked_job_for_email_event(db, ev):
         # A mangled subject fragment is not an employer; stage it for the operator instead of
         # minting a company like "GitLab was submitted".
         return None
-    comp = db.query(Company).filter(Company.name.ilike(comp_name)).first()
-    if not comp:
-        comp = Company(
-            name=comp_name, domain=f"{comp_name.lower().replace(' ', '')}.com"
-        )
-        db.add(comp)
-        db.flush()
+    comp_name = resolve_company_name(comp_name, known_company_names(db)) or comp_name
+    comp, _company_created = find_or_create_company(db, comp_name)
+    if comp is None:
+        # The employer is on the blocklist; never re-create it through mail either.
+        return None
     exists = (
         db.query(Job).filter(Job.company_id == comp.id, Job.title.ilike(role)).all()
     )
@@ -5075,13 +5078,10 @@ def _ingest_email_opportunities_to_db(
         if batch_key in seen:
             continue
 
-        comp = db.query(Company).filter(Company.name.ilike(comp_name)).first()
-        if not comp:
-            comp = Company(
-                name=comp_name, domain=f"{comp_name.lower().replace(' ', '')}.com"
-            )
-            db.add(comp)
-            db.flush()
+        comp_name = resolve_company_name(comp_name, known_company_names(db)) or comp_name
+        comp, _company_created = find_or_create_company(db, comp_name)
+        if comp is None:
+            continue
 
         if _find_existing_opportunity_job(db, comp.id, role, url):
             seen.add(batch_key)
@@ -5293,6 +5293,12 @@ def _execute_external_sync(
     - SmartRecruiters (`jobs.smartrecruiters.com`): Requisition availability probe via the public Posting API.
     - Gmail (`mail.google.com`): Interview invites and rejection status synchronization.
     """
+    # One pacer for the whole status sync: the liveness probes run once per Applied/Shortlisted
+    # row, so an unpaced loop is hundreds of requests to a single host in one run (finding 40).
+    from backend.ats.pacing import build_pacer
+
+    probe_pacer = build_pacer()
+
     hirist_checked = 0
     hirist_updated = 0
     hirist_ingested = 0
@@ -5306,7 +5312,7 @@ def _execute_external_sync(
     outcomes = []
 
     def _source_enabled(source: str, flag: str) -> bool:
-        """Probing runs only when the source is requested AND its portal flag is enabled."""
+        """Probing runs only when requested, the flag is on, and any required consent is current."""
         if source not in payload.sources and "all" not in payload.sources:
             return False
         if not is_feature_enabled(db, flag):
@@ -5315,6 +5321,16 @@ def _execute_external_sync(
             )
             channel_status.record(
                 outcomes, source, channel_status.SKIPPED_FLAG, f"'{flag}' disabled"
+            )
+            return False
+        if flag in CONSENT_REQUIRED_FEATURES and not has_consent(db, flag):
+            # The flag stays true across a CONSENT_VERSION bump, so consent has to be re-checked
+            # here or a scheduled run keeps scraping a portal the operator did not re-approve.
+            details.append(
+                f"{source} probing skipped: consent for '{flag}' is missing or outdated."
+            )
+            channel_status.record(
+                outcomes, source, channel_status.SKIPPED_FLAG, f"consent for '{flag}' not current"
             )
             return False
         return True
@@ -5406,18 +5422,15 @@ def _execute_external_sync(
                             )
                     else:
                         # New application on Hirist -> Ingest into DB
-                        comp = (
-                            db.query(Company)
-                            .filter(Company.name.ilike(comp_name))
-                            .first()
+                        comp_name = (
+                            resolve_company_name(comp_name, known_company_names(db))
+                            or comp_name
                         )
-                        if not comp:
-                            comp = Company(
-                                name=comp_name,
-                                domain=f"{comp_name.lower().replace(' ', '')}.com",
-                            )
-                            db.add(comp)
-                            db.flush()
+                        comp, _company_created = find_or_create_company(
+                            db, comp_name
+                        )
+                        if comp is None:
+                            continue
 
                         (
                             match_score,
@@ -5618,7 +5631,7 @@ def _execute_external_sync(
             )
 
             for gh_job in greenhouse_jobs:
-                is_active = probe_greenhouse_job_active(gh_job.url)
+                is_active = probe_greenhouse_job_active(gh_job.url, pacer=probe_pacer)
                 if not is_active and gh_job.status not in ("Rejected", "Closed"):
                     # A vanished requisition is a closure, not an employer rejection.
                     gh_job.status = "Closed"
@@ -5660,7 +5673,7 @@ def _execute_external_sync(
 
             for lv_job in lever_jobs:
                 if (
-                    not probe_lever_job_active(lv_job.url)
+                    not probe_lever_job_active(lv_job.url, pacer=probe_pacer)
                     and lv_job.status not in ("Rejected", "Closed")
                 ):
                     lv_job.status = "Closed"
@@ -5700,7 +5713,7 @@ def _execute_external_sync(
 
             for sr_job in sr_jobs:
                 if (
-                    not probe_smartrecruiters_job_active(sr_job.url)
+                    not probe_smartrecruiters_job_active(sr_job.url, pacer=probe_pacer)
                     and sr_job.status not in ("Rejected", "Closed")
                 ):
                     sr_job.status = "Closed"

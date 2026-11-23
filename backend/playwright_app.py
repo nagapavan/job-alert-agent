@@ -2264,16 +2264,33 @@ def fetch_google_jobs_playwright(
 
 def fetch_google_jobs_followed_queries_playwright(
     playwright_instance, 
-    headless: bool = True
+    headless: bool = True,
+    pacer=None,
 ) -> List[str]:
     """
     Navigates to Google for Jobs 'Following' tab in the persistent browser context.
     Extracts all saved/followed alert search queries created by the user.
+
+    The persistent context is closed on every path (finding 51): leaving it open held the
+    single-owner Chrome profile for the life of the process.
     """
     url = "https://www.google.com/search?q=jobs&ibp=htl;jobs"
     followed_queries = []
+    context = None
+    page = None
 
     try:
+        if pacer is not None:
+            try:
+                if not pacer.allow(url):
+                    logger.info(
+                        "Followed-query sync skipped: google.com is cooling down or over its "
+                        "per-run ceiling."
+                    )
+                    return []
+                pacer.wait(url)
+            except Exception:
+                pass
         context = get_persistent_browser_context(playwright_instance, headless=headless)
         page = context.new_page()
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
@@ -2300,9 +2317,23 @@ def fetch_google_jobs_followed_queries_playwright(
                     clean_q = l.split("Email to:")[0].strip()
                     followed_queries.append(clean_q)
 
-        page.close()
     except Exception as e:
         logger.warning(f"Could not extract followed Google Jobs queries via Playwright: {e}")
+    finally:
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
+        if context is not None:
+            try:
+                context.close()
+            except Exception as exc:
+                logger.warning(f"Followed-query context close failed: {exc}")
+        try:
+            clean_stale_profile_locks()
+        except Exception:
+            pass
 
     return followed_queries
 

@@ -42,12 +42,29 @@ def load_state() -> dict:
     return {}
 
 
-def _save_state(state: dict) -> None:
+# The last write's outcome, so a run can say "the cooldown is not durable" instead of assuming it
+# (finding 49). Scans are single-run threads, so one module-level slot is enough.
+_last_save_error: Optional[str] = None
+
+
+def last_save_error() -> Optional[str]:
+    """Why the most recent state write failed, or None when it succeeded."""
+    return _last_save_error
+
+
+def _save_state(state: dict) -> bool:
+    global _last_save_error
     try:
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        tmp = STATE_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        tmp.replace(STATE_PATH)
+        _last_save_error = None
+        return True
     except Exception as exc:  # noqa: BLE001 - best effort, never raise into a run
-        logger.debug("Could not persist Google Jobs state: %s", exc)
+        _last_save_error = str(exc)
+        logger.warning(f"Could not persist Google Jobs state to {STATE_PATH}: {exc}")
+        return False
 
 
 def cooling_down_until() -> Optional[datetime]:
@@ -86,12 +103,19 @@ def record_block(reason: str = "") -> datetime:
     return until
 
 
-def record_run(queries_used: int, total: int) -> None:
-    """Clear the cooldown and advance the rotation cursor after a run that was not blocked."""
+def record_run(queries_used: int, total: int, reached: Optional[int] = None) -> None:
+    """Advance the rotation cursor after a run that was not blocked.
+
+    The cooldown is cleared only when at least one query actually reached Google (finding 50):
+    a run where every query raised says nothing about whether the block expired, so it must not
+    silently re-enable the channel. ``reached=None`` keeps the clearing behaviour for callers
+    that have no per-query outcome.
+    """
     state = load_state()
-    state.pop("blocked_until", None)
-    state.pop("blocked_reason", None)
-    state.pop("blocked_at", None)
+    if reached is None or reached > 0:
+        state.pop("blocked_until", None)
+        state.pop("blocked_reason", None)
+        state.pop("blocked_at", None)
     cursor = int(state.get("query_cursor", 0) or 0)
     state["query_cursor"] = (cursor + max(0, queries_used)) % max(1, total)
     state["last_run_at"] = _now().isoformat()

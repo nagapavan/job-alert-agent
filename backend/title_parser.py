@@ -173,14 +173,17 @@ def resolve_company_name(name: str, known_companies: Iterable[str] = ()) -> str:
         if cand_key in {_norm_key(a) for a in [canonical, *aliases]}:
             return by_lower.get(canonical.lower(), canonical)
 
-    # Longest known name that prefixes the candidate on a word boundary.
+    # Longest known name whose *token sequence* prefixes the candidate. A substring/prefix test
+    # on the normalised key let known "Meta" swallow "Metabase" (finding 56); legal suffixes are
+    # stripped from both sides first so "Acme Corporation" still matches known "Acme Corp".
     best: Tuple[int, str] = (0, "")
+    cand_words = [w.lower() for w in _words(_strip_legal_suffix(candidate))]
     for k in known:
-        k_key = _norm_key(k)
-        if len(k_key) < 3:
+        if len(_norm_key(k)) < 3:
             continue
-        if cand_key.startswith(k_key) and len(k_key) > best[0]:
-            best = (len(k_key), k)
+        k_words = [w.lower() for w in _words(_strip_legal_suffix(k))]
+        if k_words and cand_words[: len(k_words)] == k_words and len(k_words) > best[0]:
+            best = (len(k_words), k)
     if best[1]:
         return best[1]
 

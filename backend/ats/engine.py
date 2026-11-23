@@ -94,8 +94,11 @@ def _http(method: str, url: str, *, cfg: Optional[PortalConfig] = None, **kwargs
         logger.debug(f"HTTP {method} {url} failed: {e}")
         return None
 
-    if pacer is not None and res.status_code in _RATE_LIMIT_STATUSES:
-        pacer.note_failure(url, retry_after=_parse_retry_after(res))
+    if pacer is not None:
+        if res.status_code in _RATE_LIMIT_STATUSES:
+            pacer.note_failure(url, retry_after=_parse_retry_after(res))
+        elif res.status_code < 400:
+            pacer.note_success(url)
     return res
 
 _SLUG_RESOLVERS: Dict[str, Callable[[str, str], str]] = {}
@@ -901,6 +904,11 @@ def _ensure_default_resolvers() -> None:
     except Exception:  # noqa: BLE001 - engine still works if the resolver cannot be loaded
         return
     register_slug_resolver("careers_url")(extract_slug_from_careers_url)
+
+
+def active_pacer():
+    """The pacer for the current scrape run, or None when no run is in progress."""
+    return _ACTIVE_PACER
 
 
 def set_active_pacer(pacer) -> None:

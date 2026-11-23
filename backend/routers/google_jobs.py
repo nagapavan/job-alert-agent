@@ -21,6 +21,8 @@ from backend.config import decrypt_data
 from backend.database import (
     Company,
     Job,
+    find_or_create_company,
+    known_company_names,
     OperationLog,
     Resume,
     get_db,
@@ -44,6 +46,7 @@ from backend.playwright_app import (
 from backend.preference_filter import PreferenceFilter
 from backend.scraper import evaluate_job_due_diligence, extract_portal_info_from_job_url
 from backend.task_engine import CancellationToken
+from backend.title_parser import resolve_company_name
 
 logger = logging.getLogger(__name__)
 
@@ -95,19 +98,45 @@ def update_google_jobs_queries(payload: GoogleSearchesUpdate):
 
 
 @router.post("/api/jobs/google-jobs/sync-followed")
-def sync_google_jobs_followed_queries():
+def sync_google_jobs_followed_queries(db: Session = Depends(get_db)):
     """
     Spawns Playwright to navigate to Google for Jobs 'Following' tab,
     extracts followed alert queries, merges them into saved searches, and returns the updated list.
+
+    This is a second path to google.com, so it carries the same gates as the scrape route: the
+    channel flag, the persisted block cooldown and the run pacer (finding 51).
     """
+    current = load_google_searches()
+    if not is_feature_enabled(db, "google_jobs"):
+        return {
+            "queries": current,
+            "new_queries_found": 0,
+            "discovered": [],
+            "skipped": "Google Jobs is disabled. Enable it in Preferences to sync followed queries.",
+        }
+
+    from backend import google_jobs_state
+
+    cooldown = google_jobs_state.cooldown_reason()
+    if cooldown:
+        return {
+            "queries": current,
+            "new_queries_found": 0,
+            "discovered": [],
+            "skipped": cooldown,
+        }
+
+    from backend.ats.pacing import build_pacer
+
     discovered = []
     try:
         with sync_playwright() as p:
-            discovered = fetch_google_jobs_followed_queries_playwright(p, headless=True)
+            discovered = fetch_google_jobs_followed_queries_playwright(
+                p, headless=True, pacer=build_pacer()
+            )
     except Exception as e:
         logger.warning(f"Failed to extract followed queries via Playwright: {e}")
 
-    current = load_google_searches()
     new_queries = [q for q in discovered if q and q not in current]
     all_queries = current + new_queries
     if new_queries:
@@ -200,8 +229,17 @@ def scrape_google_jobs_endpoint(
 
     google_pacer = build_pacer()
     pref_filter = PreferenceFilter.from_db(db)
+    known_names = known_company_names(db)
 
-    search_loc = req.location or "India"
+    # The manual path used to hardcode "India", overriding the operator's target country for every
+    # query. Fall back to the persisted preferences exactly as the scheduled runner does (#68).
+    pref = get_user_preferences(db)
+    search_loc = (req.location or "").strip() or (pref.target_country or "").strip()
+    if not search_loc:
+        pref_cities = [
+            c.strip() for c in (pref.target_cities or "").split(",") if c.strip()
+        ]
+        search_loc = pref_cities[0] if pref_cities else "India"
 
     queries_to_run, _total_queries = google_jobs_state.select_queries(queries_to_run)
 
@@ -230,6 +268,9 @@ def scrape_google_jobs_endpoint(
                     )
             except Exception as q_err:
                 logger.warning(f"Error fetching jobs for query '{query_str}': {q_err}")
+                # Record the failure: without it the query looked like a legitimate zero and the
+                # run status could not be derived (finding 67).
+                outcome_info.setdefault("outcome", "error")
                 discovered_jobs = []
 
             if outcome_info.get("outcome") == "cooling_down":
@@ -261,6 +302,9 @@ def scrape_google_jobs_endpoint(
                     # The organic fallback carries no employer, and inventing one files a web
                     # result as a posting at a company that never advertised it.
                     continue
+                # Synonym/alias resolution needs the stored names, or "Uber Technologies" and
+                # "Uber" keep creating separate employers (finding 57).
+                comp_name = resolve_company_name(comp_name, known_names) or comp_name
 
                 # Shared preference gate: the scheduled runner never ingests outside the
                 # operator's criteria, and the manual button must not be a way around it.
@@ -272,14 +316,9 @@ def scrape_google_jobs_endpoint(
                     continue
 
                 # Employer resolution & ATS portal learning (before dedupe: the key needs it)
-                comp = db.query(Company).filter(Company.name.ilike(comp_name)).first()
-                if not comp:
-                    comp = Company(
-                        name=comp_name,
-                        domain=f"{comp_name.lower().replace(' ', '')}.com",
-                    )
-                    db.add(comp)
-                    db.flush()
+                comp, _company_created = find_or_create_company(db, comp_name)
+                if comp is None:
+                    continue
 
                 portal_info = extract_portal_info_from_job_url(job_url, comp_name)
                 if portal_info:
@@ -434,6 +473,59 @@ def scrape_google_jobs_endpoint(
             f"{filtered_out_of_preference} outside the saved preferences."
         )
 
+        # A per-query outcome was collected but only landed in the breakdown: the log always said
+        # "Completed", so a scrape where every query failed looked like a clean run (finding 67).
+        endpoint_outcomes: List[Dict[str, Any]] = []
+        explicit_failures = {
+            "error",
+            "browser_busy",
+            "robots_blocked",
+            "dom_changed",
+            "not_jobs_mode",
+            "cooling_down",
+        }
+        query_failures = sum(
+            1
+            for entry in per_query_breakdown
+            if entry.get("outcome") in explicit_failures
+        )
+        blocked_queries = [
+            entry for entry in per_query_breakdown if entry.get("outcome") == "blocked"
+        ]
+        if blocked_queries:
+            channel_status.record(
+                endpoint_outcomes,
+                "google_jobs",
+                channel_status.ERROR,
+                f"{len(blocked_queries)}/{len(per_query_breakdown)} queries blocked by Google",
+            )
+        elif per_query_breakdown and query_failures == len(per_query_breakdown):
+            channel_status.record(
+                endpoint_outcomes,
+                "google_jobs",
+                channel_status.ERROR,
+                f"all {len(per_query_breakdown)} queries failed",
+            )
+        elif total_discovered == 0:
+            channel_status.record(
+                endpoint_outcomes,
+                "google_jobs",
+                channel_status.DEGRADED_ZERO,
+                f"0 of {len(per_query_breakdown)} queries returned any posting",
+            )
+        else:
+            channel_status.record(
+                endpoint_outcomes,
+                "google_jobs",
+                channel_status.OK,
+                f"{total_discovered} postings discovered across {len(per_query_breakdown)} queries",
+            )
+        endpoint_status = channel_status.aggregate_status(endpoint_outcomes)
+        endpoint_note = channel_status.describe(endpoint_outcomes)
+        log_summary = summary_msg
+        if endpoint_note:
+            log_summary = f"{summary_msg} Degraded — {endpoint_note}"
+
         # OperationLog
         try:
             end_tok = token_tracker.get_stats()
@@ -444,8 +536,8 @@ def scrape_google_jobs_endpoint(
 
             op_log = OperationLog(
                 operation_type="google_jobs_scrape",
-                status="Completed",
-                summary=summary_msg,
+                status=endpoint_status,
+                summary=log_summary,
                 details_json=sanitize_log_details(
                     {
                         "queries_scanned": queries_to_run,
@@ -456,6 +548,7 @@ def scrape_google_jobs_endpoint(
                         "dismissed_filtered": dismissed_filtered,
                         "filtered_out_of_preference": filtered_out_of_preference,
                         "per_query_breakdown": per_query_breakdown,
+                        "channels": endpoint_outcomes,
                     }
                 ),
                 jobs_count=total_added,
@@ -480,6 +573,30 @@ def scrape_google_jobs_endpoint(
 
     except Exception as e:
         logger.error(f"Error during Google Jobs scrape: {e}")
+        # An outer failure previously returned 200 with no channel record at all (finding 67).
+        failure_outcomes: List[Dict[str, Any]] = []
+        channel_status.record(
+            failure_outcomes, "google_jobs", channel_status.ERROR, str(e)
+        )
+        try:
+            db.add(
+                OperationLog(
+                    operation_type="google_jobs_scrape",
+                    status=channel_status.aggregate_status(failure_outcomes),
+                    summary=f"Google Jobs scrape failed: {str(e)}",
+                    details_json=sanitize_log_details(
+                        {
+                            "location": search_loc,
+                            "per_query_breakdown": per_query_breakdown,
+                            "channels": failure_outcomes,
+                        }
+                    ),
+                    jobs_count=0,
+                )
+            )
+            db.commit()
+        except Exception as log_err:
+            logger.warning(f"Failed to log Google Jobs scrape failure: {log_err}")
         return GoogleJobsScrapeResponse(
             total_discovered=total_discovered,
             total_added=total_added,
@@ -487,7 +604,7 @@ def scrape_google_jobs_endpoint(
             dismissed_filtered=dismissed_filtered,
             queries_scanned=queries_to_run,
             per_query_breakdown=per_query_breakdown,
-            message=f"Google Jobs scrape encountered notice: {str(e)}",
+            message=f"Google Jobs scrape failed: {str(e)}",
         )
 
 
@@ -601,8 +718,10 @@ def _run_google_jobs_task_runner(
         resume_text = (
             decrypt_data(active_resume.content_encrypted) if active_resume else ""
         )
+        parsed_resume = _parsed_resume_of(active_resume)
         # Shared preference gate: never ingest roles/locations outside the user's criteria.
         pref_filter = PreferenceFilter.from_db(db)
+        known_names = known_company_names(db)
         filtered_count = 0
 
         for idx, q_str in enumerate(queries):
@@ -663,6 +782,20 @@ def _run_google_jobs_task_runner(
                             "(consent wall or unusual-traffic interstitial)."
                         )
                         google_jobs_state.record_block(f"blocked on query '{q_str[:60]}'")
+                        if google_jobs_state.last_save_error():
+                            # The cooldown is running in-memory only; say so instead of implying
+                            # the block survived (finding 49).
+                            logger.error(
+                                "Google Jobs cooldown could NOT be persisted: "
+                                f"{google_jobs_state.last_save_error()}"
+                            )
+                            per_query_outcomes.append(
+                                {
+                                    "query": q_str[:80],
+                                    "outcome": "blocked",
+                                    "cooldown_persisted": False,
+                                }
+                            )
                         break
                     elif q_outcome == "not_jobs_mode":
                         logger.warning(
@@ -689,6 +822,9 @@ def _run_google_jobs_task_runner(
                         cancel_token.check()
 
                     comp_name = (rj.get("company_name") or "").strip()
+                    comp_name = (
+                        resolve_company_name(comp_name, known_names) or comp_name
+                    )
                     j_title = (rj.get("title") or "").strip()
                     j_url = (rj.get("apply_url") or rj.get("url") or "").strip()
                     j_location = rj.get("location") or location
@@ -707,16 +843,9 @@ def _run_google_jobs_task_runner(
 
                     # Upsert company first: the duplicate key is employer-scoped, otherwise a
                     # posting at employer B is dropped because employer A has the same title.
-                    comp_rec = (
-                        db.query(Company).filter(Company.name.ilike(comp_name)).first()
-                    )
-                    if not comp_rec:
-                        comp_rec = Company(
-                            name=comp_name,
-                            domain=comp_name.lower().replace(" ", "") + ".com",
-                        )
-                        db.add(comp_rec)
-                        db.flush()
+                    comp_rec, _company_created = find_or_create_company(db, comp_name)
+                    if comp_rec is None:
+                        continue
 
                     key = (Job.company_id == comp_rec.id) & (Job.title == j_title) & (
                         Job.location == j_location
@@ -729,6 +858,51 @@ def _run_google_jobs_task_runner(
                     if exists:
                         continue
 
+                    # Same gate and scorer as the manual endpoint: a fabricated 75.0 made every
+                    # Google row outrank genuinely scored ones, and dismissed roles were ingested
+                    # because this path never ran the dismissal filter (finding 66).
+                    dismissal = apply_dismissal_filter(
+                        db, j_title, rj.get("description") or "", comp_rec.name
+                    )
+                    job_status = dismissal.status
+                    match_score = 0
+                    match_analysis = None
+                    match_scored = False
+                    score_method = match_scored_at = match_band = (
+                        apply_recommendation
+                    ) = None
+                    strengths = []
+                    gaps = []
+                    partials = []
+                    if dismissal.match:
+                        match_analysis = dismissal.analysis
+                    else:
+                        (
+                            match_score,
+                            match_analysis,
+                            match_scored,
+                            score_method,
+                            match_scored_at,
+                            match_band,
+                            apply_recommendation,
+                            strengths,
+                            gaps,
+                            partials,
+                        ) = _score_job_with_engine(
+                            db,
+                            resume_text,
+                            rj.get("description") or "",
+                            parsed_resume=parsed_resume,
+                            job_title=j_title,
+                        )
+                        if not match_analysis:
+                            match_analysis = (
+                                f"Direct Google Jobs match for alert: '{q_str}'."
+                            )
+
+                    job_emb = generate_embeddings(
+                        f"{j_title} {clean_job_description(rj.get('description') or j_title)}"
+                    )
                     new_job = Job(
                         company_id=comp_rec.id,
                         title=j_title,
@@ -738,8 +912,19 @@ def _run_google_jobs_task_runner(
                         location=j_location,
                         source="google_jobs",
                         source_type=GOOGLE_JOBS_SOURCE_TYPE,
-                        status="To Apply",
-                        match_score=75.0,
+                        status=job_status,
+                        match_score=match_score,
+                        match_analysis=match_analysis,
+                        match_scored=match_scored,
+                        score_method=score_method,
+                        match_scored_at=match_scored_at,
+                        **(_score_provenance(db) if match_scored else {}),
+                        match_band=match_band,
+                        apply_recommendation=apply_recommendation,
+                        match_strengths_json=json.dumps(strengths) if match_scored else None,
+                        match_gaps_json=json.dumps(gaps) if match_scored else None,
+                        match_partials_json=json.dumps(partials) if match_scored else None,
+                        embedding=job_emb,
                     )
                     db.add(new_job)
                     db.flush()
@@ -762,7 +947,9 @@ def _run_google_jobs_task_runner(
             )
 
         if not blocked_count:
-            google_jobs_state.record_run(len(queries), total_queries)
+            google_jobs_state.record_run(
+                len(queries), total_queries, reached=total_steps - errors_count
+            )
 
         gjo_outcomes = []
         if errors_count >= total_steps:
