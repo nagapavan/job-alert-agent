@@ -114,3 +114,46 @@ def test_outreach_with_a_subject_cue_stays_a_status_event(
     events = gmail_client.run_gmail_sync(db_session)
     assert [e["event_type"] for e in events] == ["interview"]
     assert events[0]["company"] == "Globex"
+
+
+@patch("backend.scraper.extract_company_and_role_from_email_header")
+@patch("backend.gmail_client.build_service")
+@patch("backend.config.get_gmail_settings")
+def test_a_capped_pass_does_not_advance_the_watermark(
+    mock_settings, mock_build, mock_extract, db_session, tmp_path, monkeypatch
+):
+    """A pass that hit its cap has not seen the rest of the window, so the watermark must hold."""
+    monkeypatch.setattr(gmail_client, "SYNC_STATE_FILE", tmp_path / "state.json")
+    # the mocked service returns exactly one message, so a cap of 1 is "hit the cap"
+    monkeypatch.setattr(gmail_client, "STATUS_MAX_MESSAGES", 1)
+    mock_settings.return_value = dict(SETTINGS)
+    mock_extract.return_value = {"company": None, "role": None}
+    mock_build.return_value = _service_for(
+        "Thank you for applying", "Recruiter <no-reply@acme.test>", "received"
+    )
+
+    stats = {}
+    gmail_client.run_gmail_sync(db_session, stats=stats)
+
+    assert stats["truncated_passes"] == ["status"]
+    assert "status" not in gmail_client.load_sync_state()
+
+
+@patch("backend.scraper.extract_company_and_role_from_email_header")
+@patch("backend.gmail_client.build_service")
+@patch("backend.config.get_gmail_settings")
+def test_a_complete_pass_advances_the_watermark(
+    mock_settings, mock_build, mock_extract, db_session, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gmail_client, "SYNC_STATE_FILE", tmp_path / "state.json")
+    mock_settings.return_value = dict(SETTINGS)
+    mock_extract.return_value = {"company": None, "role": None}
+    mock_build.return_value = _service_for(
+        "Thank you for applying", "Recruiter <no-reply@acme.test>", "received"
+    )
+
+    stats = {}
+    gmail_client.run_gmail_sync(db_session, stats=stats)
+
+    assert stats["truncated_passes"] == []
+    assert gmail_client.load_sync_state()["status"]["after"]

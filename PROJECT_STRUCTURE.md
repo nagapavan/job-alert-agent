@@ -36,7 +36,6 @@ resolve to the same content.
   - **Skill taxonomy (`backend/skill_taxonomy.py` + `data/skill_taxonomy.json`)**: data-driven canonical skill → aliases + concepts (alias-aware JD matching); `parser.COMMON_TECH_SKILLS` is sourced from it. Unmatched phrases are recorded to `data/skill_taxonomy_candidates.json` for review and are **never scored**.
   - **Residual requirements (`backend/requirements_extractor.py`)**: mines requirement units the taxonomy missed and credits those the resume evidences (`extract_residual_requirements`).
   - **Resume RAG-lite (`backend/resume_index.py`)**: `chunk_resume`/`index_resume_chunks` persist skills/role/project chunks into `resume_chunks`; `top_evidence` supplies grounding excerpts. Scoring never depends on embeddings — they only ground the narrative.
-  - **Learning signals (`backend/learning_signals.py`)**: implicit-outcome labels for the trainer (no thumbs-up UI). Provenance is tracked as `user_initiated` vs `system_generated`; `system_generated` rows (discovery auto-filters, dismissals with no user event) are **excluded** from training. `learning_readiness` backs `GET /api/learning/readiness`.
   - **Graceful shutdown (`backend/shutdown.py`)**: bounded ASGI-lifecycle drain — see `DESIGN.md` §12.11.
 - **Web Scraping & Due Diligence (`backend/scraper.py`)**: Scrapes Greenhouse, Lever, Ashby, Uber, and custom career portals. Performs due diligence to flag phantom/ghost jobs and unwrap shortened recruitment URLs.
 - **Browser Automation (`backend/playwright_app.py`)**: Persistent browser context (`~/.job-alert-agent/chrome_profile/`), LinkedIn alerts/recommendations/saved jobs sync with auto-prune for closed roles, and assisted application overlay.
@@ -121,6 +120,10 @@ Defined in `backend/database.py` (SQLAlchemy 2.x declarative). Engine selection 
 Lightweight `ALTER TABLE` auto-migrations sync older databases without data loss, and legacy
 plaintext Q&A answers are encrypted in place on startup. Sessions are provided to routes via the
 `get_db()` dependency.
+
+`init_db()` runs once on the app's **startup lifecycle**, never at module import — importing
+`backend.main` must not touch a database. Maintenance scripts that need `SessionLocal` call
+`backend.database.init_db()` themselves.
 
 ### 9.1 `SafeVector` type — cross-dialect embeddings
 
@@ -460,7 +463,6 @@ token stats, scheduler config, encrypted BYOK/Gmail settings), `logs/app.log`,
 | Country → city hub suggestions (SPA) | `backend/country_hubs.py`, `data/country_hubs.json` (served in `GET /api/preferences`) |
 | Residual JD requirement mining | `backend/requirements_extractor.py` |
 | Resume chunking / RAG-lite evidence | `backend/resume_index.py` |
-| Training labels & readiness | `backend/learning_signals.py`, `scripts/train_match_classifier.py` |
 | Graceful shutdown / drain order | `backend/shutdown.py` (wired in `backend/main.py`) |
 | Structured match analysis & interview prep | `backend/main.py` (`/api/match/analyze`, `/api/jobs/{job_id}/interview-questions`), `backend/ai_helper.py` |
 | Shared preference filtering | `backend/preference_filter.py` |

@@ -514,7 +514,10 @@ class TokenTracker:
     """Thread-safe counter and cost estimator for local and cloud LLM inferences with snapshot and incremental delta aggregation."""
 
     def __init__(self):
-        self._lock = threading.Lock()
+        # Reentrant: the accounting methods hold this lock while calling get_stats(), which takes
+        # it again. With a plain Lock, /api/llm/token-usage/recalculate wedged forever holding the
+        # tracker for the whole process.
+        self._lock = threading.RLock()
         self._prompt_tokens = 0
         self._completion_tokens = 0
         self._call_count = 0
@@ -577,26 +580,40 @@ class TokenTracker:
                     db = db_mod.SessionLocal()
                     close_db = True
 
+                from sqlalchemy import func
+
                 from backend.database import OperationLog
 
-                new_logs = (
-                    db.query(OperationLog)
-                    .filter(
-                        OperationLog.id > self._last_aggregated_log_id,
-                        (OperationLog.prompt_tokens > 0)
-                        | (OperationLog.completion_tokens > 0),
+                # OperationLog.prompt_tokens is a *delta of these very counters* (callers subtract
+                # a start snapshot from an end snapshot). Adding those rows back therefore double
+                # counted every call, and the totals grew on each settings load. Reconcile instead:
+                # the database is the floor (it survives a restart), the in-memory counters are the
+                # live value. Both directions are idempotent.
+                row = (
+                    db.query(
+                        func.coalesce(func.sum(OperationLog.prompt_tokens), 0),
+                        func.coalesce(func.sum(OperationLog.completion_tokens), 0),
+                        func.count(OperationLog.id),
                     )
-                    .order_by(OperationLog.id.asc())
-                    .all()
+                    .filter(
+                        (OperationLog.prompt_tokens > 0)
+                        | (OperationLog.completion_tokens > 0)
+                    )
+                    .one()
                 )
+                db_prompt, db_completion, db_calls = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
 
-                if new_logs:
-                    for log in new_logs:
-                        self._prompt_tokens += log.prompt_tokens or 0
-                        self._completion_tokens += log.completion_tokens or 0
-                        self._call_count += 1
-                        if log.id > self._last_aggregated_log_id:
-                            self._last_aggregated_log_id = log.id
+                reconciled = False
+                if db_prompt > self._prompt_tokens:
+                    self._prompt_tokens = db_prompt
+                    reconciled = True
+                if db_completion > self._completion_tokens:
+                    self._completion_tokens = db_completion
+                    reconciled = True
+                if db_calls > self._call_count:
+                    self._call_count = db_calls
+                    reconciled = True
+                if reconciled:
                     self._save_persisted()
             except Exception as e:
                 logger.debug(f"Incremental token aggregation error: {e}")
@@ -668,7 +685,10 @@ class TokenTracker:
                 # 2. Tally from Jobs with generated materials
                 jobs = db.query(Job).all()
                 for j in jobs:
-                    if j.match_score and j.match_analysis:
+                    # Only the LLM fallback produced these tokens. Deterministic classifier scores
+                    # also write match_score + match_analysis, so counting on those two fields
+                    # alone invented ~600 prompt tokens per bulk-scored job.
+                    if j.score_method == "requirement_coverage_v1" and j.match_score:
                         p_tokens += 600
                         c_tokens += 150
                         inferences += 1
@@ -1798,11 +1818,13 @@ def generate_structured(
             return schema.model_validate(parsed)
 
 
-def detect_active_llm_provider() -> dict:
-    """
-    Probes available LLM providers in priority order using the registry,
-    automatically adapts LLM queue concurrency, and returns active provider metadata.
-    """
+_PROVIDER_CACHE_TTL_SECONDS = 30.0
+_provider_cache: Dict[str, Any] = {"at": 0.0, "info": None}
+_provider_cache_lock = threading.Lock()
+
+
+def _probe_active_llm_provider() -> dict:
+    """Runs the provider probes in priority order and adapts queue concurrency."""
     sorted_providers = sorted(
         PROVIDER_REGISTRY.values(), key=lambda p: p.get("priority", 99)
     )
@@ -1821,6 +1843,47 @@ def detect_active_llm_provider() -> dict:
         "endpoint": "local",
         "status": "offline",
     }
+
+
+def detect_active_llm_provider(force: bool = False) -> dict:
+    """Active provider metadata, probed at most once per _PROVIDER_CACHE_TTL_SECONDS.
+
+    Each probe is a serial HTTP call with a 1.5 s timeout, and this used to run on every
+    ``/api/health`` request — a public route that gets polled. The memo collapses a burst of
+    callers (and the concurrency sync it performs) into one probe. ``force`` is for the
+    diagnostics route and tests, which want the live answer.
+    """
+    with _provider_cache_lock:
+        if (
+            not force
+            and _provider_cache["info"] is not None
+            and time.monotonic() - _provider_cache["at"] < _PROVIDER_CACHE_TTL_SECONDS
+        ):
+            return dict(_provider_cache["info"])
+
+    info = _probe_active_llm_provider()
+    with _provider_cache_lock:
+        _provider_cache["info"] = dict(info)
+        _provider_cache["at"] = time.monotonic()
+    return dict(info)
+
+
+def cached_active_llm_provider() -> dict:
+    """Last observed provider, never probed.
+
+    A liveness check must not spend seconds on LLM discovery or resize the worker pool, so
+    ``/api/health`` reports this snapshot and ``/api/llm/status`` is what refreshes it.
+    """
+    with _provider_cache_lock:
+        if _provider_cache["info"] is not None:
+            return dict(_provider_cache["info"])
+    return {
+        "provider": "not probed yet",
+        "model": "",
+        "endpoint": "",
+        "status": "unknown",
+    }
+
 
 
 # -------------------------------------------------------------

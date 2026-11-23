@@ -52,33 +52,6 @@ def clear_operation_logs(db: Session = Depends(get_db)):
     return {"message": f"Successfully cleared {deleted} operation log record(s)."}
 
 
-@router.get("/api/learning/readiness")
-def get_learning_readiness(db: Session = Depends(get_db)):
-    """Reports whether enough implicit user outcomes exist to train the scorer.
-
-    Labels are derived from behaviour (applying, dismissing) — never from the model's own
-    output — so this makes "not enough data yet" an explicit outcome rather than a silent,
-    overfitted model.
-    """
-    from backend.learning_signals import learning_readiness
-    from backend.match_classifier import MIN_PER_CLASS_SAMPLES, MIN_TRAINING_SAMPLES
-
-    status = learning_readiness(db)
-    ready = (
-        status["trainable"] >= MIN_TRAINING_SAMPLES
-        and status["positives"] >= MIN_PER_CLASS_SAMPLES
-        and status["negatives"] >= MIN_PER_CLASS_SAMPLES
-    )
-    return {
-        **status,
-        "ready_to_train": ready,
-        "training_floor": {
-            "min_total": MIN_TRAINING_SAMPLES,
-            "min_per_class": MIN_PER_CLASS_SAMPLES,
-        },
-    }
-
-
 @router.get("/api/logs")
 def get_application_logs(
     lines: int = Query(default=100, ge=1, le=1000),

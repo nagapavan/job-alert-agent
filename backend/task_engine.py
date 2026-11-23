@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from typing import Callable, Any, Optional, Dict, List
 from pydantic import BaseModel, ConfigDict
 
+from backend.config import TASK_ENGINE_QUEUE_TIMEOUT_SECONDS
+
 logger = logging.getLogger("task_engine")
 
 
@@ -98,10 +100,19 @@ class BackgroundTaskEngine:
     Runs tasks on a dedicated worker pool with step callbacks and SSE event broadcasting.
     """
 
-    def __init__(self, max_concurrent_tasks: int = 4):
+    def __init__(
+        self,
+        max_concurrent_tasks: int = 4,
+        queue_timeout_seconds: Optional[float] = None,
+    ):
         self._tasks: Dict[str, BackgroundTask] = {}
         self._lock = threading.RLock()
         self._max_workers = max_concurrent_tasks
+        self._queue_timeout = (
+            float(TASK_ENGINE_QUEUE_TIMEOUT_SECONDS)
+            if queue_timeout_seconds is None
+            else float(queue_timeout_seconds)
+        )
         self._event_subscribers: List[asyncio.Queue] = []
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.sem_check = threading.Semaphore(self._max_workers)
@@ -109,6 +120,17 @@ class BackgroundTaskEngine:
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
+
+    def clear_event_loop(self, loop: Optional[asyncio.AbstractEventLoop] = None):
+        """Forgets the loop an SSE stream registered, once that stream is gone.
+
+        ``set_event_loop`` was only ever called on connect, so after a reload the engine kept
+        ``call_soon_threadsafe``-ing into a dead loop: every progress event silently vanished.
+        Passing ``loop`` makes the clear safe when a newer stream already registered its own.
+        """
+        with self._lock:
+            if loop is None or self._loop is loop:
+                self._loop = None
 
     def submit_task(
         self,
@@ -152,30 +174,58 @@ class BackgroundTaskEngine:
     def _run_task_wrapper(self, task: BackgroundTask):
         """Worker thread entry point."""
         t0 = time.time()
-        task.progress.status = TaskStatus.RUNNING
-        task.progress.started_at = datetime.now(timezone.utc)
-        self._broadcast_event(task.progress)
 
-        def progress_callback(
-            step: int,
-            label: str,
-            items_found: int = 0,
-            errors: int = 0,
-            total_steps: Optional[int] = None,
-        ):
-            if total_steps:
-                task.progress.total_steps = total_steps
-            task.progress.current_step = step
-            task.progress.step_label = label
-            task.progress.items_discovered = items_found
-            task.progress.errors_count = errors
+        # RUNNING is only truthful once a worker slot is held: setting it before acquire() made a
+        # queued task look active, and an unbounded acquire() let one wedged task block every
+        # later submission for the life of the process.
+        lock_acquired = self.sem_check.acquire(timeout=self._queue_timeout)
+        if not lock_acquired:
+            task.progress.status = TaskStatus.CANCELLED
+            task.progress.completed_at = datetime.now(timezone.utc)
             task.progress.elapsed_seconds = round(time.time() - t0, 1)
-            pct = (step / max(1, task.progress.total_steps)) * 100.0
-            task.progress.progress_percentage = min(100.0, max(0.0, round(pct, 1)))
+            task.progress.step_label = (
+                f"Cancelled: no worker slot within {self._queue_timeout:.0f}s."
+            )
+            logger.warning(
+                f"Task [{task.task_name}] ({task.task_id}) cancelled while queued."
+            )
+            self._broadcast_event(task.progress)
+            return
+
+        try:
+            if task.token.is_cancelled:
+                # cancel_task() reached a queued task: it must not start its work afterwards.
+                task.progress.status = TaskStatus.CANCELLED
+                task.progress.completed_at = datetime.now(timezone.utc)
+                task.progress.elapsed_seconds = round(time.time() - t0, 1)
+                task.progress.step_label = "Task cancelled before it started."
+                logger.warning(
+                    f"Task [{task.task_name}] ({task.task_id}) cancelled before starting."
+                )
+                return
+
+            task.progress.status = TaskStatus.RUNNING
+            task.progress.started_at = datetime.now(timezone.utc)
             self._broadcast_event(task.progress)
 
-        lock_acquired = self.sem_check.acquire()
-        try:
+            def progress_callback(
+                step: int,
+                label: str,
+                items_found: int = 0,
+                errors: int = 0,
+                total_steps: Optional[int] = None,
+            ):
+                if total_steps:
+                    task.progress.total_steps = total_steps
+                task.progress.current_step = step
+                task.progress.step_label = label
+                task.progress.items_discovered = items_found
+                task.progress.errors_count = errors
+                task.progress.elapsed_seconds = round(time.time() - t0, 1)
+                pct = (step / max(1, task.progress.total_steps)) * 100.0
+                task.progress.progress_percentage = min(100.0, max(0.0, round(pct, 1)))
+                self._broadcast_event(task.progress)
+
             # Pass cancellation token and progress callback into target function
             task.kwargs["cancel_token"] = task.token
             task.kwargs["progress_cb"] = progress_callback
@@ -305,8 +355,11 @@ class BackgroundTaskEngine:
                     self._loop.call_soon_threadsafe(q.put_nowait, payload)
                 else:
                     q.put_nowait(payload)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    f"Task event broadcast failed ({type(exc).__name__}: {exc}); "
+                    "the subscriber may have disconnected."
+                )
 
 
 # Global singleton instance

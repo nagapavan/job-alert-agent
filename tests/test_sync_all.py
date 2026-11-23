@@ -330,7 +330,7 @@ class TestLinkedInScanQueue:
         res = client.post("/api/linkedin/sync/stop")
 
         assert res.status_code == 200
-        assert "stopped" in res.json()["message"]
+        assert "1 queued scan(s) cancelled" in res.json()["message"]
         db_session.expunge_all()
         assert (
             db_session.get(LinkedInScanRequest, row_id).status
@@ -398,3 +398,27 @@ class TestAtsScrapeBatchCommits:
         # One batch commit per company plus the closing OperationLog write.
         assert mock_commit.call_count >= 3
 
+
+
+class TestSyncAllReporting:
+    """A stage that did not run must not be counted as completed."""
+
+    @patch("backend.main.is_feature_enabled", side_effect=lambda db, f: f == "ats_hirist")
+    @patch("backend.main.get_feature_flags")
+    @patch("backend.main._execute_external_sync")
+    @patch("backend.main._execute_ats_scrape")
+    def test_a_skipped_stage_is_reported_as_skipped(
+        self, mock_ats, mock_ext, mock_flags, _mock_flag, db_session
+    ):
+        mock_flags.return_value = {"ats_portals": True, "google_jobs": False, "linkedin_sync": False}
+        mock_ats.return_value = {"skipped": "cooling_down"}
+        mock_ext.return_value = ExternalSyncResponse(message="ok")
+
+        with patch("backend.main.get_db", return_value=_iter_db(db_session)):
+            result = _run_sync_all_task_runner()
+
+        stages = {s["stage"]: s for s in result["stages"]}
+        assert stages["ats_portals"]["status"] == "skipped"
+        assert "cooling_down" in stages["ats_portals"]["detail"]
+        assert result["skipped"] >= 1
+        assert result["completed"] == 1

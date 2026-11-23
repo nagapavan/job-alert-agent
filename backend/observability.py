@@ -13,7 +13,12 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 
-from backend.config import BASE_DIR, LLM_AUDIT_CAPTURE_CONTENT, LLM_AUDIT_MAX_CONTENT_CHARS
+from backend.config import (
+    BASE_DIR,
+    LLM_AUDIT_CAPTURE_CONTENT,
+    LLM_AUDIT_MAX_CONTENT_CHARS,
+    env_int,
+)
 
 LOGS_DIR = BASE_DIR / "logs"
 APP_LOG_PATH = LOGS_DIR / "app.log"
@@ -85,7 +90,8 @@ def setup_observability(
     log_level: Optional[str] = None,
     log_dir: Optional[Path] = None,
     max_bytes: Optional[int] = None,
-    backup_count: Optional[int] = None
+    backup_count: Optional[int] = None,
+    set_root_level: bool = True,
 ) -> None:
     """
     Configures centralized, self-rotating logging for the entire application.
@@ -99,23 +105,27 @@ def setup_observability(
     level_name = (log_level or os.environ.get("LOG_LEVEL", "INFO")).upper()
     numeric_level = getattr(logging, level_name, logging.INFO)
     if max_bytes is None:
-        max_bytes = int(os.environ.get("LOG_MAX_BYTES", str(10 * 1024 * 1024)))
+        max_bytes = env_int("LOG_MAX_BYTES", 10 * 1024 * 1024, minimum=1024)
     if backup_count is None:
-        backup_count = int(os.environ.get("LOG_BACKUP_COUNT", "5"))
+        backup_count = env_int("LOG_BACKUP_COUNT", 5, minimum=1)
 
     target_dir = log_dir or LOGS_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     app_log_file = target_dir / "app.log"
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(numeric_level)
+    if set_root_level:
+        root_logger.setLevel(numeric_level)
 
-    # Avoid duplicate handlers on re-initialization
+    # Only remove handlers this function installed. Uvicorn, a script or a test harness may own
+    # root handlers of their own, and deleting those silently disabled their output.
     for h in list(root_logger.handlers):
-        root_logger.removeHandler(h)
+        if getattr(h, "_jaa_managed", False):
+            root_logger.removeHandler(h)
 
     # 1. Console StreamHandler
     console_handler = logging.StreamHandler(sys.stdout)
+    console_handler._jaa_managed = True
     console_handler.setLevel(numeric_level)
     console_handler.setFormatter(ConsoleFormatter())
     root_logger.addHandler(console_handler)
@@ -128,6 +138,7 @@ def setup_observability(
             backupCount=backup_count,
             encoding="utf-8"
         )
+        file_handler._jaa_managed = True
         file_handler.setLevel(numeric_level)
         file_handler.setFormatter(JSONFormatter())
         root_logger.addHandler(file_handler)
@@ -138,7 +149,8 @@ def setup_observability(
     try:
         audit_logger = logging.getLogger("llm_audit")
         for h in list(audit_logger.handlers):
-            audit_logger.removeHandler(h)
+            if getattr(h, "_jaa_managed", False):
+                audit_logger.removeHandler(h)
         audit_log_file = target_dir / "llm_audit.log"
         audit_handler = RotatingFileHandler(
             str(audit_log_file),
@@ -146,6 +158,7 @@ def setup_observability(
             backupCount=backup_count,
             encoding="utf-8"
         )
+        audit_handler._jaa_managed = True
         audit_handler.setLevel(numeric_level)
         audit_handler.setFormatter(JSONFormatter())
         audit_logger.addHandler(audit_handler)

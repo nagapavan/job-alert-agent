@@ -2,10 +2,11 @@ import logging
 import os
 import re
 import threading
+import time
 import urllib.parse
 from typing import List, Dict, Optional, Any, Tuple
 
-from backend.config import CHROME_PROFILE_DIR
+from backend.config import CHROME_PROFILE_DIR, INTERACTIVE_SESSION_HOLD_SECONDS
 from backend.geo import is_place_name
 from backend.parser import split_candidate_name
 from backend.title_parser import is_bucket_company, split_role_employer
@@ -124,6 +125,77 @@ def get_persistent_browser_context(playwright_instance, headless: bool = False, 
                     **kwargs
                 )
             raise
+
+def _activate_browser_window() -> None:
+    """Best-effort foreground focus on macOS so the login window is visible."""
+    import subprocess
+
+    for app_name in ["Google Chrome for Testing", "Google Chrome", "Chromium"]:
+        try:
+            subprocess.run(
+                ["osascript", "-e", f'tell application "{app_name}" to activate'],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
+def run_interactive_session(
+    url: str,
+    cancel_token=None,
+    progress_cb=None,
+    hold_seconds: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Opens a headed login window on the persistent profile and owns it until it closes.
+
+    Runs as a task-engine task so the shutdown drain can cancel it instead of waiting for
+    the hold to expire, and the profile lock is released in ``finally`` on every path.
+    """
+    from playwright.sync_api import sync_playwright
+
+    hold = INTERACTIVE_SESSION_HOLD_SECONDS if hold_seconds is None else int(hold_seconds)
+    cleaned = clean_stale_profile_locks()
+    if not cleaned:
+        raise BrowserProfileBusy(
+            "Persistent Chrome profile is in use by another live session."
+        )
+    if progress_cb:
+        progress_cb(1, f"Login window open for up to {hold}s", total_steps=1)
+
+    closed_reason = "hold_expired"
+    with sync_playwright() as playwright:
+        context = get_persistent_browser_context(playwright, headless=False)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.bring_to_front()
+            _activate_browser_window()
+
+            deadline = time.monotonic() + hold
+            while time.monotonic() < deadline:
+                if cancel_token is not None and cancel_token.is_cancelled:
+                    closed_reason = "cancelled"
+                    raise InterruptedError("Interactive browser session cancelled.")
+                if page.is_closed():
+                    closed_reason = "closed_by_user"
+                    break
+                try:
+                    page.wait_for_timeout(1000)
+                except Exception:
+                    closed_reason = "closed_by_user"
+                    break
+        finally:
+            try:
+                context.close()
+            except Exception as exc:
+                logger.warning(f"Interactive session context close failed: {exc}")
+            clean_stale_profile_locks()
+
+    logger.info(f"Interactive browser session ended ({closed_reason}).")
+    return {"closed_reason": closed_reason, "hold_seconds": hold}
 
 # -------------------------------------------------------------
 # Gmail Job Alerts & Response Email Scanner
@@ -1990,6 +2062,19 @@ def fetch_google_jobs_playwright(
         page = context.new_page()
         if pacer is not None:
             try:
+                # wait() returns 0.0 both for "already due" and "host refused", so the refusal
+                # has to be read from allow() before anything navigates.
+                if not pacer.allow(url):
+                    _set("outcome", "cooling_down")
+                    logger.info(
+                        "Google Jobs fetch skipped: google.com is cooling down or over its "
+                        "per-run ceiling."
+                    )
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                    return []
                 pacer.wait(url)
             except Exception:
                 pass
@@ -2074,7 +2159,8 @@ def fetch_google_jobs_playwright(
                             )
                         except Exception:
                             apply_url = ""
-                    apply_url = apply_url or url
+                    # No fallback to the SERP URL: a google.com/search link is not a posting, and
+                    # URL-keyed dedupe would collapse every such result in the query into one row.
 
                     if not description:
                         description = f"Google for Jobs opening: {title} at {company}"
@@ -2098,15 +2184,23 @@ def fetch_google_jobs_playwright(
             if len(seen_titles) == before:
                 break  # no new cards appeared → end of the list
             if scroll_idx < _GOOGLE_JOBS_MAX_SCROLLS - 1:
-                _scroll(page)
                 if pacer is not None:
                     try:
+                        if not pacer.allow(url):
+                            logger.info(
+                                "Google Jobs scrolling stopped: google.com reached its "
+                                "per-run ceiling."
+                            )
+                            break
                         pacer.wait(url)
                     except Exception:
                         pass
+                _scroll(page)
 
-        # Organic-results fallback if the jobs widget rendered nothing.
-        if not jobs and not blocked and not not_jobs_mode:
+        # Organic-results fallback if the jobs widget rendered nothing. Not when Google itself
+        # said there are no matching jobs: web results are then unrelated pages, and the ingestion
+        # path would file them as postings.
+        if not jobs and not blocked and not not_jobs_mode and not jobs_vertical_empty:
             organic_cards = page.query_selector_all("div.g, div.MjjYud, div[data-hveid]")
             for org in organic_cards[:max_results]:
                 try:
@@ -2123,19 +2217,16 @@ def fetch_google_jobs_playwright(
                     snip = snippet_el.inner_text().strip() if snippet_el else ""
 
                     if title_text and href:
-                        comp = "Direct Employer"
-                        if " - " in title_text:
-                            comp = title_text.split(" - ")[-1].strip()
-                        elif " | " in title_text:
-                            comp = title_text.split(" | ")[-1].strip()
-
+                        # A SERP title suffix is the publisher ("Role - Indeed.com"), not the
+                        # employer, so no company is claimed here; ingestion skips a row that
+                        # names none instead of inventing one from the title.
                         clean_t = title_text.split(" - ")[0].split(" | ")[0].strip()
                         jobs.append({
                             "title": clean_t,
-                            "company": comp,
+                            "company": "",
                             "location": location or "Remote / Various",
                             "salary_range": "Competitive",
-                            "description": snip or f"Opportunity for {clean_t} at {comp}",
+                            "description": snip or f"Opportunity for {clean_t}",
                             "url": href,
                             "posted_at": "Discovered via Google Search",
                             "source": "Google Jobs",

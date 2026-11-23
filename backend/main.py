@@ -3,9 +3,11 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import urllib.parse
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -143,7 +145,7 @@ from playwright.sync_api import sync_playwright
 from backend.ai_helper import (
     MIN_JOB_DESCRIPTION_CHARS,
     assess_job_requirements,
-    detect_active_llm_provider,
+    cached_active_llm_provider,
     extract_job_skills_and_alignment,
     generate_consolidated_application_package,
     generate_embeddings,
@@ -161,6 +163,7 @@ from backend.company_catalog import (
 from backend.config import (
     API_KEY,
     BASE_DIR,
+    INTERACTIVE_SESSION_HOLD_SECONDS,
     LLM_INTERACTIVE_TIMEOUT,
     clear_gmail_settings,
     decrypt_data,
@@ -237,7 +240,6 @@ from backend.routers.memory_qa import router as memory_qa_router
 from backend.routers.settings import router as settings_router
 from backend.routers.tasks import router as tasks_router
 from backend.playwright_app import (
-    get_persistent_browser_context,
     scan_and_sync_hirist_applications,
     sync_email_application_events,
 )
@@ -262,22 +264,33 @@ from backend.requisition import extract_requisition_id
 from backend.task_engine import CancellationToken, task_engine
 from backend.title_parser import safe_company_name as _safe_company_name
 
-# Initialize Observability, DB tables, and Periodic Scheduler on startup
-setup_observability()
-init_db()
-# Maintenance scripts import this module (for the shared scorer) but must not boot the
-# discovery scheduler in their own process. They set JOB_ALERT_AGENT_NO_SCHEDULER=1.
-if os.environ.get("JOB_ALERT_AGENT_NO_SCHEDULER") != "1":
-    scheduler.start()
+# Graceful shutdown is driven entirely by the ASGI lifespan (see `_lifespan` below). We
+# deliberately do NOT register our own signal handlers: uvicorn owns SIGTERM/SIGINT and calls the
+# lifespan on every exit path (--reload child, --workers, standalone). See backend/shutdown.py for
+# why.
 
-# Graceful shutdown is driven entirely by the ASGI shutdown lifecycle (see the
-# `@app.on_event("shutdown")` handler below). We deliberately do NOT register our own
-# signal handlers: uvicorn owns SIGTERM/SIGINT and calls the lifecycle on every exit
-# path (--reload child, --workers, standalone). See backend/shutdown.py for why.
+
+@asynccontextmanager
+async def _lifespan(application):
+    """The one startup/shutdown hook (the three ``on_event`` handlers were deprecated).
+
+    Order matters: observability and the schema must exist before the handlers that query the
+    database, and the recovery step re-queues work only after the task engine is usable.
+    """
+    _bootstrap_runtime()
+    _startup_operation_log_maintenance()
+    _recover_queued_linkedin_scans()
+    try:
+        yield
+    finally:
+        _graceful_shutdown_drain()
+
+
 app = FastAPI(
     title="Job Alert Agent API",
     description="Autonomous job hunting, application tracking, resume ATS tailoring, and browser assistance.",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 app.include_router(discovery_router)
@@ -289,7 +302,23 @@ app.include_router(memory_qa_router)
 app.include_router(settings_router)
 
 
-@app.on_event("startup")
+def _bootstrap_runtime():
+    """Observability, schema and scheduler — once per process, on startup, not on import.
+
+    These ran at module scope, so every ``import backend.main`` (including pytest collection
+    and every maintenance script) opened the configured database, flipped it to WAL, ran
+    ``create_all`` plus the migrations, and could start a discovery scheduler thread. Importing
+    a module must not do that; a server starting must. Scripts therefore call
+    ``backend.database.init_db()`` themselves.
+    """
+    setup_observability()
+    init_db()
+    # Maintenance scripts set JOB_ALERT_AGENT_NO_SCHEDULER=1 so importing the app never starts
+    # a discovery thread in their process.
+    if os.environ.get("JOB_ALERT_AGENT_NO_SCHEDULER") != "1":
+        scheduler.start()
+
+
 def _startup_operation_log_maintenance():
     """Rotates the operation_logs table once on startup so long-running DBs stay bounded."""
     try:
@@ -304,7 +333,6 @@ def _startup_operation_log_maintenance():
         logger.debug(f"Startup operation-log rotation skipped: {e}")
 
 
-@app.on_event("startup")
 def _recover_queued_linkedin_scans():
     """Re-queue LinkedIn scans that were still waiting when the previous process exited (#115).
 
@@ -326,7 +354,6 @@ def _recover_queued_linkedin_scans():
         logger.debug(f"Startup LinkedIn queue recovery skipped: {e}")
 
 
-@app.on_event("shutdown")
 def _graceful_shutdown_drain():
     """Drain background work on server shutdown (SIGTERM/SIGINT/reload).
 
@@ -411,57 +438,17 @@ def _log_safe_header(value: Optional[str], limit: int = 200) -> str:
 
 
 @app.middleware("http")
-async def request_observability_middleware(request: Request, call_next):
-    """
-    HTTP Request Observability & Correlation Middleware.
-    Assigns unique X-Request-ID, logs request lifecycle, status codes, and latency in milliseconds.
-    """
-    req_id = (
-        request.headers.get("X-Request-ID")
-        or f"req_{int(time.time() * 1000) % 1000000:06d}"
-    )
-    request.state.request_id = req_id
-    t0 = time.perf_counter()
-
-    try:
-        response = await call_next(request)
-        latency_ms = (time.perf_counter() - t0) * 1000
-        response.headers["X-Request-ID"] = req_id
-
-        # Avoid noisy health check polling logs at INFO level
-        if request.url.path not in ("/api/health", "/favicon.ico"):
-            if response.status_code == 404:
-                # An unknown path is usually a stale client build or an external probe. Without
-                # caller identity a 404 storm cannot be attributed to anything (issue #93), so
-                # record headers only - never bodies.
-                logger.info(
-                    f"{request.method} {request.url.path} -> 404 ({latency_ms:.1f}ms) "
-                    f"ua={_log_safe_header(request.headers.get('user-agent'))} "
-                    f"referer={_log_safe_header(request.headers.get('referer'))}",
-                    extra={"request_id": req_id},
-                )
-            else:
-                logger.info(
-                    f"{request.method} {request.url.path} -> {response.status_code} ({latency_ms:.1f}ms)",
-                    extra={"request_id": req_id},
-                )
-        return response
-    except Exception as exc:
-        latency_ms = (time.perf_counter() - t0) * 1000
-        logger.error(
-            f"{request.method} {request.url.path} -> ERROR: {exc} ({latency_ms:.1f}ms)",
-            extra={"request_id": req_id},
-        )
-        raise
-
-
-@app.middleware("http")
 async def security_firewall_middleware(request: Request, call_next):
     """
     Zero-Trust Security Firewall:
     - Automatically allows public documentation, health endpoints, and static assets.
     - Requires verified X-API-Key or verified same-origin session for all REST API endpoints.
     - Blocks cross-site unauthorized requests from arbitrary websites.
+
+    Declared BEFORE ``request_observability_middleware`` on purpose: Starlette inserts each
+    middleware at the front of the stack, so the last one declared is the outermost. The firewall
+    rejects with a 401 without calling ``call_next``, so it must sit *inside* the observability
+    middleware or the rejection produces no log line and no ``X-Request-ID`` (issue #92/#93).
     """
     path = request.url.path
     if (
@@ -518,6 +505,53 @@ async def security_firewall_middleware(request: Request, call_next):
     except Exception as e:
         logger.error(f"Security firewall error: {e}")
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+
+@app.middleware("http")
+async def request_observability_middleware(request: Request, call_next):
+    """
+    HTTP Request Observability & Correlation Middleware.
+    Assigns unique X-Request-ID, logs request lifecycle, status codes, and latency in milliseconds.
+
+    Outermost middleware, so it also sees the security firewall's own 401 responses.
+    """
+    req_id = (
+        request.headers.get("X-Request-ID")
+        or f"req_{int(time.time() * 1000) % 1000000:06d}"
+    )
+    request.state.request_id = req_id
+    t0 = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+        latency_ms = (time.perf_counter() - t0) * 1000
+        response.headers["X-Request-ID"] = req_id
+
+        # Avoid noisy health check polling logs at INFO level
+        if request.url.path not in ("/api/health", "/favicon.ico"):
+            if response.status_code == 404:
+                # An unknown path is usually a stale client build or an external probe. Without
+                # caller identity a 404 storm cannot be attributed to anything (issue #93), so
+                # record headers only - never bodies.
+                logger.info(
+                    f"{request.method} {request.url.path} -> 404 ({latency_ms:.1f}ms) "
+                    f"ua={_log_safe_header(request.headers.get('user-agent'))} "
+                    f"referer={_log_safe_header(request.headers.get('referer'))}",
+                    extra={"request_id": req_id},
+                )
+            else:
+                logger.info(
+                    f"{request.method} {request.url.path} -> {response.status_code} ({latency_ms:.1f}ms)",
+                    extra={"request_id": req_id},
+                )
+        return response
+    except Exception as exc:
+        latency_ms = (time.perf_counter() - t0) * 1000
+        logger.error(
+            f"{request.method} {request.url.path} -> ERROR: {exc} ({latency_ms:.1f}ms)",
+            extra={"request_id": req_id},
+        )
+        raise
 
 
 # -------------------------------------------------------------
@@ -957,20 +991,24 @@ class JobHiringTeamResponse(BaseModel):
 # -------------------------------------------------------------
 @app.get("/api/health")
 def health_check(db: Session = Depends(get_db)):
-    """Health check verifying API, Database, and Active LLM Engine readiness.
+    """Liveness check: database reachable, and whether a graceful drain is in progress.
 
     Reports ``shutting_down: true`` while a graceful drain is in progress, so a
     supervisor can distinguish "draining" from "dead" during a restart.
+
+    Deliberately cheap and side-effect free. It used to probe every LLM provider (serial HTTP,
+    1.5 s timeout each) and resize the worker pool on each call, on a public route that gets
+    polled continuously. ``active_llm`` is now the last observed snapshot; ``/api/llm/status``
+    is the route that probes, and the SPA asks for it separately.
     """
     try:
         db.query(Company).count()
-        active_llm = detect_active_llm_provider()
         from backend.shutdown import is_shutting_down
 
         return {
             "status": "shutting_down" if is_shutting_down() else "ok",
             "database": "connected",
-            "active_llm": active_llm,
+            "active_llm": cached_active_llm_provider(),
             "shutting_down": is_shutting_down(),
         }
     except Exception as e:
@@ -1044,14 +1082,41 @@ def gmail_connect():
         raise HTTPException(
             status_code=500, detail=f"Could not build Google auth URL: {e}"
         )
-    # Persist the PKCE verifier so the callback can complete the token exchange.
-    save_gmail_settings(code_verifier=result.get("code_verifier", ""))
+    # Persist the PKCE verifier and the OAuth nonce: the callback needs the first to finish the
+    # exchange and the second to prove the redirect answers a Connect this app started.
+    save_gmail_settings(
+        code_verifier=result.get("code_verifier", ""),
+        oauth_state=result.get("state", ""),
+    )
     return {"auth_url": result["auth_url"]}
 
 
 @app.get("/api/gmail/oauth2callback")
-def gmail_oauth2callback(code: Optional[str] = None, error: Optional[str] = None):
-    """Google loopback redirect target: exchanges the code and stores the refresh token."""
+def gmail_oauth2callback(
+    code: Optional[str] = None,
+    error: Optional[str] = None,
+    state: Optional[str] = None,
+):
+    """Google loopback redirect target: validates ``state``, exchanges the code, stores the token.
+
+    The route is public (it is the OAuth redirect), so ``state`` is the only thing that ties a
+    redirect to a Connect the operator started. Without it any cross-site navigation carrying a
+    ``code`` could force-connect a mailbox.
+    """
+    settings = get_gmail_settings()
+    expected_state = (settings.get("oauth_state") or "").strip()
+    if not expected_state or not state or not secrets.compare_digest(
+        state, expected_state
+    ):
+        logger.warning("Gmail OAuth callback rejected: state did not match a pending Connect.")
+        return HTMLResponse(
+            "<h3>OAuth state mismatch.</h3>"
+            "<p>Start the connection from the app's Gmail panel and try again.</p>",
+            status_code=400,
+        )
+    # Single use: consume the nonce before the exchange, so a replayed redirect cannot reuse it.
+    save_gmail_settings(oauth_state="")
+
     if error:
         return HTMLResponse(
             f"<h3>Gmail connection failed:</h3><p>{error}</p>", status_code=400
@@ -1550,11 +1615,15 @@ def list_jobs(
     source_type: Optional[str] = None,
     sync_batch: Optional[str] = None,
     new_from_sync: bool = Query(False),
+    limit: int = Query(1000, ge=1, le=5000),
     db: Session = Depends(get_db),
 ):
     """
     Lists tracked jobs with optional filters for status, in-progress state, company, score, title, location, work mode,
     source type (LinkedIn / Direct / Email), a specific sync batch, or "new from sync" review items.
+
+    Bounded by ``limit``: the ORDER BY is on the indexed ``created_at`` now, but an unbounded
+    ``.all()`` still serialises every row the table has ever held.
     """
     query = db.query(Job)
 
@@ -1624,7 +1693,7 @@ def list_jobs(
         elif wm == "onsite":
             query = query.filter(~Job.location.ilike("%remote%"))
 
-    jobs = query.order_by(Job.created_at.desc()).all()
+    jobs = query.order_by(Job.created_at.desc()).limit(limit).all()
 
     # Attach company_name helper
     prov_ctx = _resume_provenance_context(db)
@@ -3907,8 +3976,7 @@ def launch_interactive_browser_session(
     Launches an interactive (headed) Chromium browser session using the persistent Chrome profile (.chrome_profile).
     Allows user to sign in to LinkedIn and career portals once so cookies/tokens persist for all future agent operations.
     """
-    from backend.playwright_app import clean_stale_profile_locks
-    import subprocess
+    from backend.playwright_app import run_interactive_session
 
     final_url = "https://www.linkedin.com/login"
     if payload and payload.url:
@@ -3923,44 +3991,23 @@ def launch_interactive_browser_session(
             detail="Invalid URL scheme. Only 'http://' and 'https://' URLs are permitted for interactive sessions.",
         )
 
-    def run_browser():
-        try:
-            clean_stale_profile_locks()
-            with sync_playwright() as p:
-                context = get_persistent_browser_context(p, headless=False)
-                page = context.pages[0] if context.pages else context.new_page()
-                page.goto(final_url, wait_until="domcontentloaded", timeout=60000)
-                page.bring_to_front()
-
-                # Force foreground focus on macOS
-                for app_name in [
-                    "Google Chrome for Testing",
-                    "Google Chrome",
-                    "Chromium",
-                ]:
-                    subprocess.run(
-                        [
-                            "osascript",
-                            "-e",
-                            f'tell application "{app_name}" to activate',
-                        ],
-                        check=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-
-                # Keep session open for user to log in
-                page.wait_for_timeout(600000)
-                context.close()
-        except Exception as e:
-            logger.error(f"Interactive browser session error: {e}")
-
-    thread = threading.Thread(target=run_browser, daemon=True)
-    thread.start()
+    task_id = task_engine.submit_task(
+        "browser_session",
+        "Interactive browser login",
+        run_interactive_session,
+        final_url,
+    )
 
     return {
         "status": "Launched",
-        "message": f"Interactive browser launched for '{final_url}'. Sign in to your account, and your session will persist automatically in .chrome_profile.",
+        "task_id": task_id,
+        "hold_seconds": INTERACTIVE_SESSION_HOLD_SECONDS,
+        "message": (
+            f"Interactive browser launched for '{final_url}'. Sign in to your account, "
+            f"and your session will persist automatically in .chrome_profile. The window "
+            f"closes itself after {INTERACTIVE_SESSION_HOLD_SECONDS // 60} minutes, or "
+            f"cancel it from the task list."
+        ),
     }
 
 
@@ -5883,10 +5930,24 @@ def _run_sync_all_task_runner(
                 progress_cb(step=i, label=f"Starting: {label}", total_steps=total)
             try:
                 result = fn(_make_adapter(i, label))
-                summary.append(
-                    {"stage": key, "status": "completed", "detail": str(result)[:300]}
-                )
-                logger.info(f"[SyncAll] Stage '{key}' completed: {str(result)[:200]}")
+                # Runners report "I did not run" through a `skipped` key rather than by raising
+                # (consent missing, cooldown active, profile busy, scan already in progress).
+                # Counting those as completed made a green run out of channels that never ran.
+                skipped_reason = result.get("skipped") if isinstance(result, dict) else None
+                if skipped_reason:
+                    summary.append(
+                        {
+                            "stage": key,
+                            "status": "skipped",
+                            "detail": f"skipped: {skipped_reason}",
+                        }
+                    )
+                    logger.info(f"[SyncAll] Stage '{key}' skipped: {skipped_reason}")
+                else:
+                    summary.append(
+                        {"stage": key, "status": "completed", "detail": str(result)[:300]}
+                    )
+                    logger.info(f"[SyncAll] Stage '{key}' completed: {str(result)[:200]}")
             except BrowserProfileBusy as bpb:
                 summary.append(
                     {

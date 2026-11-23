@@ -25,12 +25,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Importing the app module runs init_db() at import; the scheduler must stay off so a
-# data-repair run cannot fire a live browser scan while it mutates rows.
+# The app module is imported for the attribution helpers it re-exports; importing it no longer
+# touches the database (that happens on server startup), so open it explicitly. The scheduler
+# must stay off so a data-repair run cannot fire a live browser scan while it mutates rows.
 os.environ.setdefault("JOB_ALERT_AGENT_NO_SCHEDULER", "1")
-import backend.main as main  # noqa: F401 - runs init_db()
+import backend.main as main  # noqa: F401 - attribution helpers
 from backend.config import get_gmail_settings
-from backend.database import ApplicationEvent, Job, SessionLocal
+from backend.database import ApplicationEvent, Job, SessionLocal, init_db
+
+init_db()
 from backend.gmail_client import (
     STATUS_EVENT_TYPES,
     build_service,

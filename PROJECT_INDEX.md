@@ -87,12 +87,6 @@ Quick-lookup reference for locating where changes should be made.
 - `index_resume_chunks` — (re)writes a resume's chunks into `resume_chunks` with embeddings.
 - `top_evidence` — returns the chunks most similar to a query; used to ground requirement assessment. Scoring never depends on embeddings.
 
-### `backend/learning_signals.py`
-**Responsibility:** Implicit-outcome labels for classifier training (no thumbs-up UI).
-- `derive_decision` — maps a tracked job to `positive` / `strong_positive` / `negative` / `negative_outcome`.
-- Provenance `user_initiated` vs `system_generated`: auto-filtered discovery rows and dismissals with no user decision event are **excluded** from training.
-- `collect_decisions` / `label_counts` / `learning_readiness` — the last backs `GET /api/learning/readiness`.
-
 ### `backend/shutdown.py`
 **Responsibility:** Bounded graceful drain on the ASGI shutdown lifecycle.
 - `run_shutdown` (idempotent) / `is_shutting_down` / `DRAIN_DEADLINE_SECONDS`.
@@ -373,6 +367,7 @@ from backend.database import get_db, init_db, get_user_preferences, get_feature_
 def list_jobs(db: Session = Depends(get_db)): ...
 
 init_db()  # create tables + ALTER TABLE auto-migrations + encrypt legacy Q&A
+           # the app calls this on startup; scripts must call it themselves
 flags = get_feature_flags(db)      # {"ats_portals": True, "gmail_sync": False, ...}
 ```
 

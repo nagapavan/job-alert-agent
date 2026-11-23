@@ -38,7 +38,8 @@ async def task_events_sse(request: Request):
     Server-Sent Events (SSE) stream for real-time background task progress updates.
     """
     # Bind the running loop so worker threads broadcast thread-safely.
-    task_engine.set_event_loop(asyncio.get_running_loop())
+    loop = asyncio.get_running_loop()
+    task_engine.set_event_loop(loop)
     q = asyncio.Queue()
     task_engine.register_subscriber(q)
 
@@ -59,6 +60,7 @@ async def task_events_sse(request: Request):
                     yield ": ping\n\n"
         finally:
             task_engine.unregister_subscriber(q)
+            task_engine.clear_event_loop(loop)
 
     return StreamingResponse(
         event_generator(),

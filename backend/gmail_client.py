@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import re
+import secrets
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -206,17 +207,24 @@ def _flow(client_id: str, client_secret: str, redirect_uri: str):
 
 
 def build_auth_url(client_id: str, client_secret: str, redirect_uri: str = GMAIL_REDIRECT_URI,
-                   state: str = "job-alert-agent") -> Dict[str, str]:
+                   state: str = "") -> Dict[str, str]:
     """
     Builds the Google consent URL for the loopback OAuth flow.
-    Returns the URL plus the PKCE code_verifier, which MUST be persisted and supplied
-    again at token exchange (the flow spans two separate HTTP requests).
+
+    A random ``state`` nonce is generated unless the caller supplies one; it MUST be persisted
+    with the PKCE verifier and matched on the redirect, or a cross-site navigation can force-connect
+    a mailbox the operator never chose. Returns ``auth_url``, ``code_verifier`` and ``state``.
     """
+    nonce = (state or "").strip() or secrets.token_urlsafe(32)
     flow = _flow(client_id, client_secret, redirect_uri)
     url, _ = flow.authorization_url(
-        access_type="offline", include_granted_scopes="true", prompt="consent", state=state
+        access_type="offline", include_granted_scopes="true", prompt="consent", state=nonce
     )
-    return {"auth_url": url, "code_verifier": getattr(flow, "code_verifier", "") or ""}
+    return {
+        "auth_url": url,
+        "code_verifier": getattr(flow, "code_verifier", "") or "",
+        "state": nonce,
+    }
 
 
 def exchange_code_for_tokens(code: str, client_id: str, client_secret: str,
@@ -571,6 +579,7 @@ def run_gmail_sync(db, stats: Optional[Dict[str, Any]] = None) -> List[Dict[str,
             new_count += 1
 
     state = load_sync_state()
+    truncated_passes: List[str] = []
     alerts_had_watermark = bool((state.get("alerts") or {}).get("after"))
     matched = 0
     per_pass: Dict[str, int] = {}
@@ -583,8 +592,16 @@ def run_gmail_sync(db, stats: Optional[Dict[str, Any]] = None) -> List[Dict[str,
         matched += len(ids)
         for mid in ids:
             process(mid)
-        # Only advance the watermark for a pass that ran to completion; a failure above
-        # raises before this point, so the next run re-reads the same window.
+        # Advance the watermark only for a pass that ran to completion. A failure above raises
+        # before this point; a pass that hit its cap has not seen the rest of the window, so
+        # advancing would skip everything older than today permanently.
+        if len(ids) >= cap:
+            logger.warning(
+                f"Gmail {pass_name} pass hit its cap ({cap}); keeping the previous watermark so "
+                "the remainder of the window is read next run."
+            )
+            truncated_passes.append(pass_name)
+            continue
         now = datetime.now(timezone.utc)
         state[pass_name] = {"after": now.date().isoformat(), "synced_at": now.isoformat()}
         save_sync_state(state)
@@ -598,6 +615,8 @@ def run_gmail_sync(db, stats: Optional[Dict[str, Any]] = None) -> List[Dict[str,
         # A first run that matches no alert mail means the query/scope is wrong, not that
         # the mailbox is quiet: the caller uses this to decide on the browser fallback.
         stats["alerts_had_watermark"] = alerts_had_watermark
+        # Passes that hit their cap: the caller can tell a complete window from a partial one.
+        stats["truncated_passes"] = truncated_passes
     logger.info(
         f"Gmail API sync: {matched} messages matched "
         f"({per_pass.get('status', 0)} status/outreach, {per_pass.get('alerts', 0)} alerts), "

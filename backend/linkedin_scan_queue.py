@@ -82,6 +82,11 @@ class LinkedInScanGate:
             self._held = False
             self._cond.notify_all()
 
+    def is_held(self) -> bool:
+        """True while a scan owns the gate (i.e. a scan is actually running)."""
+        with self._cond:
+            return self._held
+
     def queue_position(self) -> int:
         """1-based position a caller arriving right now would take."""
         with self._cond:

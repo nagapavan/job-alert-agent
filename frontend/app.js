@@ -1319,15 +1319,24 @@ async function fetchHealthAndLLMStatus() {
     try {
         const res = await fetch(`${API_BASE}/api/health`);
         const data = await res.json();
-        if (data.active_llm) {
-            state.activeLLM = data.active_llm;
+        // /api/health is a liveness check and deliberately never probes LLM providers, so the
+        // badge asks the diagnostics route (memoised 30s) for the live answer instead.
+        let llm = data.active_llm;
+        try {
+            const llmRes = await fetch(`${API_BASE}/api/llm/status`);
+            if (llmRes.ok) llm = await llmRes.json();
+        } catch (e) {
+            console.warn("Could not retrieve LLM status", e);
+        }
+        if (llm) {
+            state.activeLLM = llm;
             const badge = document.getElementById("llm-status-badge");
             if (badge) {
-                if (data.active_llm.status === "online") {
-                    badge.innerText = `AI: ${data.active_llm.provider} (${data.active_llm.model})`;
+                if (llm.status === "online") {
+                    badge.innerText = `AI: ${llm.provider} (${llm.model})`;
                     badge.className = "badge active";
-                } else if (data.active_llm.status === "configured") {
-                    badge.innerText = `AI: ${data.active_llm.provider}`;
+                } else if (llm.status === "configured") {
+                    badge.innerText = `AI: ${llm.provider}`;
                     badge.className = "badge verified";
                 } else {
                     badge.innerText = `AI: Offline / Heuristics`;

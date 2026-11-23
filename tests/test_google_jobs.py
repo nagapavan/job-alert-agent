@@ -465,8 +465,39 @@ def test_organic_fallback_unwraps_google_redirect_and_skips_google_hosts():
 
     assert len(jobs) == 1
     assert jobs[0]["url"] == "https://careers.cloudflare.com/jobs/1"
-    assert jobs[0]["company"] == "Cloudflare"
+    # The "- Cloudflare" suffix in a SERP title is the publisher/listing site, not evidence of
+    # the employer; claiming it invents a company, so the row carries none and ingestion skips it.
+    assert jobs[0]["company"] == ""
     assert outcome["outcome"] == "fetched"
+
+
+def test_organic_fallback_does_not_run_when_google_says_there_are_no_jobs():
+    """`jobs_vertical_empty` is a legitimate zero, not a signal to ingest web pages."""
+    mock_p = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_context.new_page.return_value = mock_page
+    mock_page.url = "https://www.google.com/search?q=engineer&udm=8"
+    mock_page.inner_text.return_value = "No jobs match your search"
+    mock_page.query_selector.return_value = None
+    mock_page.query_selector_all.return_value = []
+    mock_page.wait_for_selector.side_effect = Exception("timeout")
+
+    outcome = {}
+    with patch(
+        "backend.playwright_app.get_persistent_browser_context",
+        return_value=mock_context,
+    ), patch("backend.playwright_app._jobs_vertical_empty", return_value=True):
+        jobs = fetch_google_jobs_playwright(mock_p, "Engineer", outcome=outcome)
+
+    assert jobs == []
+    assert outcome["outcome"] == "zero_results"
+    organic_calls = [
+        c
+        for c in mock_page.query_selector_all.call_args_list
+        if c.args and c.args[0] == "div.g, div.MjjYud, div[data-hveid]"
+    ]
+    assert organic_calls == []
 
 
 def test_read_apply_url_prefers_external_apply_link():
@@ -977,3 +1008,180 @@ def test_manual_scrape_honours_the_persisted_cooldown(db_session, monkeypatch):
     fetch.assert_not_called()
 
 
+
+# -------------------------------------------------------------
+# Politeness, SERP integrity and employer-scoped dedupe (EGM reviewer 4, #33-#38)
+# -------------------------------------------------------------
+
+
+def test_pacer_refusal_stops_the_fetch_before_navigation():
+    """A host in cooldown or over its ceiling must not be navigated to (finding 34).
+
+    ``HostPacer.wait`` returns 0.0 both for "already due" and "refused", so the old code
+    navigated either way and the ceiling could never stop a request.
+    """
+    mock_p = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_context.new_page.return_value = mock_page
+    pacer = MagicMock()
+    pacer.allow.return_value = False
+
+    outcome = {}
+    with patch(
+        "backend.playwright_app.get_persistent_browser_context",
+        return_value=mock_context,
+    ):
+        jobs = fetch_google_jobs_playwright(
+            mock_p, "Engineer", pacer=pacer, outcome=outcome
+        )
+
+    assert jobs == []
+    assert outcome["outcome"] == "cooling_down"
+    mock_page.goto.assert_not_called()
+    mock_context.close.assert_called_once()
+
+
+def test_missing_apply_link_does_not_persist_the_serp_url():
+    """A card with no external apply link gets no url; google.com/search is not a posting (#36)."""
+    mock_p = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_context.new_page.return_value = mock_page
+
+    mock_card = MagicMock()
+    mock_title = MagicMock()
+    mock_title.inner_text.return_value = "Principal Engineer"
+    mock_comp = MagicMock()
+    mock_comp.inner_text.return_value = "Acme"
+    mock_loc = MagicMock()
+    mock_loc.inner_text.return_value = "Hyderabad"
+    mock_card.query_selector.side_effect = lambda sel: {
+        "div.tNxQIb": mock_title,
+        "div.a3jPc": mock_comp,
+        "div.FqK3wc": mock_loc,
+    }.get(sel, None)
+    mock_page.query_selector_all.return_value = [mock_card]
+
+    with patch(
+        "backend.playwright_app.get_persistent_browser_context",
+        return_value=mock_context,
+    ), patch("backend.playwright_app._read_apply_url", return_value=""), patch(
+        "backend.playwright_app._read_detail_pane", return_value="Full JD body."
+    ):
+        jobs = fetch_google_jobs_playwright(mock_p, "Engineer", max_results=5)
+
+    assert len(jobs) == 1
+    assert jobs[0]["url"] == ""
+
+
+@patch("backend.routers.google_jobs.fetch_google_jobs_playwright")
+@patch("backend.routers.google_jobs.get_db")
+def test_runner_dedupe_is_employer_scoped(mock_get_db, mock_fetch_pw, db_session):
+    """Same title + location at a different employer is a different posting (#37)."""
+    from backend.main import _run_google_jobs_task_runner
+    from backend.routers.google_jobs import GOOGLE_JOBS_SOURCE_TYPE
+
+    mock_get_db.return_value = iter([db_session])
+
+    alpha = Company(name="Alpha Corp")
+    db_session.add(alpha)
+    db_session.flush()
+    db_session.add(
+        Job(
+            company_id=alpha.id,
+            title="Backend Engineer",
+            location="Remote",
+            url="https://alpha.example/jobs/1",
+            source_type=GOOGLE_JOBS_SOURCE_TYPE,
+            status="To Apply",
+        )
+    )
+    db_session.commit()
+
+    def fake_fetch(p, query=None, location=None, headless=True, max_results=15,
+                   pacer=None, outcome=None, **kwargs):
+        if outcome is not None:
+            outcome["outcome"] = "fetched"
+        return [
+            {
+                "company_name": "Beta Labs",
+                "title": "Backend Engineer",
+                "url": "https://beta.example/jobs/1",
+                "location": "Remote",
+                "description": "We are hiring backend engineers.",
+            }
+        ]
+
+    mock_fetch_pw.side_effect = fake_fetch
+    result = _run_google_jobs_task_runner(
+        queries=["Backend Engineer jobs"], location="Remote"
+    )
+
+    assert result["jobs_found"] == 1
+    beta_job = db_session.query(Job).filter(Job.url == "https://beta.example/jobs/1").first()
+    assert beta_job is not None
+    # Both Google paths must write the same value, or the endpoint's dedupe cannot see
+    # what the runner stored (finding 38).
+    assert beta_job.source_type == GOOGLE_JOBS_SOURCE_TYPE
+
+
+def test_manual_scrape_applies_the_pacer_and_the_preference_gate(db_session):
+    """The SPA button must not be an unpaced, preference-free second path (#33)."""
+    _enable_google_jobs(client)
+    client.put(
+        "/api/preferences",
+        json={"target_titles": "Software Engineer", "features": {"google_jobs": True}},
+    )
+
+    captured = {}
+
+    def fake_fetch(p, **kwargs):
+        captured.update(kwargs)
+        return [
+            {
+                "title": "Warehouse Operative",
+                "company": "Globex",
+                "location": "Hyderabad",
+                "description": "Operate forklifts.",
+                "url": "https://globex.example/jobs/1",
+            }
+        ]
+
+    with patch(
+        "backend.routers.google_jobs.fetch_google_jobs_playwright", side_effect=fake_fetch
+    ):
+        res = client.post(
+            "/api/jobs/google-jobs/scrape",
+            json={"query": "warehouse jobs", "location": "Hyderabad", "limit": 3},
+        )
+
+    assert res.status_code == 200
+    data = res.json()
+    assert captured.get("pacer") is not None
+    assert data["filtered_out_of_preference"] == 1
+    assert data["total_added"] == 0
+    assert db_session.query(Job).filter(Job.title == "Warehouse Operative").first() is None
+
+
+def test_manual_scrape_skips_rows_that_name_no_employer(db_session):
+    """The organic fallback carries no company, so ingestion must skip instead of inventing one."""
+    _enable_google_jobs(client)
+
+    with patch(
+        "backend.routers.google_jobs.fetch_google_jobs_playwright",
+        return_value=[
+            {
+                "title": "Some Web Result",
+                "company": "",
+                "location": "Remote",
+                "description": "A page that matched the query.",
+                "url": "https://example.test/page",
+            }
+        ],
+    ):
+        res = client.post("/api/jobs/google-jobs/scrape", json={"query": "anything jobs"})
+
+    assert res.status_code == 200
+    assert res.json()["total_added"] == 0
+    assert db_session.query(Job).filter(Job.title == "Some Web Result").first() is None

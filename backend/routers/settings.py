@@ -30,8 +30,12 @@ router = APIRouter(tags=["settings"])
 
 @router.get("/api/llm/status")
 def get_llm_status():
-    """Returns detailed status and metadata of the currently active LLM provider."""
-    return detect_active_llm_provider()
+    """Detailed status of the active LLM provider.
+
+    This is the diagnostics route, so it probes rather than reading the snapshot that
+    `/api/health` serves; the probe is memoised for 30 s to absorb repeated polling.
+    """
+    return detect_active_llm_provider(force=True)
 
 
 @router.get("/api/llm/routing-status")
@@ -152,8 +156,9 @@ def update_llm_settings(payload: LlmSettingsIn):
         allow_cloud_fallback=payload.allow_cloud_fallback,
     )
     # Re-evaluate the active provider so LLM queue concurrency/pacing follows the new config.
+    # Forced: the memo would otherwise return the answer from before the credentials changed.
     try:
-        detect_active_llm_provider()
+        detect_active_llm_provider(force=True)
     except Exception:
         pass
     return _masked_llm_settings()

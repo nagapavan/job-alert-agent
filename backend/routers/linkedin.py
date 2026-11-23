@@ -11,7 +11,7 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
@@ -57,8 +57,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["linkedin"])
 
-# Set by the stop route. The live cancellation path is the task engine's CancellationToken; this
-# flag is kept because the SPA posts to it unconditionally.
+# Set by POST /api/linkedin/sync/stop and checked at the boundaries between scan stages. A stage
+# is a sequence of Playwright navigations that cannot be interrupted mid-flight, so "stop" means
+# "do not start the next stage": the current page work finishes first. Cleared when a scan takes
+# the gate, so a stop can never abort a scan that starts afterwards.
 linkedin_cancel_event = threading.Event()
 
 _LINKEDIN_SCAN_GATE = linkedin_scan_queue.gate
@@ -358,6 +360,9 @@ def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
     rejected; it runs as a background task as soon as the running scan finishes.
     """
     if _LINKEDIN_SCAN_GATE.try_acquire():
+        # A stop request can only apply to the scan that was running when it was made; clear it
+        # here so the next scan is not aborted by a flag set minutes ago.
+        linkedin_cancel_event.clear()
         try:
             return _sync_linkedin_alerts_and_saved(db)
         finally:
@@ -494,20 +499,26 @@ def _sync_linkedin_alerts_and_saved(db: Session) -> LinkedInSyncResponse:
             time.sleep(LINKEDIN_AUTOMATION_PACING_SECONDS)
 
             try:
-                # 2. Scan subscribed job alert feeds + recommendations on shared page
-                alert_postings = scan_linkedin_job_alerts(
-                    p,
-                    headless=True,
-                    max_alerts=5,
-                    max_jobs_per_alert=10,
-                    target_roles=target_roles,
-                    target_location=target_location,
-                    page=page,
-                )
-                time.sleep(LINKEDIN_AUTOMATION_PACING_SECONDS)
-                recommendations = scan_linkedin_job_recommendations(
-                    p, headless=True, limit=10, page=page
-                )
+                # 2. Scan subscribed job alert feeds + recommendations on shared page.
+                # Each stage is skipped (never interrupted) when a stop was requested: the page
+                # work in flight cannot be cancelled, so the earliest safe abort is a boundary.
+                alert_postings = []
+                recommendations = []
+                if not linkedin_cancel_event.is_set():
+                    alert_postings = scan_linkedin_job_alerts(
+                        p,
+                        headless=True,
+                        max_alerts=5,
+                        max_jobs_per_alert=10,
+                        target_roles=target_roles,
+                        target_location=target_location,
+                        page=page,
+                    )
+                    time.sleep(LINKEDIN_AUTOMATION_PACING_SECONDS)
+                if not linkedin_cancel_event.is_set():
+                    recommendations = scan_linkedin_job_recommendations(
+                        p, headless=True, limit=10, page=page
+                    )
 
                 # Combine alert items without duplicate URLs
                 all_alert_items = []
@@ -622,8 +633,12 @@ def _sync_linkedin_alerts_and_saved(db: Session) -> LinkedInSyncResponse:
                         recs_added += 1
 
                 # 3. Scan saved jobs across all pages on shared page, ingest active ones as Shortlisted, and prune closed listings
-                saved_jobs = scan_and_sync_linkedin_saved_jobs(
-                    p, headless=True, auto_unsave_closed=True, page=page
+                saved_jobs = (
+                    []
+                    if linkedin_cancel_event.is_set()
+                    else scan_and_sync_linkedin_saved_jobs(
+                        p, headless=True, auto_unsave_closed=True, page=page
+                    )
                 )
                 saved_checked = len(saved_jobs)
                 saved_added = 0
@@ -753,7 +768,15 @@ def _sync_linkedin_alerts_and_saved(db: Session) -> LinkedInSyncResponse:
 
         total_processed = recs_found + saved_checked
         total_added = recs_added + saved_added
-        summary_msg = f"LinkedIn sync complete: Scanned {total_processed} total posting(s) ({recs_found} alerts/recommendations, {saved_checked} saved). {total_added} new added, {already_existing} already tracked, {closed_pruned} closed job(s) pruned."
+        stopped = linkedin_cancel_event.is_set()
+        summary_msg = (
+            f"LinkedIn sync stopped by request: Scanned {total_processed} total posting(s) "
+            f"({recs_found} alerts/recommendations, {saved_checked} saved). {total_added} new "
+            f"added, {already_existing} already tracked, {closed_pruned} closed job(s) pruned. "
+            "Remaining stages were skipped."
+            if stopped
+            else f"LinkedIn sync complete: Scanned {total_processed} total posting(s) ({recs_found} alerts/recommendations, {saved_checked} saved). {total_added} new added, {already_existing} already tracked, {closed_pruned} closed job(s) pruned."
+        )
 
         # Persist Operation Audit Log
         try:
@@ -765,7 +788,7 @@ def _sync_linkedin_alerts_and_saved(db: Session) -> LinkedInSyncResponse:
 
             op_log = OperationLog(
                 operation_type="linkedin_sync",
-                status="Completed",
+                status="Partial" if stopped else "Completed",
                 summary=summary_msg,
                 details_json=sanitize_log_details(
                     {
@@ -834,6 +857,7 @@ def _run_linkedin_sync_task_runner(
     db = next(db_gen)
     total_found = 0
     scan_lock_held = False
+    scan_errors: List[str] = []
     # Saved jobs are explicit user intent and bypass the preference gate; alerts/recommendations do not.
     pref_filter = PreferenceFilter.from_db(db)
     alerts_filtered = 0
@@ -890,6 +914,8 @@ def _run_linkedin_sync_task_runner(
                 )
             return {"jobs_found": 0, "skipped": "linkedin_sync_in_progress"}
         scan_lock_held = True
+        # The flag applies to whichever scan holds the gate; a stale request must not abort this one.
+        linkedin_cancel_event.clear()
 
         saved_count = 0
         # Review batch id for this background sync run: every job newly ingested is tagged so the
@@ -931,8 +957,12 @@ def _run_linkedin_sync_task_runner(
                     return enrichment_page
 
                 try:
-                    saved_jobs = scan_and_sync_linkedin_saved_jobs(
-                        p, headless=True, auto_unsave_closed=True, max_pages=3
+                    saved_jobs = (
+                        []
+                        if linkedin_cancel_event.is_set()
+                        else scan_and_sync_linkedin_saved_jobs(
+                            p, headless=True, auto_unsave_closed=True, max_pages=3
+                        )
                     )
                     for item in saved_jobs or []:
                         if item.get("is_closed"):
@@ -1046,6 +1076,7 @@ def _run_linkedin_sync_task_runner(
                         except Exception:
                             pass
         except Exception as s_err:
+            scan_errors.append(f"saved_jobs: {s_err}")
             logger.warning(f"LinkedIn saved jobs scan notice: {s_err}")
 
         if cancel_token:
@@ -1062,8 +1093,12 @@ def _run_linkedin_sync_task_runner(
         alerts_count = 0
         try:
             with sync_playwright() as p:
-                alerts_items = scan_linkedin_job_alerts(
-                    p, headless=True, max_alerts=10, max_jobs_per_alert=10
+                alerts_items = (
+                    []
+                    if linkedin_cancel_event.is_set()
+                    else scan_linkedin_job_alerts(
+                        p, headless=True, max_alerts=10, max_jobs_per_alert=10
+                    )
                 )
                 for rec in alerts_items or []:
                     # Preference gate: alert/recommendation feeds are discovery, not explicit intent.
@@ -1129,6 +1164,7 @@ def _run_linkedin_sync_task_runner(
                 db.commit()
                 total_found += alerts_count
         except Exception as a_err:
+            scan_errors.append(f"alerts: {a_err}")
             logger.warning(f"LinkedIn alerts scan notice: {a_err}")
 
         if progress_cb:
@@ -1142,13 +1178,22 @@ def _run_linkedin_sync_task_runner(
         # Record a linkedin_sync OperationLog so the "N new from sync" review banner (which reads
         # the latest linkedin_sync log) reflects background/Sync-All runs, not just manual syncs.
         try:
+            # A run where both scans raised is not a completed sync: it reports the failure
+            # instead, so "no saved jobs" and "LinkedIn automation broke" stop looking identical.
+            stopped_by_request = linkedin_cancel_event.is_set()
+            log_status = (
+                "Failed"
+                if len(scan_errors) >= 2
+                else ("Partial" if (scan_errors or stopped_by_request) else "Completed")
+            )
             db.add(OperationLog(
                 operation_type="linkedin_sync",
-                status="Completed",
+                status=log_status,
                 summary=(
-                    f"LinkedIn sync complete (background): {total_found} new added "
+                    f"LinkedIn sync (background): {total_found} new added "
                     f"({saved_count} saved, {alerts_count} alerts/recommendations, "
                     f"{alerts_filtered} filtered)."
+                    + (f" Errors: {'; '.join(scan_errors)[:200]}" if scan_errors else "")
                 ),
                 details_json=sanitize_log_details(
                     {
@@ -1184,8 +1229,15 @@ def _run_linkedin_sync_task_runner(
 
 @router.post("/api/linkedin/sync/stop")
 def stop_linkedin_sync(db: Session = Depends(get_db)):
-    """Signals the active LinkedIn sync to abort and cancels any queued (not yet started) scan."""
+    """Stop the running LinkedIn sync at its next stage boundary, and cancel queued scans.
+
+    A scan stage is a sequence of Playwright navigations, so the running one cannot be
+    interrupted mid-flight: this stops it from starting the next stage. The response says
+    which of those happened instead of always claiming the process stopped.
+    """
+    running = _LINKEDIN_SCAN_GATE.is_held()
     linkedin_cancel_event.set()
+
     cancelled = 0
     try:
         for row in linkedin_scan_queue.cancel_pending(db):
@@ -1195,7 +1247,15 @@ def stop_linkedin_sync(db: Session = Depends(get_db)):
     except Exception as cancel_err:  # noqa: BLE001 - stopping the live scan still succeeds
         logger.warning(f"Could not cancel queued LinkedIn scans: {cancel_err}")
 
-    message = "LinkedIn sync process stopped."
+    if running:
+        message = (
+            "Stop requested. The scan in progress finishes its current page and skips the "
+            "remaining stages."
+        )
+    elif cancelled:
+        message = "No LinkedIn scan was running."
+    else:
+        message = "No LinkedIn scan was running and nothing was queued."
     if cancelled:
         message += f" {cancelled} queued scan(s) cancelled."
     return {"message": message}

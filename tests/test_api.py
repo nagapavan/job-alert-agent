@@ -39,6 +39,17 @@ def test_health_check():
     assert "provider" in data["active_llm"]
 
 
+@patch("backend.ai_helper.requests.get")
+def test_health_does_not_probe_llm_providers(mock_get):
+    """A public liveness route must not spend seconds on provider discovery or resize the pool."""
+    before = mock_get.call_count
+    res = client.get("/api/health")
+    assert res.status_code == 200
+    assert mock_get.call_count == before
+    # The snapshot field stays, so the SPA contract does not change.
+    assert "provider" in res.json()["active_llm"]
+
+
 def test_llm_status_endpoint():
     res = client.get("/api/llm/status")
     assert res.status_code == 200
@@ -489,7 +500,8 @@ def test_trigger_jobs_scrape(mock_gh):
     # Test stop linkedin sync endpoint
     stop_li_res = client.post("/api/linkedin/sync/stop")
     assert stop_li_res.status_code == 200
-    assert "stopped" in stop_li_res.json()["message"]
+    # Nothing is running here, and the route must say so rather than claim it killed a scan.
+    assert "No LinkedIn scan was running" in stop_li_res.json()["message"]
 
 
 @patch("backend.scraper.scrape_workday_jobs")
@@ -1311,15 +1323,19 @@ def test_llm_token_usage_lifecycle(tmp_path, monkeypatch):
     assert sync_res.json()["completion_tokens"] >= 75
 
 
-@patch("backend.main.threading.Thread")
-def test_browser_auth_session_endpoints(mock_thread):
+@patch("backend.main.task_engine.submit_task", return_value="tsk_browser01")
+def test_browser_auth_session_endpoints(mock_submit):
     # Test POST /api/browser/auth-session
     res1 = client.post(
         "/api/browser/auth-session", json={"url": "https://www.linkedin.com/login"}
     )
     assert res1.status_code == 200
     assert res1.json()["status"] == "Launched"
+    assert res1.json()["task_id"] == "tsk_browser01"
     assert "linkedin.com/login" in res1.json()["message"]
+    # The session must be a task-engine task so the shutdown drain can cancel it.
+    assert mock_submit.call_args.args[0] == "browser_session"
+    assert mock_submit.call_args.args[3] == "https://www.linkedin.com/login"
 
     # Test POST /api/browser/interactive-session
     res2 = client.post(
@@ -1328,6 +1344,7 @@ def test_browser_auth_session_endpoints(mock_thread):
     )
     assert res2.status_code == 200
     assert res2.json()["status"] == "Launched"
+    assert mock_submit.call_args.args[3] == "https://mail.google.com"
     assert "mail.google.com" in res2.json()["message"]
 
     # Test scheme rejection (file:// and javascript:)
@@ -2322,3 +2339,172 @@ def test_status_update_to_the_same_status_writes_no_event(db_session):
         db_session.query(ApplicationEvent).filter(ApplicationEvent.job_id == job.id).count()
     )
     assert after == before
+
+
+@patch("backend.routers.linkedin.scan_and_sync_linkedin_saved_jobs")
+@patch("backend.routers.linkedin.scan_linkedin_job_alerts")
+@patch("backend.playwright_app.is_profile_in_use", return_value=False)
+def test_linkedin_background_run_records_failure_not_completed(
+    _mock_in_use, mock_alerts, mock_saved, db_session
+):
+    """Both scans raising must not read as a completed sync with zero jobs."""
+    from backend.database import OperationLog, get_user_preferences, record_consent
+    from backend.routers.linkedin import _run_linkedin_sync_task_runner
+
+    mock_saved.side_effect = RuntimeError("saved jobs scan exploded")
+    mock_alerts.side_effect = RuntimeError("alerts scan exploded")
+
+    pref = get_user_preferences(db_session)
+    pref.features_json = '{"linkedin_sync": true}'
+    db_session.commit()
+    record_consent(db_session, "linkedin_sync")
+
+    with patch("backend.routers.linkedin.get_db", return_value=iter([db_session])):
+        _run_linkedin_sync_task_runner()
+
+    log = (
+        db_session.query(OperationLog)
+        .filter(OperationLog.operation_type == "linkedin_sync")
+        .order_by(OperationLog.id.desc())
+        .first()
+    )
+    assert log is not None
+    assert log.status == "Failed"
+    assert "saved jobs scan exploded" in (log.summary or "")
+
+
+def test_token_sync_is_idempotent_and_does_not_double_count(tmp_path, monkeypatch):
+    """OperationLog rows are deltas of the same counters, so adding them back doubled the total."""
+    from backend.ai_helper import token_tracker
+    from backend.database import OperationLog
+
+    monkeypatch.setattr("backend.ai_helper.STATS_FILE", tmp_path / "token_stats.json")
+    token_tracker.reset()
+    token_tracker.record(500, 150)
+
+    db = next(
+        client.app.dependency_overrides[
+            client.app.dependency_overrides.__iter__().__next__()
+        ]()
+    )
+    try:
+        # The log row the caller wrote for that very call: a delta of the counters above.
+        db.add(OperationLog(operation_type="scraper", status="Completed",
+                            summary="recorded call", prompt_tokens=500, completion_tokens=150))
+        db.commit()
+    finally:
+        db.close()
+
+    first = client.post("/api/llm/token-usage/sync").json()
+    second = client.post("/api/llm/token-usage/sync").json()
+
+    assert first["prompt_tokens"] == 500
+    assert second["prompt_tokens"] == 500, "a second sync must not add the same rows again"
+    assert second["completion_tokens"] == 150
+
+
+def test_recalculate_does_not_count_deterministic_scores_as_llm_calls(db_session):
+    """Deterministic scores write match_score + match_analysis too; only the LLM fallback spent tokens."""
+    from backend.ai_helper import token_tracker
+    from backend.database import Company, Job
+
+    comp = Company(name="Globex")
+    db_session.add(comp)
+    db_session.flush()
+    db_session.add(
+        Job(
+            company_id=comp.id,
+            title="Staff Engineer",
+            status="To Apply",
+            match_score=71.0,
+            match_analysis="Strengths: python",
+            score_method="classifier_v1",
+        )
+    )
+    db_session.commit()
+
+    token_tracker.reset()
+    out = token_tracker.recalculate_from_database(db=db_session)
+
+    assert out["prompt_tokens"] == 0
+    assert out["completion_tokens"] == 0
+
+
+def test_linkedin_stop_does_not_claim_the_running_scan_was_killed():
+    """The route used to answer "LinkedIn sync process stopped." whatever happened."""
+    from backend.routers.linkedin import linkedin_cancel_event
+
+    linkedin_cancel_event.clear()
+    try:
+        res = client.post("/api/linkedin/sync/stop")
+        assert res.status_code == 200
+        message = res.json()["message"]
+        assert "process stopped" not in message
+        assert linkedin_cancel_event.is_set(), "a stop must be recorded for the running scan"
+    finally:
+        linkedin_cancel_event.clear()
+
+
+@patch("backend.routers.linkedin.sync_playwright")
+@patch("backend.routers.linkedin.scan_and_sync_linkedin_saved_jobs")
+@patch("backend.routers.linkedin.scan_linkedin_job_alerts")
+@patch("backend.routers.linkedin.scan_linkedin_job_recommendations")
+def test_linkedin_stop_skips_the_remaining_manual_stages(
+    mock_recs, mock_alerts, mock_saved, _mock_pw, db_session
+):
+    """A stop between stages must skip them, and say so in the message and the audit log."""
+    from backend.database import OperationLog, get_user_preferences, record_consent
+    from backend.routers.linkedin import _sync_linkedin_alerts_and_saved, linkedin_cancel_event
+
+    pref = get_user_preferences(db_session)
+    pref.features_json = '{"linkedin_sync": true}'
+    db_session.commit()
+    record_consent(db_session, "linkedin_sync")
+
+    linkedin_cancel_event.set()  # as if the user pressed stop before the first stage
+    try:
+        res = _sync_linkedin_alerts_and_saved(db_session)
+    finally:
+        linkedin_cancel_event.clear()
+
+    mock_alerts.assert_not_called()
+    mock_recs.assert_not_called()
+    mock_saved.assert_not_called()
+    assert "stopped by request" in res.message
+    log = (
+        db_session.query(OperationLog)
+        .filter(OperationLog.operation_type == "linkedin_sync")
+        .order_by(OperationLog.id.desc())
+        .first()
+    )
+    assert log is not None
+    assert log.status == "Partial"
+
+
+@patch("backend.routers.linkedin.sync_playwright")
+@patch("backend.routers.linkedin.scan_and_sync_linkedin_saved_jobs")
+@patch("backend.routers.linkedin.scan_linkedin_job_alerts")
+@patch("backend.routers.linkedin.scan_linkedin_job_recommendations")
+def test_a_new_scan_ignores_a_stale_stop_request(mock_recs, mock_alerts, mock_saved, _mock_pw):
+    """The flag is per-scan: a stop set before this one started must not abort it."""
+    from backend.routers.linkedin import linkedin_cancel_event
+
+    mock_alerts.return_value = []
+    mock_recs.return_value = []
+    mock_saved.return_value = []
+
+    client.put(
+        "/api/preferences",
+        json={
+            "features": {"linkedin_sync": True},
+            "consents": {"linkedin_sync": {"ack": True}},
+        },
+    )
+    linkedin_cancel_event.set()
+    try:
+        res = client.post("/api/linkedin/sync")
+    finally:
+        linkedin_cancel_event.clear()
+
+    assert res.status_code == 200
+    assert mock_alerts.called, "a stale stop must not skip the scan"

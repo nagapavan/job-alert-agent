@@ -5,19 +5,19 @@ Tests for the fast ML-based match classifier.
 import pytest
 from backend.match_classifier import (
     MatchFeatures,
-    SimpleHeuristicClassifier,
+    DeterministicClassifier,
     extract_match_features,
     build_deterministic_assessment,
     build_jd_hints,
 )
 
 
-class TestSimpleHeuristicClassifier:
+class TestDeterministicClassifier:
     """Test fallback heuristic classifier (always available, no sklearn required)."""
 
     def test_strong_match(self):
         """Strong must-have + seniority + experience coverage."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = MatchFeatures(
             must_coverage=1.0,
             nice_coverage=0.8,
@@ -33,7 +33,7 @@ class TestSimpleHeuristicClassifier:
 
     def test_moderate_match(self):
         """Partial must-haves, good nice-to-haves."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = MatchFeatures(
             must_coverage=0.6,
             nice_coverage=0.9,
@@ -49,7 +49,7 @@ class TestSimpleHeuristicClassifier:
 
     def test_weak_match(self):
         """Low must-have coverage, experience mismatch."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = MatchFeatures(
             must_coverage=0.2,
             nice_coverage=0.3,
@@ -65,7 +65,7 @@ class TestSimpleHeuristicClassifier:
 
     def test_score_bounds(self):
         """Scores are always 0-100."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         for must_cov in [0.0, 0.5, 1.0]:
             for nice_cov in [0.0, 0.5, 1.0]:
                 features = MatchFeatures(
@@ -499,27 +499,27 @@ class TestEmptyNiceToHaveSet:
         )
 
     def test_no_nice_section_is_scored_over_the_remaining_eighty_points(self):
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = self._features(0.5, 0.0, must_count=8, nice_count=0)
         # (0.5*60 + 1.0*15 + 1.0*5) / 80 * 100 == 62.5, not the legacy 45.0.
         assert classifier.predict(features) == pytest.approx(62.5)
 
     def test_a_perfect_fit_without_a_preferred_section_can_reach_one_hundred(self):
         """The old formula capped such a JD at 80 no matter how well the candidate matched."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = self._features(1.0, 0.0, must_count=8, nice_count=0)
         assert classifier.predict(features) == pytest.approx(100.0)
 
     def test_a_jd_with_nice_to_haves_keeps_its_legacy_score(self):
         """The renormalisation must be inert when the set is present."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = self._features(0.6, 0.75, must_count=5, nice_count=4)
         legacy = 0.6 * 60 + 0.75 * 20 + 1.0 * 15 + 1.0 * 5
         assert classifier.predict(features) == pytest.approx(legacy)
 
     def test_partial_nice_coverage_still_costs_points(self):
         """An empty set is free; a present-but-unmet set is not."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         unmet = self._features(0.6, 0.0, must_count=5, nice_count=4)
         met = self._features(0.6, 1.0, must_count=5, nice_count=4)
         absent = self._features(0.6, 0.0, must_count=5, nice_count=0)
@@ -527,7 +527,7 @@ class TestEmptyNiceToHaveSet:
 
     def test_no_requirements_at_all_keeps_the_legacy_full_scale(self):
         """With nothing to verify, the score stays low instead of renormalising over 20 points."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = self._features(0.0, 0.0, must_count=0, nice_count=0)
         assert classifier.predict(features) == pytest.approx(20.0)
 

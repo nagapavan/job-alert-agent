@@ -185,6 +185,11 @@ origin/referer, `Sec-Fetch-Site: same-origin`, or a loopback client (`127.0.0.1`
 - **Public paths**: `/`, `/api/health`, `/api/auth/status`, `/docs`, `/openapi.json`,
   `/favicon.ico`, `/api/gmail/oauth2callback`, `/static/*`, and all `OPTIONS` preflights.
 - `verify_api_key` is also applied to `GET /api/auth/client-config`.
+- **Declaration order is load-bearing.** Starlette inserts each `@app.middleware` at the front of
+  the stack, so the last one declared is the outermost. The firewall has to sit *inside*
+  `request_observability_middleware`, otherwise its 401 (which returns without calling
+  `call_next`) is never logged and carries no `X-Request-ID`. Declare the firewall first;
+  `tests/test_app_lifecycle.py` fails if that ordering regresses.
 - Key validation uses **constant-time** comparison to prevent timing attacks:
 
 ```python
@@ -268,6 +273,11 @@ def _graceful_shutdown_drain():
 `run_shutdown()` is idempotent (first caller drains; later calls no-op) and every step is wrapped so
 teardown can never raise. During a drain, `GET /api/health` reports `status: "shutting_down"` and
 `shutting_down: true` so a supervisor can tell "draining" from "dead".
+
+`/api/health` is a liveness check only: one database query plus the shutdown flag. Its
+`active_llm` field is the last *observed* provider snapshot and it never probes, because the route
+is public and polled and each probe is a serial HTTP call. Provider discovery, and the worker-pool
+sizing that follows it, belong to `GET /api/llm/status` (memoised 30 s) and to the LLM settings write.
 
 > **Do NOT register your own signal handlers.** Uvicorn owns `SIGTERM`/`SIGINT` and fires the ASGI
 > shutdown lifecycle on every graceful path (`--reload` child, `--workers`, standalone). Because the

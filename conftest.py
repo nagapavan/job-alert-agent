@@ -5,10 +5,10 @@ import warnings
 from pathlib import Path
 import pytest
 
-# Importing backend.main runs setup_observability(), init_db() and scheduler.start() at module
-# scope, so these two settings must be in place BEFORE that import happens. Without them a plain
-# `pytest` flips the operator's live database to WAL, runs ~40 ALTER TABLE migrations on it, and
-# starts a real discovery scheduler thread that can fire a browser run mid-suite.
+# Importing backend.main no longer touches the database: observability, init_db() and the
+# scheduler now run on the ASGI startup lifecycle, so collection stays side-effect free. The
+# NO_SCHEDULER guard still matters for every TestClient that starts the app. DATABASE_URL is set
+# here so that startup handler opens a throwaway file instead of the operator's live database.
 os.environ.setdefault("JOB_ALERT_AGENT_NO_SCHEDULER", "1")
 os.environ.setdefault(
     "DATABASE_URL", f"sqlite:///{Path(tempfile.mkdtemp(prefix='jaa-test-')) / 'import-time.db'}"

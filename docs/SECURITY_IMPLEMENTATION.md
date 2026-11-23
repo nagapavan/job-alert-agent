@@ -78,6 +78,14 @@ Otherwise returns **401 Unauthorized**.
 
 **Special case**: `GET /api/auth/client-config` requires `verify_api_key`.
 
+**Loopback caveat (accepted, documented).** `verify_api_key` treats a loopback caller as
+authenticated so the SPA can bootstrap without a key. That means *any* local process — or a
+no-`Origin` cross-site GET the firewall allows — can read `API_KEY` from
+`/api/auth/client-config`. This is a deliberate trade for the handshake, not an oversight: the
+threat model is "other users on this machine", and the alternative (a per-page-session token
+injected into the SPA shell) adds a second secret without removing local exposure. The browser
+extension deliberately keeps the key in a header instead of calling this route.
+
 **Constant-time comparison** (timing attack prevention):
 
 ```python

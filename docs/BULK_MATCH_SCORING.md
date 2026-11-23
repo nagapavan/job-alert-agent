@@ -243,8 +243,7 @@ Run: `./.venv/bin/pytest -q tests/test_match_rescore.py`
 ## Future Enhancements
 
 1. **Learned artifact detector** (ML): Replace the `_JD_CUE_RE` regex with a classifier trained on artifact patterns.
-2. **Classifier retraining**: Shipped — `scripts/train_match_classifier.py` trains from implicit user
-   outcomes (excluded system-generated rows), gated at ≥50 trainable / ≥15 per class. Still open:
-   scheduling it periodically and versioning the model artifact.
+2. **Learned scoring**: not planned. Scoring is one deterministic scorer so a stored score can be
+   re-derived; see "Why there is no training step" in [`HYBRID_MATCHER_GUIDE.md`](HYBRID_MATCHER_GUIDE.md).
 3. **Score confidence interval**: Attach uncertainty bounds from the classifier.
 4. **Cache Tier 2 results**: Reuse LLM fallback results for duplicate JDs (e.g., LinkedIn repost).

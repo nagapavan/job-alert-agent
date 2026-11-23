@@ -217,3 +217,32 @@ def test_stale_running_status_reconciled_on_load(tmp_path, monkeypatch):
     monkeypatch.setattr(sched_mod, "SCHEDULER_CONFIG_FILE", cfg)
     fresh = sched_mod.PeriodicScheduler(check_interval_seconds=9999)
     assert fresh._jobs["sched_google_jobs"].last_status == "INTERRUPTED"
+
+
+@patch("backend.scheduler.task_engine.submit_task")
+def test_failed_submission_is_finalized_as_failed(mock_submit, monkeypatch, tmp_path):
+    """A submission that raises must not leave the job stuck on RUNNING (finding 14)."""
+    import backend.database as dbmod
+    import backend.scheduler as sched_mod
+
+    monkeypatch.setattr(dbmod, "is_feature_enabled", lambda db, feature: True)
+    monkeypatch.setattr(sched_mod, "SCHEDULER_CONFIG_FILE", tmp_path / "sched.json")
+    mock_submit.side_effect = RuntimeError("worker pool unavailable")
+
+    assert scheduler.run_job_now("sched_google_jobs") is None
+    assert scheduler._jobs["sched_google_jobs"].last_status == "FAILED"
+
+
+def test_config_save_is_atomic(tmp_path, monkeypatch):
+    """A crash mid-write must not be able to truncate the schedule file (finding 24)."""
+    import json
+    import backend.scheduler as sched_mod
+
+    cfg = tmp_path / "scheduler_config.json"
+    monkeypatch.setattr(sched_mod, "SCHEDULER_CONFIG_FILE", cfg)
+
+    scheduler._save_config()
+
+    assert cfg.exists()
+    assert isinstance(json.loads(cfg.read_text()), list)
+    assert not (tmp_path / "scheduler_config.json.tmp").exists()

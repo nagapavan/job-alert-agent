@@ -755,23 +755,61 @@ alex.morgan@example.com
     assert "alex.morgan@example.com" in cleaned
 
 
+def _reset_provider_cache():
+    from backend import ai_helper
+
+    ai_helper._provider_cache["info"] = None
+    ai_helper._provider_cache["at"] = 0.0
+
+
 @patch("backend.ai_helper.requests.get")
 def test_detect_active_llm_provider(mock_get):
     from backend.ai_helper import detect_active_llm_provider
+
+    _reset_provider_cache()
 
     # 1. Mock LM Studio responsive
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_get.return_value = mock_resp
 
-    status = detect_active_llm_provider()
+    status = detect_active_llm_provider(force=True)
     assert status["provider"] == "LM Studio"
     assert status["status"] == "online"
 
     # 2. Mock all offline -> offline status
     mock_get.side_effect = ConnectionError("No local LLMs")
-    status_offline = detect_active_llm_provider()
+    status_offline = detect_active_llm_provider(force=True)
     assert status_offline["status"] in ("offline", "configured")
+
+
+@patch("backend.ai_helper.requests.get")
+def test_the_provider_probe_is_memoised(mock_get):
+    """Each probe is a serial 1.5 s HTTP call; a burst of callers must not repeat it."""
+    from backend import ai_helper
+
+    _reset_provider_cache()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_get.return_value = mock_resp
+
+    first = ai_helper.detect_active_llm_provider()
+    probes = mock_get.call_count
+    second = ai_helper.detect_active_llm_provider()
+
+    assert probes >= 1
+    assert mock_get.call_count == probes
+    assert first == second
+
+    # The snapshot route never probes, whatever the cache state.
+    assert ai_helper.cached_active_llm_provider() == first
+
+
+def test_the_health_snapshot_is_unknown_until_something_probes():
+    from backend import ai_helper
+
+    _reset_provider_cache()
+    assert ai_helper.cached_active_llm_provider()["status"] == "unknown"
 
 
 def test_clean_job_description_boilerplate_stripping():

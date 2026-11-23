@@ -24,8 +24,9 @@ os.environ.setdefault("JOB_ALERT_AGENT_NO_SCHEDULER", "1")
 
 
 def _load_rows():
-    import backend.main  # noqa: F401 - runs init_db(), which binds SessionLocal
-    from backend.database import Job, SessionLocal
+    from backend.database import Job, SessionLocal, init_db
+
+    init_db()
 
     db = SessionLocal()
     try:
@@ -93,13 +94,13 @@ def _score_all(rows):
 
 def _predict(assessment, parsed, title, description):
     from backend.match_classifier import (
-        build_jd_hints, extract_match_features, get_classifier,
+        CLASSIFIER, build_jd_hints, extract_match_features,
     )
     from backend.match_scoring import ScoringConfig
 
     hints = build_jd_hints(description, title)
     features = extract_match_features(parsed, hints, assessment=assessment)
-    score = get_classifier().predict(features)
+    score = CLASSIFIER.predict(features)
     config = ScoringConfig()
     if features.must_count > 0 and features.must_coverage < config.must_floor:
         score = min(score, config.cap_when_below_floor)

@@ -332,10 +332,10 @@ def _deterministic_match(
     # the LLM queue. Falls through to the LLM extractor only if it cannot produce
     # a usable assessment.
     from backend.match_classifier import (
+        CLASSIFIER,
         build_deterministic_assessment,
         build_jd_hints,
         extract_match_features,
-        get_classifier,
     )
     from backend.match_scoring import band_and_recommendation
 
@@ -358,8 +358,7 @@ def _deterministic_match(
         features = extract_match_features(
             parsed_resume, jd_hints, assessment=assessment
         )
-        classifier = get_classifier()
-        score = classifier.predict(features)
+        score = CLASSIFIER.predict(features)
 
         scoring_config = ScoringConfig.from_mapping(get_scoring_config(db))
         # Same must-have floor as compute_match: a posting the candidate only half-qualifies

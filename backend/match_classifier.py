@@ -1,31 +1,21 @@
-"""
-Fast, deterministic ML-based job match classifier.
+"""Deterministic job-match scorer.
 
-Replaces expensive full-cycle LLM extraction with lightweight feature-based scoring.
-Trained on historical job assessments from the database.
+Maps the features derived from a requirement assessment (coverage of must-haves and
+nice-to-haves, seniority, education, tenure, over-qualification) to a 0-100 score with
+fixed weights. No model file, no training step, no per-user state: the same JD and resume
+always produce the same score, which is what makes the stored score reproducible and the
+audit in ``score_judge`` able to re-derive it.
 """
 
 import json
 import logging
-import pickle
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Tuple, List
-import numpy as np
 
 from backend import section_intent
 
 logger = logging.getLogger("match_classifier")
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-CLASSIFIER_PATH = BASE_DIR / "data" / "match_classifier.pkl"
-
-# Training floors. Learning is refused below these so a model fitted on a handful of
-# outcomes cannot silently ship and degrade scoring (see backend/learning_signals.py).
-MIN_TRAINING_SAMPLES = 50
-MIN_PER_CLASS_SAMPLES = 15
-
 
 @dataclass
 class MatchFeatures:
@@ -45,11 +35,8 @@ class MatchFeatures:
     education_mentioned: bool = True
 
 
-class SimpleHeuristicClassifier:
-    """
-    Fallback deterministic classifier when no trained model exists.
-    Uses weighted rule-based scoring (no ML).
-    """
+class DeterministicClassifier:
+    """Weighted rule-based scoring over the assessment features (no model, no ML)."""
 
     def predict(self, features: MatchFeatures) -> float:
         """Return match score 0-100 based on requirement coverage and fit."""
@@ -91,60 +78,6 @@ class SimpleHeuristicClassifier:
             pass  # Don't penalize; let user decide
 
         return score
-
-
-class TrainedClassifier:
-    """Lightweight logistic regression trained on historical assessments."""
-
-    def __init__(self, model):
-        self.model = model
-        self.fallback = SimpleHeuristicClassifier()
-
-    def predict(self, features: MatchFeatures) -> float:
-        """Return match score 0-100."""
-        try:
-            X = self._features_to_array(features)
-            # Logistic regression outputs probability [0, 1]; scale to [0, 100]
-            prob = self.model.predict_proba(X.reshape(1, -1))[0, 1]
-            return prob * 100.0
-        except Exception as e:
-            logger.warning(f"Classifier inference failed, using fallback: {e}")
-            return self.fallback.predict(features)
-
-    @staticmethod
-    def _features_to_array(features: MatchFeatures) -> np.ndarray:
-        """Convert MatchFeatures to numpy array for sklearn."""
-        return np.array(
-            [
-                features.must_coverage,
-                features.nice_coverage,
-                features.seniority_fit,
-                features.education_match,
-                features.experience_years_delta,
-                features.over_qualified_flag,
-                min(features.must_count / 10.0, 1.0),  # Normalize by typical max
-                min(features.nice_count / 10.0, 1.0),
-            ],
-            dtype=np.float32,
-        )
-
-
-def load_classifier() -> SimpleHeuristicClassifier | TrainedClassifier:
-    """
-    Load trained classifier if available, else return heuristic fallback.
-    """
-    if CLASSIFIER_PATH.exists():
-        try:
-            with open(CLASSIFIER_PATH, "rb") as f:
-                model = pickle.load(f)
-            logger.info(f"Loaded trained classifier from {CLASSIFIER_PATH}")
-            return TrainedClassifier(model)
-        except Exception as e:
-            logger.warning(f"Failed to load classifier: {e}; using fallback heuristic")
-            return SimpleHeuristicClassifier()
-    else:
-        logger.info(f"No classifier found at {CLASSIFIER_PATH}; using heuristic fallback")
-        return SimpleHeuristicClassifier()
 
 
 def build_jd_hints(description: str, job_title: str = "") -> dict:
@@ -646,132 +579,5 @@ def build_deterministic_assessment(
     )
 
 
-def train_classifier_from_db(db_session, output_path: Optional[Path] = None):
-    """Train a logistic-regression classifier on *implicit user outcomes*.
-
-    Labels are derived by :mod:`backend.learning_signals` from real behaviour (the user
-    applied, or deliberately dismissed a role) — never from the model's own previous
-    output. System-generated states (discovery auto-filtering, rows pre-set at ingestion)
-    are excluded, because they carry no preference signal.
-
-    Refuses to train below ``MIN_TRAINING_SAMPLES`` with at least
-    ``MIN_PER_CLASS_SAMPLES`` in each class. This is deliberate: a model fitted on a
-    handful of positives would memorise noise and silently degrade scoring while looking
-    like it had learned something.
-    """
-    try:
-        from sklearn.linear_model import LogisticRegression
-    except ImportError:
-        logger.error(
-            "scikit-learn not installed. Install with: pip install scikit-learn"
-        )
-        return False
-
-    from backend.database import Job
-    from backend import learning_signals, jd_signals
-
-    output = output_path or CLASSIFIER_PATH
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    decisions = learning_signals.collect_decisions(db_session)
-    trainable = [d for d in decisions if d.is_trainable]
-    excluded = len(decisions) - len(trainable)
-
-    positives = [d for d in trainable if d.label in (
-        learning_signals.POSITIVE, learning_signals.STRONG_POSITIVE
-    )]
-    negatives = [d for d in trainable if d.label in (
-        learning_signals.NEGATIVE, learning_signals.NEGATIVE_OUTCOME
-    )]
-
-    if len(trainable) < MIN_TRAINING_SAMPLES:
-        logger.warning(
-            "Insufficient training signal: %d trainable decisions (need >= %d). "
-            "%d rows excluded as system-generated. Not training.",
-            len(trainable), MIN_TRAINING_SAMPLES, excluded,
-        )
-        return False
-    if min(len(positives), len(negatives)) < MIN_PER_CLASS_SAMPLES:
-        logger.warning(
-            "Insufficient class balance: %d positive / %d negative "
-            "(need >= %d each). Not training.",
-            len(positives), len(negatives), MIN_PER_CLASS_SAMPLES,
-        )
-        return False
-
-    logger.info(
-        "Training classifier on %d user decisions (%d positive, %d negative); "
-        "%d system-generated rows excluded",
-        len(trainable), len(positives), len(negatives), excluded,
-    )
-
-    X_list = []
-    y_list = []
-
-    for decision in trainable:
-        try:
-            job = db_session.query(Job).filter(Job.id == decision.job_id).first()
-            if job is None:
-                continue
-            # Re-derive features from the job's own JD so training uses the same code path
-            # as live scoring (train/serve parity). Stored match_*_json columns are NULL for
-            # progressed rows, so they cannot be used as features.
-            assessment = build_deterministic_assessment(
-                job.description or "", None, job_title=job.title or ""
-            )
-            if not assessment.requirements:
-                continue
-            jd_hints = {
-                "min_years": 0,
-                "max_years": 100,
-                "seniority_level": jd_signals.seniority_level(job.title or ""),
-                "education_mentioned": bool(jd_signals.parse_education(job.description or "")),
-            }
-            features = extract_match_features(None, jd_hints, assessment=assessment)
-            X_list.append(TrainedClassifier._features_to_array(features))
-            y_list.append(
-                1 if decision.label in (
-                    learning_signals.POSITIVE, learning_signals.STRONG_POSITIVE
-                ) else 0
-            )
-        except Exception as e:
-            logger.debug(f"Skipped job {decision.job_id}: {e}")
-            continue
-
-    if len(X_list) < MIN_TRAINING_SAMPLES:
-        logger.warning(
-            "Only %d rows yielded usable features (need >= %d). Not training.",
-            len(X_list), MIN_TRAINING_SAMPLES,
-        )
-        return False
-
-    X_train = np.array(X_list, dtype=np.float32)
-    y_train = np.array(y_list)
-
-    if len(set(y_train.tolist())) < 2:
-        logger.warning("Training data contains a single class; not training.")
-        return False
-
-    model = LogisticRegression(max_iter=1000, random_state=42)
-    model.fit(X_train, y_train)
-
-    with open(output, "wb") as f:
-        pickle.dump(model, f)
-
-    logger.info(f"Trained classifier saved to {output}")
-    logger.info(f"  Features: {X_train.shape[1]}, Samples: {X_train.shape[0]}")
-    logger.info(f"  Positive class: {y_train.sum()} / {len(y_train)}")
-
-    return True
-
-
-# Singleton instance (lazy-loaded on first use)
-_classifier_instance = None
-
-
-def get_classifier():
-    """Get the global classifier instance (lazy-loaded)."""
-    global _classifier_instance
-    if _classifier_instance is None:
-        _classifier_instance = load_classifier()
-    return _classifier_instance
+# One deterministic scorer for the whole process; it holds no state.
+CLASSIFIER = DeterministicClassifier()

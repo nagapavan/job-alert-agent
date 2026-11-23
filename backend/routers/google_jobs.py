@@ -44,11 +44,14 @@ from backend.playwright_app import (
 from backend.preference_filter import PreferenceFilter
 from backend.scraper import evaluate_job_due_diligence, extract_portal_info_from_job_url
 from backend.task_engine import CancellationToken
-from backend.title_parser import safe_company_name as _safe_company_name
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["google-jobs"])
+
+# Both ingestion paths (manual endpoint and scheduled runner) must write the same value, or the
+# endpoint's dedupe filter cannot see a posting the runner already stored.
+GOOGLE_JOBS_SOURCE_TYPE = "Google"
 
 
 class GoogleSearchesUpdate(BaseModel):
@@ -68,6 +71,7 @@ class GoogleJobsScrapeResponse(BaseModel):
     total_discovered: int = 0
     total_added: int = 0
     already_existing: int = 0
+    filtered_out_of_preference: int = 0
     dismissed_filtered: int = 0
     queries_scanned: List[str] = []
     per_query_breakdown: List[dict] = []
@@ -185,10 +189,21 @@ def scrape_google_jobs_endpoint(
     total_added = 0
     already_existing = 0
     dismissed_filtered = 0
+    filtered_out_of_preference = 0
     per_query_breakdown = []
     seen_in_batch_urls = set()
 
+    # Same politeness and preference machinery the scheduled runner uses: one run-level pacer for
+    # google.com, the operator's criteria applied before ingestion, and the query cursor rotated
+    # instead of replaying every stored query on each click.
+    from backend.ats.pacing import build_pacer
+
+    google_pacer = build_pacer()
+    pref_filter = PreferenceFilter.from_db(db)
+
     search_loc = req.location or "India"
+
+    queries_to_run, _total_queries = google_jobs_state.select_queries(queries_to_run)
 
     try:
         for query_str in queries_to_run:
@@ -196,7 +211,9 @@ def scrape_google_jobs_endpoint(
             q_added = 0
             q_existing = 0
             q_dismissed = 0
+            q_filtered = 0
             discovered_jobs = []
+            outcome_info: Dict[str, Any] = {}
 
             try:
                 # Playwright is the sole Google Jobs fetcher: the direct SERP is permanently
@@ -208,10 +225,29 @@ def scrape_google_jobs_endpoint(
                         location=search_loc,
                         headless=True,
                         max_results=req.limit,
+                        pacer=google_pacer,
+                        outcome=outcome_info,
                     )
             except Exception as q_err:
                 logger.warning(f"Error fetching jobs for query '{query_str}': {q_err}")
                 discovered_jobs = []
+
+            if outcome_info.get("outcome") == "cooling_down":
+                per_query_breakdown.append(
+                    {
+                        "query": query_str,
+                        "discovered": 0,
+                        "added": 0,
+                        "existing": 0,
+                        "dismissed": 0,
+                        "filtered": 0,
+                        "outcome": "cooling_down",
+                    }
+                )
+                logger.warning(
+                    "Google Jobs stopped: google.com is cooling down or over its per-run ceiling."
+                )
+                break
 
             q_discovered = len(discovered_jobs)
             total_discovered += q_discovered
@@ -219,37 +255,23 @@ def scrape_google_jobs_endpoint(
             for j in discovered_jobs:
                 job_url = j.get("url", "").strip()
                 job_title = j.get("title", "").strip()
-                comp_name = _safe_company_name(j.get("company"), "Google Jobs Employer")
-
-                # Batch deduplication check
-                batch_key = (
-                    job_url if job_url else f"{job_title}::{comp_name}"
-                ).lower()
-                if batch_key in seen_in_batch_urls:
-                    q_existing += 1
-                    already_existing += 1
-                    continue
-                seen_in_batch_urls.add(batch_key)
-
-                # Database deduplication check
-                existing = None
-                if job_url:
-                    existing = db.query(Job).filter(Job.url == job_url).first()
-                if not existing:
-                    existing = (
-                        db.query(Job)
-                        .filter(
-                            (Job.title.ilike(job_title)) & (Job.source_type == "Google")
-                        )
-                        .first()
-                    )
-
-                if existing:
-                    q_existing += 1
-                    already_existing += 1
+                job_location = (j.get("location") or search_loc or "").strip()
+                comp_name = (j.get("company") or "").strip()
+                if not job_title or not comp_name:
+                    # The organic fallback carries no employer, and inventing one files a web
+                    # result as a posting at a company that never advertised it.
                     continue
 
-                # Employer resolution & ATS portal learning
+                # Shared preference gate: the scheduled runner never ingests outside the
+                # operator's criteria, and the manual button must not be a way around it.
+                if pref_filter.rejection_reason(
+                    job_title, job_location, j.get("description", "") or ""
+                ):
+                    q_filtered += 1
+                    filtered_out_of_preference += 1
+                    continue
+
+                # Employer resolution & ATS portal learning (before dedupe: the key needs it)
                 comp = db.query(Company).filter(Company.name.ilike(comp_name)).first()
                 if not comp:
                     comp = Company(
@@ -272,6 +294,38 @@ def scrape_google_jobs_endpoint(
                         and "google.com" not in portal_info["canonical_apply_url"]
                     ):
                         j["url"] = portal_info["canonical_apply_url"]
+                        job_url = j["url"]
+
+                # Batch deduplication check
+                batch_key = (
+                    job_url if job_url else f"{job_title}::{comp.name}::{job_location}"
+                ).lower()
+                if batch_key in seen_in_batch_urls:
+                    q_existing += 1
+                    already_existing += 1
+                    continue
+                seen_in_batch_urls.add(batch_key)
+
+                # Database deduplication check: the employer is part of the key, otherwise a
+                # posting at employer B is dropped because employer A has the same title.
+                existing = None
+                if job_url:
+                    existing = db.query(Job).filter(Job.url == job_url).first()
+                if not existing:
+                    existing = (
+                        db.query(Job)
+                        .filter(
+                            (Job.company_id == comp.id)
+                            & (Job.title.ilike(job_title))
+                            & (Job.source_type == GOOGLE_JOBS_SOURCE_TYPE)
+                        )
+                        .first()
+                    )
+
+                if existing:
+                    q_existing += 1
+                    already_existing += 1
+                    continue
 
                 # Due diligence
                 dd = evaluate_job_due_diligence(
@@ -336,7 +390,7 @@ def scrape_google_jobs_endpoint(
                     salary_range=j.get("salary_range", "Competitive"),
                     location=j.get("location", "Remote / Various"),
                     source=f"Google Jobs ({query_str})",
-                    source_type="Google",
+                    source_type=GOOGLE_JOBS_SOURCE_TYPE,
                     status=job_status,
                     match_score=match_score,
                     match_analysis=match_analysis,
@@ -368,10 +422,17 @@ def scrape_google_jobs_endpoint(
                     "added": q_added,
                     "existing": q_existing,
                     "dismissed": q_dismissed,
+                    "filtered": q_filtered,
+                    "outcome": outcome_info.get("outcome"),
                 }
             )
 
-        summary_msg = f"Google Jobs discovery complete across {len(queries_to_run)} alert query(ies): Discovered {total_discovered} posting(s). Added {total_added} new target(s), {already_existing} already tracked, {dismissed_filtered} auto-dismissed."
+        summary_msg = (
+            f"Google Jobs discovery complete across {len(queries_to_run)} alert query(ies): "
+            f"Discovered {total_discovered} posting(s). Added {total_added} new target(s), "
+            f"{already_existing} already tracked, {dismissed_filtered} auto-dismissed, "
+            f"{filtered_out_of_preference} outside the saved preferences."
+        )
 
         # OperationLog
         try:
@@ -393,6 +454,7 @@ def scrape_google_jobs_endpoint(
                         "total_added": total_added,
                         "already_existing": already_existing,
                         "dismissed_filtered": dismissed_filtered,
+                        "filtered_out_of_preference": filtered_out_of_preference,
                         "per_query_breakdown": per_query_breakdown,
                     }
                 ),
@@ -410,6 +472,7 @@ def scrape_google_jobs_endpoint(
             total_added=total_added,
             already_existing=already_existing,
             dismissed_filtered=dismissed_filtered,
+            filtered_out_of_preference=filtered_out_of_preference,
             queries_scanned=queries_to_run,
             per_query_breakdown=per_query_breakdown,
             message=summary_msg,
@@ -606,6 +669,12 @@ def _run_google_jobs_task_runner(
                             f"[Google Jobs] Redirect dropped the jobs mode for '{q_str}'; "
                             "landed on a plain web SERP."
                         )
+                    elif q_outcome == "cooling_down":
+                        logger.warning(
+                            f"[Google Jobs] Pacer refused '{q_str}': google.com is cooling "
+                            "down or over its per-run ceiling; stopping this run."
+                        )
+                        break
                     elif q_outcome == "dom_changed":
                         logger.warning(
                             f"[Google Jobs] DOM selector miss for '{q_str}' (dom_changed); "
@@ -622,33 +691,22 @@ def _run_google_jobs_task_runner(
                     comp_name = (rj.get("company_name") or "").strip()
                     j_title = (rj.get("title") or "").strip()
                     j_url = (rj.get("apply_url") or rj.get("url") or "").strip()
+                    j_location = rj.get("location") or location
 
-                    if not comp_name or not j_title or not j_url:
+                    # A posting with no URL is still a posting: the employer + title + location
+                    # key identifies it, and the old `or url` fallback stored the SERP link.
+                    if not comp_name or not j_title:
                         continue
 
                     # Preference gate (title / location / work-mode) before ingestion.
                     if pref_filter.rejection_reason(
-                        j_title, rj.get("location") or location, rj.get("description", "")
+                        j_title, j_location, rj.get("description", "")
                     ):
                         filtered_count += 1
                         continue
 
-                    # Check for duplicate
-                    exists = (
-                        db.query(Job)
-                        .filter(
-                            (Job.url == j_url)
-                            | (
-                                (Job.title == j_title)
-                                & (Job.location == rj.get("location"))
-                            )
-                        )
-                        .first()
-                    )
-                    if exists:
-                        continue
-
-                    # Upsert company
+                    # Upsert company first: the duplicate key is employer-scoped, otherwise a
+                    # posting at employer B is dropped because employer A has the same title.
                     comp_rec = (
                         db.query(Company).filter(Company.name.ilike(comp_name)).first()
                     )
@@ -660,15 +718,26 @@ def _run_google_jobs_task_runner(
                         db.add(comp_rec)
                         db.flush()
 
+                    key = (Job.company_id == comp_rec.id) & (Job.title == j_title) & (
+                        Job.location == j_location
+                    )
+                    exists = (
+                        db.query(Job).filter((Job.url == j_url) | key).first()
+                        if j_url
+                        else db.query(Job).filter(key).first()
+                    )
+                    if exists:
+                        continue
+
                     new_job = Job(
                         company_id=comp_rec.id,
                         title=j_title,
                         description=rj.get("description")
                         or f"Google for Jobs posting for {j_title} at {comp_name}.",
                         url=j_url,
-                        location=rj.get("location") or location,
+                        location=j_location,
                         source="google_jobs",
-                        source_type="Direct",
+                        source_type=GOOGLE_JOBS_SOURCE_TYPE,
                         status="To Apply",
                         match_score=75.0,
                     )

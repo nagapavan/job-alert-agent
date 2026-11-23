@@ -62,7 +62,7 @@ def _drain(deadline: float) -> None:
         scheduler.stop()
         logger.info("Shutdown: scheduler stopped.")
     except Exception as exc:  # noqa: BLE001 - teardown must never raise
-        logger.debug("Shutdown: scheduler stop skipped: %s", exc)
+        logger.warning("Shutdown: scheduler stop failed: %s", exc)
 
     # 2. Task engine: cooperatively cancel queued/running tasks.
     try:
@@ -77,7 +77,7 @@ def _drain(deadline: float) -> None:
                 break
             time.sleep(0.1)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Shutdown: task cancellation skipped: %s", exc)
+        logger.warning("Shutdown: task cancellation failed: %s", exc)
 
     # 3. LLM queue: stop dispatching new provider calls.
     try:
@@ -86,7 +86,7 @@ def _drain(deadline: float) -> None:
         llm_queue.stop()
         logger.info("Shutdown: LLM queue stopped.")
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Shutdown: LLM queue stop skipped: %s", exc)
+        logger.warning("Shutdown: LLM queue stop failed: %s", exc)
 
     # 4. Browser profile: release the lock LAST, only when no live process owns it.
     try:
@@ -97,7 +97,7 @@ def _drain(deadline: float) -> None:
         else:
             logger.info("Shutdown: browser profile still in use; locks left intact.")
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Shutdown: profile lock cleanup skipped: %s", exc)
+        logger.warning("Shutdown: profile lock cleanup failed: %s", exc)
 
 
 def run_shutdown() -> None:

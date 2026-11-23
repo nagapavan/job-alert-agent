@@ -175,12 +175,11 @@ X-API-Key: <your-api-key>
          └─────────────────────────────────────────┘
                              ↓
    ┌─────────────────────────────────────────────────────┐
-   │ Load Classifier (singleton pattern)                 │
+   │ DeterministicClassifier (one scorer, no model file) │
    ├─────────────────────────────────────────────────────┤
-   │ Try: Load trained sklearn model (if available)      │
-   │     → TrainedClassifier wraps logistic regression   │
-   │ Fallback: SimpleHeuristicClassifier (always works)  │
-   │     → Rule-based weighted combination               │
+   │ Weighted: 60 must-coverage / 20 nice-coverage /     │
+   │           15 seniority / 5 education                │
+   │ Renormalised over the components the JD defines     │
    └─────────────────────────────────────────────────────┘
                              ↓
          ┌─────────────────────────────────────────┐
@@ -301,59 +300,27 @@ class MatchFeatures:
 
 ---
 
-## Classifier Types
+## The Scorer
 
-### 1. SimpleHeuristicClassifier (Always Available)
+There is exactly one scorer: `backend.match_classifier.DeterministicClassifier`. It is a weighted
+rule-based model over the deterministic features above — no model file, no training step, no
+per-user state — so the same JD and resume always produce the same score, which is what makes a
+stored score reproducible and lets the audit re-derive it.
 
-Rule-based, no dependencies:
-
-```python
-score = (
-    0.45 * must_coverage_score +
-    0.15 * nice_coverage_score +
-    0.25 * seniority_fit +
-    0.10 * education_bonus +
-    0.05 * overqualification_penalty
-)
+```text
+score = (60·must_coverage + 20·nice_coverage + 15·seniority_fit + 5·education_match)
+        / (sum of the components the JD defines) × 100
 ```
 
-**When used:**
-- No sklearn installed
-- No trained model available
-- Trained model fails to load
-- Always available as fallback
+- Weights are renormalised over the components the **posting** defines (issue #70, #108): a JD with
+  no education requirement or unparseable seniority drops that term instead of scoring a constant.
+- Must-haves dominate. A JD that states no requirement set at all is scored on the full scale and
+  left low rather than renormalised over 20 points.
+- `experience_years_delta < -0.3` (candidate clearly too junior) scales the score by 0.8.
+  Over-qualification is advisory: it is surfaced, never used to lower the score.
+- The must-have floor (`ScoringConfig.must_floor`) caps the score afterwards — see below.
 
-**Performance:** <1ms
-
-### 2. TrainedClassifier (Optional, Requires Training)
-
-Logistic regression trained on **implicit user outcomes** (never on the model's own output):
-
-```bash
-python scripts/train_match_classifier.py
-```
-
-**Training requirements:**
-- **≥50 trainable decisions** (`MIN_TRAINING_SAMPLES`) overall, **and ≥15 in each class**
-  (`MIN_PER_CLASS_SAMPLES`). The trainer refuses otherwise rather than fitting a near-tautological model.
-- Labels come from behaviour, not from a thumbs-up UI: applying / progressing → positive;
-  deliberate dismissal → negative. Rows the *system* generated (discovery auto-filters, dismissals
-  with no user decision event) are **excluded** as training data.
-- Feature values are re-derived via `build_deterministic_assessment` — never read back from
-  `match_*_json`, which is `NULL` on progressed rows.
-- Saves to `data/match_classifier.pkl`
-- Automatically loaded on app restart
-
-Check readiness without training: `GET /api/learning/readiness` returns trainable/positive/negative
-counts, excluded rows, and a `ready_to_train` verdict with the configured floor.
-
-**When used:**
-- Model file exists + sklearn installed
-- Automatically loaded in `load_classifier()`
-
-**Performance:** <1ms (sklearn inference is very fast)
-
-**Typical accuracy:** 70-85% agreement with LLM scoring on historical assessments
+**Performance:** <1ms, no dependencies.
 
 ### Band thresholds & recommendation (`ScoringConfig`)
 
@@ -388,7 +355,6 @@ The classifier itself has **no environment variables**. What is tunable:
 | Knob | Where | Effect |
 | :--- | :--- | :--- |
 | Band cutoffs (`strong`/`good`/`moderate`/`weak`) & coverage weights | `UserPreference.scoring_config_json` via `GET/PUT /api/preferences` → `scoring_config` | Changes band/recommendation boundaries and must/nice weighting for both scoring paths |
-| Training floors | `MIN_TRAINING_SAMPLES` / `MIN_PER_CLASS_SAMPLES` in `backend/match_classifier.py` | How much signal is required before training is allowed |
 | Embedding backend | `EMBEDDING_*` env vars, or `GET/PUT /api/settings/embeddings` | Semantics only — does not change the score thresholds |
 
 `ScoringConfig` is the single source of truth: `ScoringConfig.from_mapping(get_scoring_config(db))`
@@ -486,7 +452,7 @@ print(f"Method: {response.match_method}")    # "classifier_v1" or "requirement_c
 | Phase | Latency | Tokens | Notes |
 |-------|---------|--------|-------|
 | Feature extraction | <1ms | 0 | Regex + parsing |
-| Classifier inference | <2ms | 0 | Heuristic or sklearn |
+| Classifier inference | <2ms | 0 | Deterministic weights |
 | **Total** | **<100ms** | **0** | No LLM calls |
 
 ### On-Demand Detailed Analysis (First Time)
@@ -517,41 +483,18 @@ print(f"Method: {response.match_method}")    # "classifier_v1" or "requirement_c
 
 ---
 
-## Training & Customization
+## Why there is no training step
 
-### Train Custom Classifier
+Scoring is deliberately not learned per user. A fitted model was removed because:
 
-Once you have ≥50 trainable outcomes with ≥15 per class (check `GET /api/learning/readiness` first):
+- It could only be trained locally, on the operator's own apply/dismiss history, and that artifact
+  is personal data that must never be committed — so a second installation could never have one.
+- It needed scikit-learn, which was never installed by default, so the path was inert.
+- Every training-capable installation would score the *same* posting differently, which breaks the
+  reproducibility the audit depends on.
 
-```bash
-./.venv/bin/python scripts/train_match_classifier.py
-```
-
-Use `--status` to print the readiness breakdown without training.
-
-**Output (sufficient data):**
-```
-Training classifier on 78 user decisions (19 positive, 59 negative); 99 system-generated rows excluded
-Features: must_coverage, nice_coverage, seniority_fit, education_match, over_qualified_flag
-Model saved to data/match_classifier.pkl
-Restart the app to use the trained model
-```
-
-**Output (insufficient data) — training is refused, not attempted:**
-```
-Insufficient training signal: 34 trainable decisions (need >= 50). 99 rows excluded as system-generated. Not training.
-```
-
-### Verify Classifier is Active
-
-```bash
-curl -X GET http://localhost:8000/api/llm/status \
-  -H "X-API-Key: your-key"
-```
-
-Look for: `"classifier_type": "trained"` or `"classifier_type": "heuristic"`
-
----
+Selection between alternative *postings* is expressed through preferences, dismissals and the
+application workflow, not by retraining the scorer.
 
 ## Troubleshooting
 
@@ -588,44 +531,19 @@ SELECT id, title, match_analysis FROM jobs WHERE id=42 LIMIT 1;
 
 Should show non-null `match_analysis` after first request.
 
-### Q: Trained model not loading
-
-**A:** Either:
-1. Model file missing: `ls -la data/match_classifier.pkl`
-2. sklearn not installed: `pip install scikit-learn`
-3. Python version mismatch (use 3.10+)
-
-**Fix:**
-```bash
-# Retrain
-python scripts/train_match_classifier.py
-
-# Or manually train
-python -c "
-from backend.match_classifier import train_classifier_from_db
-from backend.database import SessionLocal
-db = SessionLocal()
-train_classifier_from_db(db)
-"
-```
-
----
-
 ## Future Enhancements
 
 ### Possible Improvements
 
 1. **Confidence scoring:** Return confidence interval (0.5-0.95) alongside score
-2. **A/B testing:** Compare classifier vs. LLM scores; retrain when divergence exceeds threshold
+2. **A/B testing:** Compare the deterministic score against the LLM analysis; surface divergence
 3. **Feature importance:** Return which features most influenced the score ("60% seniority fit")
 4. **Fast narrative:** Return 1-2 sentence summary from classifier (no LLM)
 5. **Streaming analysis:** Stream LLM narrative as it's generated
 
 ### Not Planned (Out of Scope)
 
-- Fine-tuning classifier per user (would require >100 historical assessments)
 - Multi-model ensemble (classifier + heuristic + LLM voting) — added complexity without clear benefit
-- Real-time retraining (expensive; batch training on schedule is sufficient)
 
 ---
 

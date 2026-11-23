@@ -63,8 +63,9 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="write the changes (default: dry run)")
     args = parser.parse_args()
 
-    import backend.main  # noqa: F401 - binds SessionLocal via init_db()
-    from backend.database import ApplicationEvent, Job, SessionLocal
+    from backend.database import ApplicationEvent, Job, SessionLocal, init_db
+
+    init_db()
 
     db = SessionLocal()
     try:
