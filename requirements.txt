@@ -1,5 +1,5 @@
 # Pinned for reproducible installs (generated from the project virtualenv).
-# Optional / unofficial extras degrade gracefully when absent (see AGENTS.md §8).
+# Optional / unofficial extras degrade gracefully when absent (see PROJECT_STRUCTURE.md §8).
 fastapi==0.141.1
 uvicorn==0.52.4
 sqlalchemy==2.0.52
@@ -19,8 +19,6 @@ google-auth-oauthlib==1.4.1
 google-api-python-client==2.200.0
 geonamescache==3.0.2
 pycountry==26.2.16
-# scikit-learn==1.5.2  # Optional: Install manually if needed for ML-trained classifier
-# On Python 3.14+, pre-built wheels may not be available; fallback heuristic is always active
 # Optional local embedding backend (in-process ONNX). Degrades to the built-in
 # deterministic hash fallback when absent, so the app runs fully offline without it.
 # macOS arm64 pins 1.24.1: its wheel lacks the ORT telemetry client that aborts at exit in 1.30.0.

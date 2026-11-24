@@ -15,12 +15,18 @@ per-pacer (cheap; contention is negligible at our request rates).
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import threading
 import time
 import urllib.parse
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+# Cooldowns persisted across runs (finding 48): a host that answered 429/503 is not re-hit at full
+# speed by the next run just because the previous pacer object went away.
+COOLDOWN_STATE_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "host_cooldowns.json"
 
 logger = logging.getLogger("scraper.ats.pacing")
 
@@ -35,6 +41,7 @@ class HostPacer:
         jitter: float = 0.5,
         max_requests_per_run: int = 60,
         cooldown_seconds: float = 30.0,
+        persist_path: Optional[Path] = None,
         _sleep=time.sleep,
         _monotonic=time.monotonic,
     ):
@@ -51,6 +58,10 @@ class HostPacer:
         self._block_until: Dict[str, float] = {}
         self._stopped: Dict[str, str] = {}
         self._per_host_delay: Dict[str, Optional[float]] = {}
+        # host -> why it was last refused (ceiling|cooldown); read by the audit path (finding 47).
+        self._refusals: Dict[str, str] = {}
+        self.persist_path = Path(persist_path) if persist_path else None
+        self._load_persisted_cooldowns()
 
     # -- helpers -----------------------------------------------------------
 
@@ -91,8 +102,10 @@ class HostPacer:
                         f"Pacing: host '{host}' reached the per-run ceiling "
                         f"({self.max_requests_per_run}); stopping this host for the run."
                     )
+                self._refusals[host] = "ceiling"
                 return False
             if self._monotonic() < self._block_until.get(host, 0.0):
+                self._refusals[host] = "cooldown"
                 return False
         return True
 
@@ -124,10 +137,69 @@ class HostPacer:
             return
         with self._lock:
             self._block_until[host] = self._monotonic() + cooldown
+        self._persist_cooldowns()
         logger.warning(
             f"Pacing: host '{host}' signalled rate-limiting; cooling down for "
             f"{cooldown:.0f}s."
         )
+
+    def note_success(self, url: str) -> None:
+        """A normal answer clears any cooldown this host was carrying (findings 48/50 parity)."""
+        host = self._host(url)
+        with self._lock:
+            if host in self._block_until:
+                del self._block_until[host]
+        self._persist_cooldowns()
+
+    def refusal_reason(self, url: str) -> Optional[str]:
+        """Why ``url``'s host was last refused (``cooldown``/``ceiling``), or None."""
+        with self._lock:
+            return self._refusals.get(self._host(url))
+
+    def refusals(self) -> Dict[str, str]:
+        """Snapshot of host -> last refusal reason, for the audit path (finding 47)."""
+        with self._lock:
+            return dict(self._refusals)
+
+    def _load_persisted_cooldowns(self) -> None:
+        if not self.persist_path or not self.persist_path.exists():
+            return
+        try:
+            raw = json.loads(self.persist_path.read_text("utf-8")) or {}
+        except Exception as exc:  # noqa: BLE001 - a corrupt state file is not fatal
+            logger.warning(f"Could not read persisted host cooldowns: {exc}")
+            return
+        now_wall = time.time()
+        now_mono = self._monotonic()
+        seeded = 0
+        for host, until_epoch in raw.items():
+            try:
+                remaining = float(until_epoch) - now_wall
+            except (TypeError, ValueError):
+                continue
+            if remaining > 0:
+                self._block_until[str(host)] = now_mono + remaining
+                seeded += 1
+        if seeded:
+            logger.info(f"Pacing: {seeded} host(s) still cooling down from a previous run.")
+
+    def _persist_cooldowns(self) -> None:
+        if not self.persist_path:
+            return
+        try:
+            now_wall = time.time()
+            now_mono = self._monotonic()
+            payload = {
+                host: now_wall + max(0.0, until - now_mono)
+                for host, until in self._block_until.items()
+                if until > now_mono
+            }
+            self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.persist_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.replace(self.persist_path)
+        except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+            logger.warning(f"Could not persist host cooldowns: {exc}")
 
     def stats(self) -> Dict[str, int]:
         with self._lock:

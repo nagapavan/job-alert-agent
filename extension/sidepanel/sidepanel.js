@@ -339,7 +339,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (document.getElementById("prof-auth")) document.getElementById("prof-auth").value = prof.workAuthorization || "";
     if (document.getElementById("prof-sponsorship")) document.getElementById("prof-sponsorship").value = prof.sponsorshipRequired || "";
 
-    if (document.getElementById("cfg-backend-url")) document.getElementById("cfg-backend-url").value = data.backendUrl || "http://localhost:8000";
+    if (document.getElementById("cfg-backend-url")) document.getElementById("cfg-backend-url").value = data.backendUrl || DEFAULT_BACKEND_URL;
     if (document.getElementById("cfg-api-key")) document.getElementById("cfg-api-key").value = data.apiKey || "";
     if (document.getElementById("cfg-mode")) document.getElementById("cfg-mode").value = data.mode || "connected";
   }
@@ -394,7 +394,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       sponsorshipRequired: document.getElementById("prof-sponsorship")?.value || ""
     };
 
-    const backendUrl = document.getElementById("cfg-backend-url")?.value.trim() || "http://localhost:8000";
+    const backendUrl = document.getElementById("cfg-backend-url")?.value.trim() || DEFAULT_BACKEND_URL;
     const apiKey = document.getElementById("cfg-api-key")?.value.trim() || "";
     const mode = document.getElementById("cfg-mode")?.value || "connected";
 
@@ -849,28 +849,38 @@ document.addEventListener("DOMContentLoaded", async () => {
     );
   });
 
-  // Shortlist Job
+  // Shortlist Job — local shortlist, or a status PATCH when the posting is a saved job.
+  // The old handler posted prose to /api/chat/assistant with no auth header (a guaranteed
+  // 401 from a chrome-extension:// origin) and still toasted success; it also routed a
+  // status change through an LLM (finding 175).
   document.getElementById("btn-shortlist-job")?.addEventListener("click", async () => {
     if (!currentInspectedJob) {
       showToast("Inspect a job posting first.");
       return;
     }
-
-    if (window.jobAgentRuntime.isConnected) {
-      try {
-        await fetch(`${window.jobAgentRuntime.backendUrl}/api/chat/assistant`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            message: `Shortlist job: ${currentInspectedJob.title} at ${currentInspectedJob.company}`
-          })
+    const job = currentInspectedJob;
+    const jobId = job.jobId || job.job_id;
+    try {
+      if (jobId && window.jobAgentRuntime.isConnected) {
+        const res = await fetch(`${window.jobAgentRuntime.backendUrl}/api/jobs/${jobId}/status`, {
+          method: "PATCH",
+          headers: window.jobAgentRuntime.getAuthHeaders(),
+          body: JSON.stringify({ status: "Shortlisted" })
         });
-        showToast("⭐ Job Shortlisted to Pipeline!");
-      } catch (e) {
-        showToast("Saved locally to favorites.");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        showToast("⭐ Job shortlisted in your pipeline.");
+        return;
       }
-    } else {
-      showToast("⭐ Saved to Local Shortlist.");
+      const stored = await chrome.storage.local.get(["shortlistedJobs"]);
+      const list = Array.isArray(stored.shortlistedJobs) ? stored.shortlistedJobs : [];
+      const key = `${job.title}|${job.company}|${job.url || ""}`;
+      if (!list.some((item) => `${item.title}|${item.company}|${item.url || ""}` === key)) {
+        list.push({ title: job.title, company: job.company, url: job.url || "", savedAt: Date.now() });
+        await chrome.storage.local.set({ shortlistedJobs: list.slice(-200) });
+      }
+      showToast("⭐ Saved to your local shortlist.");
+    } catch (e) {
+      showToast("⚠️ Could not shortlist this job.");
     }
   });
 

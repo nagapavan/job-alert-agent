@@ -20,6 +20,8 @@ import logging
 import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from backend.embeddings import cosine_similarity as _cosine
+
 logger = logging.getLogger("requirements_extractor")
 
 # Leading phrasings that introduce a requirement but carry no signal themselves.
@@ -50,6 +52,26 @@ _STOPWORDS = {
 _BULLET_RE = re.compile(r"^\s*(?:[•●*\-–—▪◦►■·]|\d+[\.\)])\s+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+")
 _WS_RE = re.compile(r"\s+")
+
+# A unit can be marked nice-to-have inline ("Experience with Kafka preferred"). The cue is
+# dropped from the phrase so it never becomes part of a requirement's text (issue #98).
+_TRAILING_PREFERENCE_RE = re.compile(
+    r"(?:\bis\s+)?\b(?:preferred|a\s+plus|nice\s+to\s+have|nice-to-have|good\s+to\s+have)"
+    r"\s*[.!]?\s*$",
+    re.I,
+)
+
+# Generic English words that describe a posting's chrome rather than a skill. A phrase built
+# only from these (`development`, `full time`, `professional`) is neither credited nor queued:
+# crediting it reported portal metadata as "partial coverage" (issue #98).
+_GENERIC_ONLY_TOKENS = {
+    "development", "developer", "developers", "engineering", "engineer", "engineers",
+    "professional", "professionals", "full", "part", "time", "work", "working",
+    "environment", "environments", "opportunity", "opportunities", "team", "teams",
+    "role", "roles", "position", "positions", "job", "jobs", "company", "companies",
+    "candidate", "candidates", "ability", "related", "field", "information", "additional",
+    "core", "hours", "days", "location", "office", "benefits", "rewards", "culture",
+}
 
 _pattern_cache: Optional[List["re.Pattern"]] = None
 
@@ -98,6 +120,20 @@ def _split_units(text: str) -> List[str]:
     return units
 
 
+def strip_trailing_preference_cue(unit: str) -> Tuple[str, bool]:
+    """Drop an inline nice-to-have cue from a unit, reporting whether one was there."""
+    text = unit or ""
+    if not _TRAILING_PREFERENCE_RE.search(text.strip()):
+        return text, False
+    return _TRAILING_PREFERENCE_RE.sub("", text).strip(), True
+
+
+def is_generic_phrase(phrase: str) -> bool:
+    """True when every content token is generic English (chrome, not a skill)."""
+    tokens = _content_tokens(phrase)
+    return bool(tokens) and all(t in _GENERIC_ONLY_TOKENS for t in tokens)
+
+
 def iter_requirement_units(jd: str, spans: Sequence) -> List[Tuple[str, str]]:
     """Yield ``(unit_text, category)`` for contributing (required/preferred) sections."""
     from backend.match_scoring import MUST_HAVE, NICE_TO_HAVE
@@ -108,7 +144,10 @@ def iter_requirement_units(jd: str, spans: Sequence) -> List[Tuple[str, str]]:
             continue
         category = NICE_TO_HAVE if span.label == "preferred" else MUST_HAVE
         for unit in _split_units(jd[span.start:span.end]):
-            units.append((unit, category))
+            cleaned, inline_preferred = strip_trailing_preference_cue(unit)
+            if not cleaned:
+                continue
+            units.append((cleaned, NICE_TO_HAVE if inline_preferred else category))
     return units
 
 
@@ -150,17 +189,6 @@ def _token_match(token: str, corpus: set) -> bool:
     if len(token) >= 4:
         return any(token in c or c in token for c in corpus if len(c) >= 4)
     return False
-
-
-def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
-    if not a or not b:
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = sum(x * x for x in a) ** 0.5
-    nb = sum(y * y for y in b) ** 0.5
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
 
 
 def _resume_chunks(resume_text: str, limit: int = 30) -> List[str]:
@@ -233,10 +261,18 @@ def extract_residual_requirements(
         phrase = key_phrase(unit_text)
         if not phrase or not skill_taxonomy.is_plausible_skill_phrase(phrase):
             continue
-        supported, _score, how = resume_supports(phrase, resume_text, resume_chunks)
+        if is_generic_phrase(phrase):
+            # Chrome, not a skill: neither credited nor queued for review (issue #98).
+            continue
+        supported, score, how = resume_supports(phrase, resume_text, resume_chunks)
         if supported:
             results.append(
-                {"text": phrase, "category": category, "evidence": f"resume:{how}"}
+                {
+                    "text": phrase,
+                    "category": category,
+                    "evidence": f"resume:{how}",
+                    "score": round(float(score), 4),
+                }
             )
         else:
             skill_taxonomy.record_skill_candidate(phrase)

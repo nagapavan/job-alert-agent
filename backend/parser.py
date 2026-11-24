@@ -11,6 +11,7 @@ from pypdf import PdfReader
 # Skill vocabulary is loaded from data/skill_taxonomy.json (curated, extensible data)
 # instead of a hardcoded list. A built-in fallback keeps the app working if it is absent.
 from backend.skill_taxonomy import DISPLAY_SKILLS as COMMON_TECH_SKILLS
+from backend.text_utils import HEADER_PROBE_CHARS
 
 def resume_fingerprint(text: str) -> str:
     """Content fingerprint of a resume, used as its version identity (issue #56).
@@ -382,8 +383,10 @@ def extract_timeline_entries(text: str) -> list[dict]:
             company = header_chunk[: t_match.start()].strip(" ,|-")
             title = header_chunk[t_match.start() :].strip(" ,|-")
         else:
-            company = header_chunk
-            title = "Software Engineer"
+            # Keep what the resume actually says; never invent an employer or title, because
+            # a fabricated title feeds seniority detection (finding 101).
+            company = header_chunk.strip()
+            title = ""
 
         next_start = (
             matches[idx + 1].start() if idx + 1 < len(matches) else len(flat_text)
@@ -416,7 +419,7 @@ def extract_timeline_entries(text: str) -> list[dict]:
         entries.append(
             {
                 "title": title,
-                "company": company or "Direct Employer",
+                "company": company or "",
                 "dates": dates,
                 "details": details,
             }
@@ -430,7 +433,7 @@ def parse_open_source_resume(text: str) -> dict:
     Extracts contact info, summary, experience timeline, education, and skills.
     """
     sections = segment_resume_sections(text)
-    header_text = sections["header"] or text[:400]
+    header_text = sections["header"] or text[:HEADER_PROBE_CHARS]
 
     # 1. Email
     email_match = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", text)
@@ -467,7 +470,7 @@ def parse_open_source_resume(text: str) -> dict:
             name = first
 
     if not name or len(name.split()) < 2:
-        flat_start = " ".join(text[:400].split())
+        flat_start = " ".join(text[:HEADER_PROBE_CHARS].split())
         title_pos = re.search(
             r"\b(Principal|Senior|Lead|Staff|Software\s+Engineer|Developer|Architect|Mobile:|Mail:|Phone:|Email:|Links:)\b",
             flat_start,
@@ -527,7 +530,9 @@ def parse_open_source_resume(text: str) -> dict:
     skills_text = (sections["skills"] + " " + text).lower()
     skills_found = []
     for skill in COMMON_TECH_SKILLS:
-        pattern = r"\b" + re.escape(skill.lower()) + r"\b"
+        # Symbol-tolerant boundaries: `\b` can never match `C++`, `C#` or `.NET` because the
+        # edge is not a word character (finding 100).
+        pattern = r"(?<![A-Za-z0-9])" + re.escape(skill.lower()) + r"(?![A-Za-z0-9])"
         if re.search(pattern, skills_text):
             skills_found.append(skill)
     skills_found = list(dict.fromkeys(skills_found))
@@ -573,10 +578,10 @@ def parse_open_source_resume(text: str) -> dict:
                         break
                 if not title:
                     title = hdr
-                    company = "Direct Employer"
+                    company = ""
             else:
-                title = "Software Engineer"
-                company = "Organization"
+                title = ""
+                company = ""
 
             if current_entry:
                 entries.append(current_entry)

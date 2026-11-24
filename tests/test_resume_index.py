@@ -29,6 +29,21 @@ def test_chunk_resume_empty():
     assert chunk_resume(None) == []
 
 
+def test_chunk_resume_uses_parser_details_and_ai_bullets():
+    """The heuristic parser writes `details`; the AI parser writes `bullets`. Neither is
+    `description`, so a role chunk must not collapse to its header line (finding 79)."""
+    parsed = {
+        "experience": [
+            {"title": "Engineer", "company": "Acme", "dates": "2020", "details": "Built APIs"},
+            {"title": "Lead", "company": "Globex", "dates": "2022", "bullets": ["Led team", "Shipped"]},
+        ]
+    }
+    chunks = chunk_resume(parsed)
+    role_texts = [c["text"] for c in chunks if c["section"] == "role"]
+    assert "Built APIs" in role_texts[0]
+    assert "Led team" in role_texts[1] and "Shipped" in role_texts[1]
+
+
 def _fake_embed(text):
     vec = [0.0] * 384
     vec[0 if "python" in text.lower() else 1] = 1.0

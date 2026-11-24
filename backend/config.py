@@ -3,9 +3,79 @@ import json
 import shutil
 import secrets
 from pathlib import Path
-from cryptography.fernet import Fernet
+from typing import Optional
+import time
+
+from cryptography.fernet import Fernet, InvalidToken
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def env_int(
+    name: str,
+    default: int,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
+    """Reads an int env var, falling back on garbage and clamping to the safe range."""
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        logger.warning(f"Ignoring non-integer {name}={raw!r}; using {default}.")
+        value = default
+    if minimum is not None and value < minimum:
+        logger.warning(f"{name}={value} is below {minimum}; clamped.")
+        value = minimum
+    if maximum is not None and value > maximum:
+        logger.warning(f"{name}={value} is above {maximum}; clamped.")
+        value = maximum
+    return value
+
+
+def env_float(
+    name: str,
+    default: float,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
+    """Reads a float env var, falling back on garbage and clamping to the safe range."""
+    raw = os.environ.get(name)
+    try:
+        value = float(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        logger.warning(f"Ignoring non-numeric {name}={raw!r}; using {default}.")
+        value = default
+    if minimum is not None and value < minimum:
+        logger.warning(f"{name}={value} is below {minimum}; clamped.")
+        value = minimum
+    if maximum is not None and value > maximum:
+        logger.warning(f"{name}={value} is above {maximum}; clamped.")
+        value = maximum
+    return value
+
+
+def write_private_file(path: Path, data: str) -> None:
+    """Writes a secrets-bearing file with 0600 permissions from creation.
+
+    ``Path.write_text`` honours the ambient umask, so a key could exist world-readable until a
+    later chmod. ``os.open`` applies the mode at creation; a chmod that still fails is logged
+    rather than swallowed, because it is the only signal that the secret is exposed.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        logger.warning(f"Could not restrict permissions on {path}: {exc}")
 
 # -------------------------------------------------------------
 # Encryption Setup (Fernet)
@@ -22,21 +92,29 @@ def load_or_create_key() -> bytes:
         return env_key.encode()
     
     if KEY_FILE.exists():
+        key_data = KEY_FILE.read_bytes().strip()
         try:
-            key_data = KEY_FILE.read_bytes().strip()
             # Validate Fernet key format (must be 32 urlsafe base64 bytes)
             Fernet(key_data)
             return key_data
-        except Exception:
-            pass
+        except Exception as exc:
+            # Fail closed. Generating a replacement here silently orphaned every encrypted
+            # resume, parsed profile and Q&A answer: the old ciphertext stays in the database and
+            # nothing can read it again. Keep the damaged key for forensics and stop.
+            backup = KEY_FILE.with_name(f"{KEY_FILE.name}.corrupt-{int(time.time())}")
+            try:
+                shutil.copy2(KEY_FILE, backup)
+            except Exception:
+                backup = None
+            raise RuntimeError(
+                f"Encryption key at {KEY_FILE} is unreadable ({exc}). "
+                f"Original kept at {backup or KEY_FILE}. "
+                "Restore it or set JOB_ALERT_AGENT_SECRET_KEY; refusing to generate a new key "
+                "because that would orphan every encrypted row."
+            ) from exc
     
     new_key = Fernet.generate_key()
-    KEY_FILE.write_bytes(new_key)
-    # Restrict permissions on key file on Unix systems (chmod 600)
-    try:
-        os.chmod(KEY_FILE, 0o600)
-    except Exception:
-        pass
+    write_private_file(KEY_FILE, new_key.decode("ascii"))
     return new_key
 
 ENCRYPTION_KEY = load_or_create_key()
@@ -49,13 +127,23 @@ def encrypt_data(data: str) -> str:
     return cipher.encrypt(data.encode("utf-8")).decode("utf-8")
 
 def decrypt_data(token: str) -> str:
-    """Decrypts a base64 encoded token and returns the plaintext string."""
+    """Decrypts a base64 encoded token and returns the plaintext string.
+
+    Legacy plaintext rows (written before encryption at rest) are returned unchanged, which is
+    what keeps old databases readable. A token that *looks* like Fernet ciphertext but cannot be
+    decrypted is real corruption — it is logged at ERROR so it surfaces in ``/api/logs`` instead
+    of quietly flowing into prompts as base64.
+    """
     if not token:
         return ""
     try:
         return cipher.decrypt(token.encode("utf-8")).decode("utf-8")
-    except Exception:
-        # If not encrypted (e.g. legacy plaintext), return as-is for backward compatibility
+    except InvalidToken:
+        if token.startswith("gAAAAA"):
+            logger.error(
+                "Stored ciphertext could not be decrypted with the current key; returning it "
+                "unchanged. This usually means .key was replaced. Row is unreadable."
+            )
         return token
 
 # -------------------------------------------------------------
@@ -78,11 +166,7 @@ def load_or_create_api_key() -> str:
             pass
     
     new_api_key = secrets.token_urlsafe(32)
-    API_KEY_FILE.write_text(new_api_key, encoding="utf-8")
-    try:
-        os.chmod(API_KEY_FILE, 0o600)
-    except Exception:
-        pass
+    write_private_file(API_KEY_FILE, new_api_key)
     return new_api_key
 
 API_KEY = load_or_create_api_key()
@@ -114,12 +198,12 @@ DATABASE_URL = os.environ.get("DATABASE_URL", SQLITE_URL)
 # -------------------------------------------------------------
 # Default provider priority: "auto", "lmstudio", "unsloth", "ollama", "openai", "gemini", "anthropic"
 DEFAULT_LLM_PROVIDER = os.environ.get("DEFAULT_LLM_PROVIDER", "auto")
-LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "120"))
+LLM_TIMEOUT = env_int("LLM_TIMEOUT", 120, minimum=1)
 # Transient-failure retry policy for provider calls (429/5xx/conn/timeout).
 # Values may be overridden per task-type via TASK_PROFILES in ai_helper.
-LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
-LLM_BACKOFF_BASE = float(os.environ.get("LLM_BACKOFF_BASE", "0.5"))
-LLM_BACKOFF_MAX = float(os.environ.get("LLM_BACKOFF_MAX", "5.0"))
+LLM_MAX_RETRIES = env_int("LLM_MAX_RETRIES", 3, minimum=0)
+LLM_BACKOFF_BASE = env_float("LLM_BACKOFF_BASE", 0.5, minimum=0.0)
+LLM_BACKOFF_MAX = env_float("LLM_BACKOFF_MAX", 5.0, minimum=0.0)
 LLM_RETRY_JITTER = os.environ.get("LLM_RETRY_JITTER", "true").lower() in ("true", "1", "yes")
 
 # LLM audit-trail content capture (transitional observability, LangSmith-analogue).
@@ -128,19 +212,19 @@ LLM_RETRY_JITTER = os.environ.get("LLM_RETRY_JITTER", "true").lower() in ("true"
 LLM_AUDIT_CAPTURE_CONTENT = os.environ.get(
     "LLM_AUDIT_CAPTURE_CONTENT", "false"
 ).lower() in ("true", "1", "yes")
-LLM_AUDIT_MAX_CONTENT_CHARS = int(os.environ.get("LLM_AUDIT_MAX_CONTENT_CHARS", "500"))
+LLM_AUDIT_MAX_CONTENT_CHARS = env_int("LLM_AUDIT_MAX_CONTENT_CHARS", 500, minimum=0)
 
 # Career Copilot quality Judge gate (open-ended reply scoring + bounded regeneration).
 # Adds one extra LLM call per copilot turn, so it can be disabled via env for
 # strict token-economy. max_regenerations bounds how many retries the judge may trigger.
 COPILOT_JUDGE_ENABLED = os.environ.get("COPILOT_JUDGE_ENABLED", "true").lower() in ("true", "1", "yes")
-COPILOT_JUDGE_MAX_REGEN = int(os.environ.get("COPILOT_JUDGE_MAX_REGEN", "1"))
+COPILOT_JUDGE_MAX_REGEN = env_int("COPILOT_JUDGE_MAX_REGEN", 1, minimum=0)
 # Scoring judge (issue #60): audits a deterministic match assessment and bounds the
 # audit -> re-score -> re-audit loop. On-demand only, never in discovery.
-SCORE_JUDGE_MAX_ROUNDS = int(os.environ.get("SCORE_JUDGE_MAX_ROUNDS", "1"))
+SCORE_JUDGE_MAX_ROUNDS = env_int("SCORE_JUDGE_MAX_ROUNDS", 1, minimum=0)
 # Interactive endpoints must not block on the LLM for the full timeout; the match-analysis
 # LLM fallback aborts after this many seconds and returns a fast unverified state.
-LLM_INTERACTIVE_TIMEOUT = int(os.environ.get("LLM_INTERACTIVE_TIMEOUT", "30"))
+LLM_INTERACTIVE_TIMEOUT = env_int("LLM_INTERACTIVE_TIMEOUT", 30, minimum=1)
 # Bulk discovery/re-score scoring: run the deterministic requirement engine first (no LLM),
 # with a bounded LLM fallback. Set to false to fall back to the legacy LLM-only bulk path.
 DETERMINISTIC_BULK_SCORING = os.environ.get("DETERMINISTIC_BULK_SCORING", "true").lower() in ("true", "1", "yes")
@@ -224,6 +308,8 @@ GMAIL_SETTINGS_FILE = BASE_DIR / "data" / "gmail_settings.json"
 _GMAIL_DEFAULTS = {
     "client_id": "", "client_secret": "", "refresh_token": "",
     "token_email": "", "history_id": "", "connected_at": "", "code_verifier": "",
+    # Single-use OAuth nonce echoed back by Google; see /api/gmail/oauth2callback.
+    "oauth_state": "",
     # Why the connection is not usable, surfaced in the UI instead of a bare
     # "Client saved — not connected." Both are non-secret diagnostics.
     "token_expired_at": "", "last_error": "",
@@ -237,7 +323,7 @@ def _read_gmail_settings() -> dict:
     try:
         raw = json.loads(GMAIL_SETTINGS_FILE.read_text("utf-8"))
         for key in ("client_id", "token_email", "history_id", "connected_at",
-                    "token_expired_at", "last_error"):
+                    "token_expired_at", "last_error", "oauth_state"):
             settings[key] = raw.get(key) or ""
         for key in ("client_secret", "refresh_token", "code_verifier"):
             token = raw.get(key) or ""
@@ -259,7 +345,8 @@ def is_gmail_configured() -> bool:
 
 def save_gmail_settings(client_id=None, client_secret=None, refresh_token=None,
                         token_email=None, history_id=None, connected_at=None,
-                        code_verifier=None, token_expired_at=None, last_error=None) -> dict:
+                        code_verifier=None, token_expired_at=None, last_error=None,
+                        oauth_state=None) -> dict:
     """Persists Gmail settings, encrypting sensitive fields. None leaves a value unchanged."""
     current = _read_gmail_settings()
     for key, value in (
@@ -267,7 +354,7 @@ def save_gmail_settings(client_id=None, client_secret=None, refresh_token=None,
         ("refresh_token", refresh_token), ("token_email", token_email),
         ("history_id", history_id), ("connected_at", connected_at),
         ("code_verifier", code_verifier), ("token_expired_at", token_expired_at),
-        ("last_error", last_error),
+        ("last_error", last_error), ("oauth_state", oauth_state),
     ):
         if value is not None:
             current[key] = value
@@ -282,13 +369,9 @@ def save_gmail_settings(client_id=None, client_secret=None, refresh_token=None,
         "code_verifier": encrypt_data(current["code_verifier"]) if current["code_verifier"] else "",
         "token_expired_at": current["token_expired_at"],
         "last_error": current["last_error"],
+        "oauth_state": current["oauth_state"],
     }
-    GMAIL_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    GMAIL_SETTINGS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    try:
-        os.chmod(GMAIL_SETTINGS_FILE, 0o600)
-    except Exception:
-        pass
+    write_private_file(GMAIL_SETTINGS_FILE, json.dumps(payload, indent=2))
     return current
 
 
@@ -322,12 +405,7 @@ def save_llm_settings(openai_api_key=None, gemini_api_key=None, anthropic_api_ke
         "anthropic_api_key": encrypt_data(current["anthropic_api_key"]) if current["anthropic_api_key"] else "",
         "allow_cloud_fallback": bool(current["allow_cloud_fallback"]),
     }
-    LLM_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    LLM_SETTINGS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    try:
-        os.chmod(LLM_SETTINGS_FILE, 0o600)
-    except Exception:
-        pass
+    write_private_file(LLM_SETTINGS_FILE, json.dumps(payload, indent=2))
     return current
 
 # -------------------------------------------------------------
@@ -345,7 +423,7 @@ def save_llm_settings(openai_api_key=None, gemini_api_key=None, anthropic_api_ke
 # - The vector dimension is a hard contract (SafeVector(384)). Changing the model
 #   does not change the dimension, but existing rows must be re-embedded.
 # -------------------------------------------------------------
-EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
+EMBEDDING_DIM = env_int("EMBEDDING_DIM", 384, minimum=1)
 _ENV_EMBEDDING_BACKEND = os.environ.get("EMBEDDING_BACKEND")
 _ENV_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL")
 _ENV_EMBEDDING_SERVER_URL = os.environ.get("EMBEDDING_SERVER_URL")
@@ -436,12 +514,7 @@ def save_embedding_settings(backend=None, model=None, allow_download=None,
     if server_model is not None:
         current["server_model"] = str(server_model).strip()
 
-    EMBEDDING_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    EMBEDDING_SETTINGS_FILE.write_text(json.dumps(current, indent=2), encoding="utf-8")
-    try:
-        os.chmod(EMBEDDING_SETTINGS_FILE, 0o600)
-    except Exception:
-        pass
+    write_private_file(EMBEDDING_SETTINGS_FILE, json.dumps(current, indent=2))
     return current
 
 
@@ -454,7 +527,12 @@ ENABLE_DYNAMIC_MODEL_ROUTING = os.environ.get("ENABLE_DYNAMIC_MODEL_ROUTING", "t
 # automated scripts; this value spaces out page loads so live sync and the repair
 # script (backend/scripts/repair_linkedin_saved_jobs.py) look less bursty. Default
 # 4.0s + 0-50% jitter (applied at call sites). Raise via env for stricter pacing.
-LINKEDIN_AUTOMATION_PACING_SECONDS = float(os.environ.get("LINKEDIN_AUTOMATION_PACING_SECONDS", "4.0"))
+LINKEDIN_AUTOMATION_PACING_SECONDS = env_float("LINKEDIN_AUTOMATION_PACING_SECONDS", 4.0, minimum=0.0)
+
+# Upper bound on per-sync LinkedIn saved-job detail-page navigations (each fetches the real
+# "About the job" text so the scorer has signal). Keeps a large saved-jobs library from turning
+# one sync into hundreds of page loads; the remainder stay unscored baselines.
+LINKEDIN_SAVED_JOB_DESC_FETCH_LIMIT = env_int("LINKEDIN_SAVED_JOB_DESC_FETCH_LIMIT", 25, minimum=1)
 
 # Self-identifying User-Agent for HTML/index scraping (custom careers pages, Google for Jobs).
 # Public ATS JSON APIs keep the standard browser UA; identifying crawlers is the compliance-
@@ -479,21 +557,21 @@ RESPECT_AI_USE_FILES = os.environ.get(
 # host; 0 disables. Applied with 0-SCRAPE_PACING_JITTER fractional jitter so bursts don't align.
 # A per-portal `pacing_seconds` in data/ats_portals.json overrides this default. Intended to become
 # a UI-tunable "request delay" knob (see docs/POLITE_CRAWLING_AND_WORKDAY.md §2.6).
-SCRAPE_PACING_SECONDS = float(os.environ.get("SCRAPE_PACING_SECONDS", "0.5"))
-SCRAPE_PACING_JITTER = float(os.environ.get("SCRAPE_PACING_JITTER", "0.5"))  # fraction, 0..1
+SCRAPE_PACING_SECONDS = env_float("SCRAPE_PACING_SECONDS", 0.5, minimum=0.0)
+SCRAPE_PACING_JITTER = env_float("SCRAPE_PACING_JITTER", 0.5, minimum=0.0, maximum=1.0)
 # Hard ceiling on requests to a single host per scrape run, independent of pacing, so a
 # pathological board (thousands of postings) can never become an accidental flood.
-SCRAPE_MAX_REQUESTS_PER_HOST_PER_RUN = int(
-    os.environ.get("SCRAPE_MAX_REQUESTS_PER_HOST_PER_RUN", "60")
+SCRAPE_MAX_REQUESTS_PER_HOST_PER_RUN = env_int(
+    "SCRAPE_MAX_REQUESTS_PER_HOST_PER_RUN", 60, minimum=1
 )
 # Cooldown applied to a host after a 429/503 (or an explicit Retry-After). Bounded below.
-SCRAPE_HOST_COOLDOWN_SECONDS = float(os.environ.get("SCRAPE_HOST_COOLDOWN_SECONDS", "30"))
+SCRAPE_HOST_COOLDOWN_SECONDS = env_float("SCRAPE_HOST_COOLDOWN_SECONDS", 30.0, minimum=0.0)
 
 # Concurrency & Pacing Limits (Local single-worker vs Cloud parallel dispatch)
-LLM_LOCAL_MAX_CONCURRENCY = int(os.environ.get("LLM_LOCAL_MAX_CONCURRENCY", "1"))
-LLM_CLOUD_MAX_CONCURRENCY = int(os.environ.get("LLM_CLOUD_MAX_CONCURRENCY", "8"))
-LLM_LOCAL_PACING_SECONDS = float(os.environ.get("LLM_LOCAL_PACING_SECONDS", "0.2"))
-LLM_CLOUD_PACING_SECONDS = float(os.environ.get("LLM_CLOUD_PACING_SECONDS", "0.0"))
+LLM_LOCAL_MAX_CONCURRENCY = env_int("LLM_LOCAL_MAX_CONCURRENCY", 1, minimum=1)
+LLM_CLOUD_MAX_CONCURRENCY = env_int("LLM_CLOUD_MAX_CONCURRENCY", 8, minimum=1)
+LLM_LOCAL_PACING_SECONDS = env_float("LLM_LOCAL_PACING_SECONDS", 0.2, minimum=0.0)
+LLM_CLOUD_PACING_SECONDS = env_float("LLM_CLOUD_PACING_SECONDS", 0.0, minimum=0.0)
 
 # -------------------------------------------------------------
 # Dedicated Chrome Profile Configuration
@@ -512,6 +590,20 @@ CHROME_PROFILE_DIR = Path(os.environ.get(
 # - "new_headless": full Chromium in new headless mode (channel="chromium"). Invisible, but
 #   not verified against Google's bot checks on every release.
 GOOGLE_JOBS_BROWSER_MODE = os.environ.get("GOOGLE_JOBS_BROWSER_MODE", "headful").strip().lower()
+
+# How long an interactive login window stays open before it closes itself and releases
+# the single-owner Chrome profile. Long enough to finish an SSO/MFA flow, short enough
+# that a forgotten window cannot hold the profile lock for ten minutes.
+INTERACTIVE_SESSION_HOLD_SECONDS = env_int(
+    "INTERACTIVE_SESSION_HOLD_SECONDS", 300, minimum=30, maximum=1800
+)
+
+# How long a submitted task may wait for a worker slot before it is cancelled rather than run.
+# An unbounded wait let one wedged task block every later submission for the life of the
+# process.
+TASK_ENGINE_QUEUE_TIMEOUT_SECONDS = env_int(
+    "TASK_ENGINE_QUEUE_TIMEOUT_SECONDS", 300, minimum=1
+)
 
 
 def _migrate_legacy_chrome_profile():

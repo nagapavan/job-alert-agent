@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import random
 import time
+import concurrent.futures
 from typing import Any, Callable, Optional, Tuple, TypeVar
 
 import requests
@@ -36,20 +37,47 @@ T = TypeVar("T")
 LLM_RESILIENCE_RETRYABLE_HTTP = frozenset({429, 500, 502, 503, 504})
 
 
+def _status_code(exc: BaseException) -> Optional[int]:
+    """Best-effort HTTP status across ``requests``, ``httpx`` and provider SDK errors.
+
+    ``requests.HTTPError`` keeps it on ``response.status_code``; the OpenAI/Anthropic SDKs put it
+    on the exception itself (``APIStatusError.status_code``), and httpx on ``HTTPStatusError``.
+    Duck typing means a new SDK does not silently lose retryability.
+    """
+    for attribute in ("status_code", "http_status"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, int):
+            return value
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    if isinstance(value, int):
+        return value
+    return None
+
+
 def is_retryable(exc: BaseException) -> bool:
     """Return True when ``exc`` is a transient failure worth retrying."""
     # Connection / transport failures (raises over HTTP + provider SDK boundaries).
     if isinstance(exc, (requests.exceptions.ConnectionError, ConnectionError)):
         return True
-    if isinstance(exc, (requests.exceptions.Timeout, TimeoutError)):
+    if isinstance(
+        exc,
+        (
+            requests.exceptions.Timeout,
+            TimeoutError,
+            concurrent.futures.TimeoutError,
+        ),
+    ):
         return True
+
+    # SDK-specific connection/timeout classes without a shared base: httpx.ConnectError,
+    # openai.APIConnectionError, anthropic.APITimeoutError, google.api_core.exceptions.
+    type_name = type(exc).__name__.lower()
+    if "connection" in type_name or "timeout" in type_name:
+        return True
+
     # HTTP errors are retried only for retryable status codes.
-    if isinstance(exc, requests.exceptions.HTTPError):
-        resp = getattr(exc, "response", None)
-        status = getattr(resp, "status_code", None)
-        if status in LLM_RESILIENCE_RETRYABLE_HTTP:
-            return True
-    return False
+    return _status_code(exc) in LLM_RESILIENCE_RETRYABLE_HTTP
 
 
 def resolve_retry_config(
@@ -98,8 +126,12 @@ def with_retry(
     backoff_base: Optional[float] = None,
     backoff_max: Optional[float] = None,
     jitter: Optional[bool] = None,
+    cancel_token: Optional[Any] = None,
 ) -> T:
     """Run ``fn()`` with exponential backoff on transient failures.
+
+    ``cancel_token`` (any object exposing ``is_cancelled``) is checked before every backoff
+    sleep: a cancelled task must not keep firing provider calls for the rest of the retry budget.
 
     ``max_retries`` is the number of retries AFTER the first attempt. When omitted, it
     (and the backoff values) resolve from ``task_type`` config (per-profile then global).
@@ -134,6 +166,9 @@ def with_retry(
             if use_jitter:
                 # 0.5x..1.5x jitter to avoid thundering-herd retry synchrony.
                 delay *= random.uniform(0.5, 1.5)
+            if cancel_token is not None and getattr(cancel_token, "is_cancelled", False):
+                logger.info("[%s] cancelled before retry %d; abandoning.", step_name, attempt)
+                raise InterruptedError(f"{step_name} cancelled before retry") from exc
             logger.info(
                 "[%s] retryable error (%s); retry %d/%d in %.2fs",
                 step_name,

@@ -159,7 +159,7 @@ def call_anthropic(...)   # same signature
 |    6     | `anthropic` | Anthropic Claude |   ☁️   | `claude-3-5-sonnet` / `claude-3-5-haiku`                         |
 
 - **Auto-detection**: `detect_active_llm_provider()` probes local servers in priority order and
-  reports the first reachable one (`backend/main.py::GET /api/llm/status`).
+  reports the first reachable one (`backend/routers/settings.py::GET /api/llm/status`).
 - **Cloud is opt-in**: cloud providers are skipped in the fallback cascade unless
   `is_cloud_fallback_allowed()` is true (env `ALLOW_CLOUD_FALLBACK` **or** the persisted
   Settings toggle). This preserves local-first privacy by default.

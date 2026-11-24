@@ -136,3 +136,65 @@ def test_queue_scale_down_and_sync():
     assert status2["max_concurrency"] == 8
     assert status2["mode"] == "cloud"
 
+
+
+def test_scale_down_then_up_restores_the_full_pool():
+    """Scaling cloud -> local -> cloud must give back cloud concurrency.
+
+    The retired workers used to stay in the pool list, so the scale-up saw a full pool and
+    spawned nothing: the queue ran with one worker permanently, and nothing reported it.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    mgr = LLMQueueManager(max_workers=8, pacing_seconds=0.0, mode="cloud")
+    mgr.sync_provider_concurrency(is_local=True)
+    assert mgr.get_status()["max_concurrency"] == 1
+
+    # Wait for the excess workers to actually exit, which is the state that used to be permanent.
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if len([t for t in mgr._workers.values() if t.is_alive()]) <= 1:
+            break
+        time.sleep(0.05)
+    assert len([t for t in mgr._workers.values() if t.is_alive()]) == 1
+
+    mgr.sync_provider_concurrency(is_local=False)
+    total = mgr.get_status()["max_concurrency"]
+    assert total >= 4
+    live = [t for t in mgr._workers.values() if t.is_alive()]
+    assert len(live) == total, f"expected {total} live workers, got {len(live)}"
+
+    # Prove it: four tasks only finish if four workers really run them.
+    barrier = threading.Barrier(4)
+
+    def needs_four(idx):
+        barrier.wait(timeout=3.0)
+        return idx
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [
+            pool.submit(mgr.submit, needs_four, i, timeout=5.0, task_name=f"parallel-{i}")
+            for i in range(4)
+        ]
+        assert sorted(f.result(timeout=6.0) for f in futures) == [0, 1, 2, 3]
+
+
+def test_stop_fails_queued_futures_so_callers_do_not_wait_out_the_timeout():
+    """A stopped queue must resolve pending work, not leave submit() blocked (finding 11)."""
+    q = LLMQueueManager(max_workers=1)
+    q.stop()
+
+    task = LLMTask(lambda: 1, (), {}, priority=LLMPriority.ON_DEMAND, task_name="pending")
+    q._queue.put(task)
+    q.stop()
+
+    with pytest.raises(RuntimeError, match="stopped"):
+        task.future.result(timeout=1)
+
+
+def test_submit_after_stop_fails_fast():
+    q = LLMQueueManager(max_workers=1)
+    q.stop()
+
+    with pytest.raises(RuntimeError, match="stopped"):
+        q.submit(lambda: 1, timeout=0.5)

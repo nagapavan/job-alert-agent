@@ -17,20 +17,20 @@ playwright install chromium
 # Plain (recommended — stable):
 uvicorn backend.main:app --host 127.0.0.1 --port 8000
 
-# Optional hot reload (see AGENTS.md §12.2 for the caveat):
+# Optional hot reload (see PROJECT_STRUCTURE.md §12.2 for the caveat):
 # pip install "uvicorn[standard]"   # adds the watchfiles watcher
 uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload --reload-dir backend
 ```
 
 No build step is required for the SPA or the Chrome extension.
 
-## Before opening a PR
+## Before you hand off or push
 
 1. Add or update tests covering your change (happy path + a boundary case).
 2. Run the suite and make sure it is green:
 
    ```bash
-   ./.venv/bin/pytest -q tests/
+   ./.venv/bin/pytest -q tests/ -m "not live"
    ```
 
 3. If you touched JS, run the syntax checks:
@@ -47,7 +47,7 @@ No build step is required for the SPA or the Chrome extension.
 
 ## Code Editing & File Integrity Rules
 
-- **Never Push Without Explicit Approval**: Do NOT run `git push` or otherwise publish to any remote unless the user explicitly asks. Local commits and branches are fine.
+- **Never Commit Or Push Without Explicit Approval**: Do NOT run `git commit`, `git add`, `git push` or otherwise publish unless the user explicitly approves that specific change. Staging sweeps in work that was already in the index, so approve the exact files, not just the intent.
 - **Active File Targeting**: If changes belong to the active file, modify only that file. Otherwise, update the existing relevant file. Do not scatter related changes across multiple files unnecessarily.
 - **No Unnecessary Files**: Do not create new files or folders unless explicitly requested or approved.
 - **No Over-Engineering Documentation**: Do NOT auto-generate explanatory docs, checklists, alternative analyses, or reference files unless explicitly requested. Make the code changes only. If asked "should we do X?", wait for the decision—do not create docs exploring options you're unsure about.

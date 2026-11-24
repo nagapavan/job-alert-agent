@@ -125,14 +125,19 @@ class PeriodicScheduler:
         self._save_config()
 
     def _save_config(self):
-        """Persists schedule configuration to disk."""
+        """Persists schedule configuration to disk atomically (temp file + ``os.replace``)."""
         try:
             with self._lock:
                 serialized = [j.model_dump(mode="json") for j in self._jobs.values()]
-                with open(SCHEDULER_CONFIG_FILE, "w", encoding="utf-8") as f:
+                tmp_path = SCHEDULER_CONFIG_FILE.with_suffix(".json.tmp")
+                with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(serialized, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, SCHEDULER_CONFIG_FILE)
         except Exception as e:
-            logger.warning(f"Failed to save scheduler config: {e}")
+            # Name the parse/write problem: a silent fallback to defaults resets every schedule.
+            logger.warning(f"Failed to save scheduler config to {SCHEDULER_CONFIG_FILE}: {e}")
 
     def start(self):
         """Starts the scheduler daemon thread."""
@@ -264,11 +269,11 @@ class PeriodicScheduler:
                 except Exception as fe:
                     logger.debug(f"Feature-flag gate unavailable: {fe}")
 
-        # Import runner functions lazily to avoid circular dependencies
-        from backend.main import (
-            _run_google_jobs_task_runner,
-            _run_linkedin_sync_task_runner
-        )
+        # Imported from the channel modules, not from backend.main: the app module is heavy and
+        # boots the runtime on the startup lifecycle, which a maintenance script or a test that
+        # reaches run_job_now must not trigger.
+        from backend.routers.google_jobs import _run_google_jobs_task_runner
+        from backend.routers.linkedin import _run_linkedin_sync_task_runner
 
         runner_map = {
             "google_jobs_scan": ("Google Jobs Scheduled Scan", _run_google_jobs_task_runner),
@@ -308,12 +313,23 @@ class PeriodicScheduler:
         job.last_status = "RUNNING"
         self._save_config()
 
-        task_id = task_engine.submit_task(
-            task_type=job.task_type,
-            task_name=f"{name_prefix} (Auto)",
-            fn=_tracked_runner,
-            total_steps=6 if job.task_type == "google_jobs_scan" else 3
-        )
+        task_id = None
+        try:
+            task_id = task_engine.submit_task(
+                task_type=job.task_type,
+                task_name=f"{name_prefix} (Auto)",
+                fn=_tracked_runner,
+                total_steps=6 if job.task_type == "google_jobs_scan" else 3
+            )
+        except Exception as submit_err:
+            # The run never reached a worker, so it must be finalized here: leaving RUNNING on a
+            # job that will not run hides the failure until the next process start relabels it.
+            logger.error(
+                f"Failed to submit scheduled job [{job.name}]: {submit_err}",
+                exc_info=True,
+            )
+            self._finalize_job(job.id, "FAILED")
+            return None
 
         job.last_task_id = task_id
         self._save_config()

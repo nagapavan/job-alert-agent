@@ -376,6 +376,20 @@ def test_extract_linkedin_job_from_anchor_strips_employer_glued_to_title():
     assert rec["title"] == "Principal Software Engineer"
 
 
+def test_extract_linkedin_job_splits_merged_title_without_a_slug():
+    """No slug and no company element: the merged "TitleCompany" is split, not bucketed."""
+    from backend.playwright_app import _extract_linkedin_job_from_anchor
+
+    anchor = MagicMock()
+    anchor.get_attribute.return_value = "/jobs/view/4425826777/"
+    anchor.evaluate.return_value = "Senior Staff EngineerArcesium\nHyderabad\nSave"
+    anchor.inner_text.return_value = "Senior Staff EngineerArcesium"
+
+    rec = _extract_linkedin_job_from_anchor(anchor)
+    assert rec["title"] == "Senior Staff Engineer"
+    assert rec["company"] == "Arcesium"
+
+
 def test_extract_linkedin_job_never_mistakes_location_for_company():
     """Merged title + numeric-only URL: the location row must not become the employer."""
     from backend.playwright_app import _extract_linkedin_job_from_anchor
@@ -433,3 +447,22 @@ def test_fetch_linkedin_job_details_degrades_on_navigation_error():
 
 
 
+
+
+def test_interview_feedback_survey_is_not_an_interview_invite():
+    """A feedback/survey mail mentions 'interview' but must not become an interview outcome.
+
+    2026-11-16 cleanup: "Please share your feedback: Your recent interview experience at Amazon"
+    was classified as an interview invite and moved a row the operator never applied to.
+    """
+    for subject in (
+        "Please share your feedback: Your recent interview experience at Amazon",
+        "Interview feedback request",
+        "Thank you for interviewing with us",
+    ):
+        assert classify_email(subject, "", "no-reply@example.com")["category"] != "interview"
+
+    # A genuine invitation is unaffected.
+    assert classify_email(
+        "Schedule your interview with Globex", "", "recruiting@globex.com"
+    )["category"] == "interview"

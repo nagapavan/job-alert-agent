@@ -188,3 +188,36 @@ class TestHTTPMiddlewareAndEndpoint:
         for entry in data["logs"]:
             if "level" in entry:
                 assert entry["level"] == "INFO"
+
+
+def test_setup_observability_leaves_foreign_root_handlers_alone(tmp_path):
+    """Only handlers this function installed are replaced (finding 18)."""
+    root = logging.getLogger()
+    foreign = logging.NullHandler()
+    root.addHandler(foreign)
+
+    try:
+        setup_observability(log_level="INFO", log_dir=tmp_path)
+        setup_observability(log_level="INFO", log_dir=tmp_path)
+        assert foreign in root.handlers
+        managed = [h for h in root.handlers if getattr(h, "_jaa_managed", False)]
+        assert len(managed) == 2  # one console + one rotating file, not duplicated
+    finally:
+        root.removeHandler(foreign)
+        for handler in list(root.handlers):
+            if getattr(handler, "_jaa_managed", False):
+                root.removeHandler(handler)
+
+
+def test_setup_observability_can_leave_the_root_level_alone(tmp_path):
+    root = logging.getLogger()
+    original_level = root.level
+    root.setLevel(logging.WARNING)
+    try:
+        setup_observability(log_level="DEBUG", log_dir=tmp_path, set_root_level=False)
+        assert root.level == logging.WARNING
+    finally:
+        for handler in list(root.handlers):
+            if getattr(handler, "_jaa_managed", False):
+                root.removeHandler(handler)
+        root.setLevel(original_level)

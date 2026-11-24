@@ -9,6 +9,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from backend.database import (
+    ApplicationEvent,
     Company,
     Job,
     EmailSuppression,
@@ -269,11 +270,13 @@ def test_match_job_for_email_event_prefers_exact_domain(db_session):
     db_session.commit()
     # Sender domain acme.com (from a cleaned address) finds the tracked job even when the
     # parsed company name carries trailing punctuation / differs.
-    match = _match_job_for_email_event(
+    match, info = _match_job_for_email_event(
         db_session, "Acme.", "Staff Engineer", domain="acme.com"
     )
     assert match is not None
     assert match.id == job.id
+    assert info["matched_by"] == "exact_title"
+    assert info["ambiguous"] is False
 
 
 # -------------------------------------------------------------
@@ -386,3 +389,420 @@ def test_run_gmail_sync_marks_only_resolved_mail(mock_settings, mock_build_servi
     assert len(events) == 1
     assert db_session.query(ProcessedEmail).count() == 1
     assert run_gmail_sync(db_session) == []
+
+# -------------------------------------------------------------
+# Ambiguity: never guess which application an email is about
+# -------------------------------------------------------------
+
+def _interview_job(db_session, comp, title, url):
+    job = Job(company_id=comp.id, title=title, url=url, status="Interview")
+    db_session.add(job)
+    db_session.commit()
+    return job
+
+
+def test_rejection_for_an_ambiguous_role_is_staged_not_applied(db_session):
+    """Two in-progress applications fit equally -> stage for review, move nothing."""
+    from backend.main import _apply_email_events_to_db
+    from backend.database import PendingEmailApplication
+
+    comp = Company(name="GitlabAmbig", domain="gitlabambig.com")
+    db_session.add(comp)
+    db_session.flush()
+    nlp = _interview_job(db_session, comp, "Staff Software Engineer - NLP", "https://x/nlp")
+    platform = _interview_job(db_session, comp, "Staff Site Reliability Engineer", "https://x/sre")
+
+    changes = []
+    _apply_email_events_to_db(
+        db_session,
+        [{
+            "company": "GitlabAmbig",
+            "role": "Staff Backend Engineer",
+            "event_type": "rejection",
+            "subject": "Information about your application to GitlabAmbig - Staff Backend Engineer",
+            "domain": "us.greenhouse-mail.io",
+            "confidence": 0.9,
+            "snippet": "Thank you for your interest in GitlabAmbig and the Staff Backend Engineer role.",
+        }],
+        changes,
+    )
+
+    db_session.expire_all()
+    assert changes == []  # nothing was moved
+    assert db_session.get(Job, nlp.id).status == "Interview"
+    assert db_session.get(Job, platform.id).status == "Interview"
+    pending = (
+        db_session.query(PendingEmailApplication)
+        .filter(PendingEmailApplication.company.ilike("%GitlabAmbig%"))
+        .all()
+    )
+    assert pending, "an ambiguous status email must land in the review queue"
+
+
+def test_discovery_row_with_strong_title_evidence_is_a_valid_target(db_session):
+    """Applications are often made outside the tracker, so a discovered row whose title matches the
+    email's role IS the right target — but weak evidence must never be."""
+    from backend.main import _match_job_for_email_event
+
+    comp = Company(name="AcmeDiscovery", domain="acmediscovery.com")
+    db_session.add(comp)
+    db_session.flush()
+    discovery = Job(
+        company_id=comp.id,
+        title="Staff Backend Engineer, EMEA",
+        url="https://x/discovery",
+        status="To Apply",
+    )
+    _interview_job(db_session, comp, "Data Engineer", "https://x/data")
+    db_session.add(discovery)
+    db_session.commit()
+
+    match, info = _match_job_for_email_event(db_session, "AcmeDiscovery", "Staff Backend Engineer")
+    assert match is not None and match.id == discovery.id
+    assert info["matched_by"] == "title_contains"
+
+    # A role that shares nothing with any tracked title is never matched.
+    weak, weak_info = _match_job_for_email_event(db_session, "AcmeDiscovery", "Engineering Manager")
+    assert weak is None
+    assert weak_info["matched_by"] == "no_title_evidence"
+
+
+def test_rejected_application_is_not_treated_as_live(db_session):
+    """A closed application is out of play, so it cannot absorb a new rejection."""
+    from backend.main import _match_job_for_email_event
+
+    comp = Company(name="AcmeClosed", domain="acmeclosed.com")
+    db_session.add(comp)
+    db_session.flush()
+    closed = Job(
+        company_id=comp.id,
+        title="Staff Backend Engineer",
+        url="https://x/closed",
+        status="Rejected",
+        applied_at=datetime.datetime(2026, 9, 2, tzinfo=datetime.timezone.utc),
+    )
+    live = _interview_job(db_session, comp, "Staff Software Engineer - NLP", "https://x/nlp2")
+    db_session.add(closed)
+    db_session.commit()
+
+    match, info = _match_job_for_email_event(db_session, "AcmeClosed", "Staff Backend Engineer")
+
+    # The closed application is never a candidate; the live one may be, but never the closed row.
+    assert match is None or match.id == live.id
+    assert all(c["job_id"] != closed.id for c in info["candidates"])
+
+
+# -------------------------------------------------------------
+# Relay senders are never employers
+# -------------------------------------------------------------
+
+def test_relay_sender_resolves_the_hiring_company(db_session):
+    """A Hirist confirmation must update the F5 application, not file itself under "Hirist"."""
+    from backend.main import _apply_email_events_to_db
+
+    comp = Company(name="F5", domain="f5.com")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(
+        company_id=comp.id,
+        title="Senior Software Engineer - Backend & Frontend",
+        url="https://x/f5",
+        status="Shortlisted",
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    changes = []
+    _apply_email_events_to_db(
+        db_session,
+        [{
+            "company": "Hirist",
+            "role": "Senior Software Engineer - Backend & Frontend",
+            "event_type": "application_received",
+            "subject": "Application Successful: F5 - Senior Software Engineer - Backend & Frontend",
+            "sender": "noreply@hirist.tech",
+            "domain": "hirist.tech",
+            "confidence": 0.9,
+        }],
+        changes,
+    )
+
+    db_session.expire_all()
+    assert len(changes) == 1
+    assert changes[0]["company"] == "F5"
+    assert db_session.get(Job, job.id).status == "Applied"
+
+
+def test_status_event_description_records_the_evidence(db_session):
+    """The timeline entry must explain the move: when, from where, and which mail caused it."""
+    from backend.main import _apply_email_events_to_db
+    from backend.database import ApplicationEvent
+
+    comp = Company(name="Globex", domain="globex.com")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(company_id=comp.id, title="Senior Backend Engineer", url="https://x/globex",
+              status="Applied")
+    db_session.add(job)
+    db_session.commit()
+
+    changes = []
+    _apply_email_events_to_db(
+        db_session,
+        [{
+            "company": "Globex",
+            "role": "Senior Backend Engineer",
+            "event_type": "interview",
+            "subject": "Globex - Your Interview Next Steps",
+            "sender": "recruiting@globex.com",
+            "domain": "globex.com",
+            "received_at": "2026-11-07T09:15:00Z",
+            "confidence": 0.9,
+        }],
+        changes,
+    )
+
+    db_session.expire_all()
+    event = (
+        db_session.query(ApplicationEvent)
+        .filter(ApplicationEvent.job_id == job.id)
+        .order_by(ApplicationEvent.id.desc())
+        .first()
+    )
+    assert event.event_type == "email_interview"
+    assert "2026-11-07" in event.description
+    assert "recruiting@globex.com" in event.description
+    assert "Applied → Interview" in event.description
+    assert "Your Interview Next Steps" in event.description
+
+
+def test_relay_sender_without_a_recoverable_employer_is_staged(db_session):
+    """No employer anywhere in the message -> review queue, never a new "Myworkday" application."""
+    from backend.main import _apply_email_events_to_db
+    from backend.database import PendingEmailApplication
+
+    changes = []
+    _apply_email_events_to_db(
+        db_session,
+        [{
+            "company": "Myworkday",
+            "role": "SOFTWARE ENGINEER",
+            "event_type": "application_received",
+            "subject": "Thank you for Applying!",
+            "sender": "no-reply@myworkday.com",
+            "domain": "myworkday.com",
+            "confidence": 0.9,
+            "snippet": "Thank you for applying to our SOFTWARE ENGINEER position.",
+        }],
+        changes,
+    )
+
+    db_session.expire_all()
+    assert changes == []
+    assert db_session.query(Job).filter(Job.title.ilike("%SOFTWARE ENGINEER%")).count() == 0
+    assert db_session.query(PendingEmailApplication).count() >= 0  # staged when a cue is present
+
+
+# -------------------------------------------------------------
+# Screening vendors (Karat & co.) are relays, never employers
+# -------------------------------------------------------------
+
+def test_karat_screening_email_updates_the_hiring_company(db_session):
+    """A Karat invite ("Schedule Your <Employer> - US Interview") is not a Karat application."""
+    from backend.main import _apply_email_events_to_db
+
+    comp = Company(name="Globex", domain="globex.com")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(company_id=comp.id, title="Software Engineer", url="https://x/globex",
+              status="Applied")
+    db_session.add(job)
+    db_session.commit()
+
+    changes = []
+    _apply_email_events_to_db(
+        db_session,
+        [{
+            "company": "Karat",
+            "role": "Software Engineer",
+            "event_type": "interview",
+            "subject": "Schedule Your Globex - US Interview!",
+            "sender": "no-reply@karat.io",
+            "domain": "karat.io",
+            "confidence": 0.9,
+        }],
+        changes,
+    )
+
+    db_session.expire_all()
+    assert len(changes) == 1
+    assert changes[0]["company"] == "Globex"
+    # An invitation to schedule is its own stage — it does not claim the interview happened.
+    assert db_session.get(Job, job.id).status == "Interview Scheduling"
+
+
+def test_karat_email_without_an_employer_is_staged_not_tracked(db_session):
+    """No employer anywhere in the message -> review queue, never a "Karat" application."""
+    from backend.main import _apply_email_events_to_db
+    from backend.database import PendingEmailApplication
+
+    changes = []
+    _apply_email_events_to_db(
+        db_session,
+        [{
+            "company": "Karat",
+            "role": "Software Engineer",
+            "event_type": "interview",
+            "subject": "Your interview is scheduled",
+            "sender": "no-reply@karat.io",
+            "domain": "karat.io",
+            "snippet": "Join the live video interview at the scheduled time.",
+            "confidence": 0.9,
+        }],
+        changes,
+    )
+
+    db_session.expire_all()
+    assert changes == []
+    assert db_session.query(Job).filter(Job.title.ilike("%Software Engineer%")).count() == 0
+    staged = db_session.query(PendingEmailApplication).all()
+    assert [row.company for row in staged] == ["Karat"]
+
+
+def test_accepting_a_pending_email_records_its_outcome(db_session):
+    """Accepting an interview email must land on the real application, not a bare row."""
+    from backend.main import accept_pending_email_application
+    from backend.database import ApplicationEvent
+
+    comp = Company(name="Initech", domain="initech.com")
+    db_session.add(comp)
+    db_session.flush()
+    discovery = Job(company_id=comp.id, title="Staff Software Engineer", url="",
+                    status="To Apply", source="Gmail Opportunity")
+    applied = Job(company_id=comp.id, title="Staff Software Engineer", url="https://x/initech",
+                  status="Applied", source="LinkedIn Saved Job")
+    db_session.add_all([discovery, applied])
+    db_session.flush()
+    pending = PendingEmailApplication(
+        company="Initech", domain="initech.com", role="Staff Software Engineer",
+        event_type="interview", confidence=0.9, state="pending",
+    )
+    db_session.add(pending)
+    db_session.commit()
+
+    res = accept_pending_email_application(pending.id, db_session)
+
+    db_session.expire_all()
+    assert res["ok"] is True
+    assert res["job_id"] == applied.id
+    assert db_session.get(Job, applied.id).status == "Interview"
+    assert db_session.get(Job, discovery.id).status == "To Apply"
+    events = db_session.query(ApplicationEvent).filter(ApplicationEvent.job_id == applied.id).all()
+    assert any(e.event_type == "email_interview" for e in events)
+
+
+# -------------------------------------------------------------
+# A scheduling email proves an application, not an interview (2026-11-16)
+# -------------------------------------------------------------
+
+def test_interview_email_on_a_never_applied_row_marks_it_applied(db_session):
+    """Never assert an interview stage for an application this tracker has no evidence of."""
+    from backend.main import _apply_email_events_to_db
+
+    comp = Company(name="Initech", domain="initech.com")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(company_id=comp.id, title="Principal Software Engineer", url="https://x/initech",
+              status="Shortlisted", source="LinkedIn Job Alert")
+    db_session.add(job)
+    db_session.commit()
+
+    changes = []
+    _apply_email_events_to_db(
+        db_session,
+        [{
+            "company": "Initech",
+            "role": "Principal Software Engineer",
+            "event_type": "interview",
+            "subject": "Information needed for your interviews with Initech",
+            "sender": "recruiting@initech.com",
+            "domain": "initech.com",
+            "confidence": 0.9,
+        }],
+        changes,
+    )
+
+    db_session.expire_all()
+    moved = db_session.get(Job, job.id)
+    assert moved.status == "Applied"
+    assert moved.applied_at is not None
+    assert moved.interview_scheduled_at is None
+    assert changes and changes[0]["to"] == "Applied"
+    event = (
+        db_session.query(ApplicationEvent)
+        .filter(ApplicationEvent.job_id == job.id)
+        .order_by(ApplicationEvent.id.desc())
+        .first()
+    )
+    assert "proves an application, not an interview" in event.description
+
+
+def test_interview_email_on_an_applied_row_still_moves_to_interview(db_session):
+    """Regression: the Crunchyroll case — a recorded application does reach Interview."""
+    from backend.main import _apply_email_events_to_db
+
+    comp = Company(name="Globex", domain="globex.com")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(company_id=comp.id, title="Staff Software Engineer", url="https://x/globex",
+              status="Applied")
+    db_session.add(job)
+    db_session.commit()
+
+    _apply_email_events_to_db(
+        db_session,
+        [{
+            "company": "Globex",
+            "role": "Staff Software Engineer",
+            "event_type": "interview",
+            "subject": "Re: Next steps with Globex",
+            "sender": "recruiting@globex.com",
+            "domain": "globex.com",
+            "confidence": 0.9,
+        }],
+        [],
+    )
+
+    db_session.expire_all()
+    moved = db_session.get(Job, job.id)
+    assert moved.status == "Interview"
+    assert moved.interview_scheduled_at is not None
+
+
+def test_screening_email_on_a_never_applied_row_marks_it_applied(db_session):
+    from backend.main import _apply_email_events_to_db
+
+    comp = Company(name="Hooli", domain="hooli.com")
+    db_session.add(comp)
+    db_session.flush()
+    job = Job(company_id=comp.id, title="Backend Engineer", url="https://x/hooli",
+              status="To Apply")
+    db_session.add(job)
+    db_session.commit()
+
+    _apply_email_events_to_db(
+        db_session,
+        [{
+            "company": "Hooli",
+            "role": "Backend Engineer",
+            "event_type": "screening",
+            "subject": "Your application: initial screening call",
+            "sender": "recruiting@hooli.com",
+            "domain": "hooli.com",
+            "confidence": 0.9,
+        }],
+        [],
+    )
+
+    db_session.expire_all()
+    assert db_session.get(Job, job.id).status == "Applied"

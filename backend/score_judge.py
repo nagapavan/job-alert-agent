@@ -4,7 +4,7 @@ The judge is an *auditor*, not a scorer: it returns verdicts on the requirement 
 the groundedness of the narrative claims, and the deterministic engine re-scores the
 corrected set. A given verdict set therefore always produces the same number.
 
-Boundaries (see AGENTS.md §10.2 "deterministic-first"):
+Boundaries (see DESIGN.md §10.2 "deterministic-first"):
 
 - never called during discovery or bulk scans — opt-in, one job at a time;
 - never invents requirements (``missing_requirements`` is reported, never scored);
@@ -218,16 +218,16 @@ def rescore(
 ) -> dict:
     """Recompute features and the band from a (possibly corrected) assessment. No LLM."""
     from backend.match_classifier import (
+        CLASSIFIER,
         build_jd_hints,
         extract_match_features,
-        get_classifier,
     )
     from backend.match_scoring import ScoringConfig, band_and_recommendation
 
     config = config or ScoringConfig()
     hints = build_jd_hints(jd, job_title)
     features = extract_match_features(parsed_resume, hints, assessment=assessment)
-    score = float(get_classifier().predict(features))
+    score = float(CLASSIFIER.predict(features))
     gated = features.must_count > 0 and features.must_coverage < config.must_floor
     band, recommendation = band_and_recommendation(
         score, config, gated=gated, over_qualified=features.over_qualified_flag > 0.5

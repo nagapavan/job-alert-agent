@@ -10,7 +10,7 @@ import pytest
 
 from backend.match_classifier import (
     MatchFeatures,
-    SimpleHeuristicClassifier,
+    DeterministicClassifier,
     _is_title_phrase,
     build_deterministic_assessment,
     extract_match_features,
@@ -73,7 +73,7 @@ def test_education_component_is_excluded_when_the_jd_states_none():
 
     assert features.education_mentioned is False
     # must 60 + seniority excluded + education excluded -> perfect coverage scores 100.
-    score = SimpleHeuristicClassifier().predict(
+    score = DeterministicClassifier().predict(
         MatchFeatures(
             must_coverage=features.must_coverage,
             nice_coverage=0.0,

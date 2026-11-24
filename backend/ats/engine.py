@@ -94,8 +94,11 @@ def _http(method: str, url: str, *, cfg: Optional[PortalConfig] = None, **kwargs
         logger.debug(f"HTTP {method} {url} failed: {e}")
         return None
 
-    if pacer is not None and res.status_code in _RATE_LIMIT_STATUSES:
-        pacer.note_failure(url, retry_after=_parse_retry_after(res))
+    if pacer is not None:
+        if res.status_code in _RATE_LIMIT_STATUSES:
+            pacer.note_failure(url, retry_after=_parse_retry_after(res))
+        elif res.status_code < 400:
+            pacer.note_success(url)
     return res
 
 _SLUG_RESOLVERS: Dict[str, Callable[[str, str], str]] = {}
@@ -729,6 +732,140 @@ class SmartRecruitersScraper(PaginatedJsonScraper):
             "url": data.get("applyUrl") or data.get("postingUrl") or "",
         }
 
+class AdpScraper(PaginatedJsonScraper):
+    """ADP Workforce Now career-centre JSON API (opt-in, undocumented endpoint).
+
+    Three things the declarative shape cannot express: list rows key on ``itemID`` (not ``id``),
+    pagination uses ``$skip``/``$top`` with the total under ``meta.totalNumber``, and the public
+    apply URL only exists as ``customFieldGroup`` -> ``ExternalJobID``, which has to be
+    re-assembled into the career-centre URL. Locations are a list of objects, not a path.
+    """
+
+    def fetch_list(
+        self, cfg: PortalConfig, ctx: Dict[str, Any], *, timeout: int
+    ) -> List[Any]:
+        base = _format_template(cfg.list_url, ctx)
+        items: List[Any] = []
+        offset = 0
+        for _ in range(max(1, cfg.max_pages)):
+            res = _http(
+                "GET",
+                base,
+                cfg=cfg,
+                params={"$skip": offset, "$top": cfg.page_size},
+                timeout=timeout,
+            )
+            if res is None or res.status_code != 200:
+                break
+            data = res.json()
+            page = _resolve_path(data, cfg.response_path) if cfg.response_path else data
+            page = page if isinstance(page, list) else []
+            items.extend(page)
+            total = _resolve_path(data, cfg.total_path) if isinstance(data, dict) else None
+            offset += cfg.page_size
+            if not page or (isinstance(total, int) and offset >= total):
+                break
+        return items
+
+    def map_item(
+        self, cfg: PortalConfig, item: Any, ctx: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, str]]:
+        if not isinstance(item, dict):
+            return None
+        job_id = _adp_external_job_id(item)
+        return {
+            "title": str(item.get("requisitionTitle") or "Untitled Role").strip(),
+            "location": _adp_location(item),
+            "url": _adp_public_url(ctx or {}, job_id) if job_id else "",
+            "description": "",
+            "_item_id": str(item.get("itemID") or ""),
+        }
+
+    def fetch_detail(
+        self, cfg: PortalConfig, item: Any, ctx: Dict[str, Any]
+    ) -> Dict[str, str]:
+        detail = cfg.detail or {}
+        url_tmpl = detail.get("url")
+        item_id = ctx.get("item_id") or (item.get("itemID") if isinstance(item, dict) else "")
+        if not url_tmpl or not item_id:
+            return {}
+        url = _format_template(url_tmpl, ctx, id=item_id)
+        if not url or "{" in url:
+            return {}
+        res = _http("GET", url, cfg=cfg, timeout=8)
+        if res is None or res.status_code != 200:
+            return {}
+        data = res.json() or {}
+        out: Dict[str, str] = {}
+        for path in detail.get("desc_paths", []):
+            raw = _resolve_path(data, path)
+            if raw:
+                out["description"] = _clean_html(str(raw))
+                break
+        job_id = _adp_external_job_id(data) or _adp_external_job_id(item)
+        if job_id:
+            out["url"] = _adp_public_url(ctx, job_id)
+        location = _adp_location(data)
+        if location:
+            out["location"] = location
+        return out
+
+
+def _adp_external_job_id(payload: Any) -> str:
+    """``ExternalJobID`` out of ADP's ``customFieldGroup`` (list-of-pairs or mapping form)."""
+    if not isinstance(payload, dict):
+        return ""
+    group = payload.get("customFieldGroup")
+    if not isinstance(group, dict):
+        return ""
+    fields = group.get("stringFields")
+    if isinstance(fields, dict):
+        return str(fields.get("ExternalJobID") or "").strip()
+    if isinstance(fields, list):
+        for entry in fields:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or entry.get("fieldName") or "").strip()
+            if name.lower() == "externaljobid":
+                return str(entry.get("value") or entry.get("fieldValue") or "").strip()
+    return ""
+
+
+def _adp_location(payload: Any) -> str:
+    """Best-effort location from ``requisitionLocations`` (alias names, then city name)."""
+    if not isinstance(payload, dict):
+        return ""
+    locations = payload.get("requisitionLocations")
+    if not isinstance(locations, list):
+        return ""
+    for entry in locations:
+        if not isinstance(entry, dict):
+            continue
+        aliases = entry.get("aliasNames")
+        if isinstance(aliases, list) and aliases:
+            return ", ".join(str(a).strip() for a in aliases if str(a).strip())
+        address = entry.get("address")
+        if isinstance(address, dict):
+            city = str(address.get("cityName") or "").strip()
+            region = str(address.get("countrySubdivisionLevel1") or "").strip()
+            if city:
+                return f"{city}, {region}" if region else city
+    return ""
+
+
+def _adp_public_url(ctx: Dict[str, Any], job_id: str) -> str:
+    """Re-assemble the public career-centre URL from cid/ccId + ``ExternalJobID``."""
+    cid = str(ctx.get("cid") or "").strip()
+    if not cid or not job_id:
+        return ""
+    cc_id = str(ctx.get("ccId") or "19000101_000001").strip()
+    lang = str(ctx.get("lang") or "en_US").strip()
+    return (
+        "https://workforcenow.adp.com/mascsr/default/mdf/recruitment/recruitment.html"
+        f"?cid={cid}&ccId={cc_id}&jobId={job_id}&lang={lang}"
+    )
+
+
 _SHAPE_REGISTRY: Dict[str, ShapeScraper] = {
     "simple_json": SimpleJsonScraper(),
     "paginated_json": PaginatedJsonScraper(),
@@ -744,6 +881,7 @@ _VARIANT_REGISTRY: Dict[str, ShapeScraper] = {
     "greenhouse": GreenhouseScraper(),
     "smartrecruiters": SmartRecruitersScraper(),
     "workday": WorkdayScraper(),
+    "adp": AdpScraper(),
 }
 
 
@@ -766,6 +904,11 @@ def _ensure_default_resolvers() -> None:
     except Exception:  # noqa: BLE001 - engine still works if the resolver cannot be loaded
         return
     register_slug_resolver("careers_url")(extract_slug_from_careers_url)
+
+
+def active_pacer():
+    """The pacer for the current scrape run, or None when no run is in progress."""
+    return _ACTIVE_PACER
 
 
 def set_active_pacer(pacer) -> None:

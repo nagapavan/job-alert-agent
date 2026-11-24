@@ -4,11 +4,17 @@
 
 All job scoring in the agent uses a **two-tier approach** to maximize token efficiency and response speed:
 
-1. **Fast Path** (deterministic, <100ms, no LLM cost)
+1. **Fast Path** (deterministic, ~0.1–0.3 s per posting, no LLM cost)
 2. **Bounded Fallback** (LLM, capped at `LLM_INTERACTIVE_TIMEOUT`, only when needed)
 
 Rescoring is deliberately **not** LinkedIn-blocking: it never opens a browser and scores only from
-the cached `jobs.description` (see `AGENTS.md` §3).
+the cached `jobs.description` (see `DESIGN.md` §3).
+
+The deterministic path is not purely regex: `section_intent.classify_heading` falls back to an
+embedding nearest-neighbour check for headings the phrase lists miss. That fallback is memoised per
+thread and per embedding backend (`_exemplar_vectors` / `_remember_label`), so the 13 JD exemplars
+are embedded once rather than once per heading line, and a repeated heading costs no embedding at
+all. Without the memo the fallback dominated the cost (~5 s of a 6.8 s five-posting profile).
 
 This reduces LLM usage by ~93% during bulk discovery and rescoring operations.
 
@@ -18,7 +24,7 @@ This reduces LLM usage by ~93% during bulk discovery and rescoring operations.
 
 ### Tier 1: Deterministic Classification
 
-**Entry point**: `_score_job_with_engine()` (`backend/main.py`), which delegates to
+**Entry point**: `_score_job_with_engine()` (`backend/job_scoring.py`), which delegates to
 `_deterministic_match()` for the fast path.
 
 ```
@@ -59,7 +65,7 @@ A clean "no requirements" result on a non-JD discovery artifact does **not** tri
 
 **Guard: Artifact Detection** (`_looks_like_job_description()`)
 
-Before spending an LLM call, the system checks whether the description text looks like an actual job posting. The guard matches JD structural cues (e.g. "experience", "responsibilities", "looking for", "requirements", "qualifications", "years of", "degree") via a compiled regex (`_JD_CUE_RE` in `backend/main.py`) and returns `False` for LinkedIn snippets, Gmail recruiter lines, and truncated link previews.
+Before spending an LLM call, the system checks whether the description text looks like an actual job posting. The guard matches JD structural cues (e.g. "experience", "responsibilities", "looking for", "requirements", "qualifications", "years of", "degree") via a compiled regex (`_JD_CUE_RE` in `backend/job_scoring.py`) and returns `False` for LinkedIn snippets, Gmail recruiter lines, and truncated link previews.
 
 **Examples of artifacts that skip LLM**:
 
@@ -88,9 +94,9 @@ These are marked `unscored` without spending an LLM call.
 
 | File                          | Function                           | Role                                             |
 | :---------------------------- | :--------------------------------- | :----------------------------------------------- |
-| `backend/main.py`             | `_score_job_with_engine()`         | Two-tier routing with artifact guard             |
-| `backend/main.py`             | `_deterministic_match()`           | Deterministic requirement + classifier fast path |
-| `backend/main.py`             | `_looks_like_job_description()`    | Non-JD artifact guard (`_JD_CUE_RE`)             |
+| `backend/job_scoring.py`      | `_score_job_with_engine()`         | Two-tier routing with artifact guard             |
+| `backend/job_scoring.py`      | `_deterministic_match()`           | Deterministic requirement + classifier fast path |
+| `backend/job_scoring.py`      | `_looks_like_job_description()`    | Non-JD artifact guard (`_JD_CUE_RE`)             |
 | `backend/match_classifier.py` | `build_deterministic_assessment()` | Fast JD+resume requirement extraction            |
 | `backend/match_scoring.py`    | `band_and_recommendation()`        | Shared band/recommendation from `ScoringConfig`  |
 | `backend/resume_signals.py`   | `estimate_technology_years()`      | Tech tenure inference (overlaps merged)          |
@@ -184,7 +190,7 @@ All discovery sites pass the `job_title` param to `_score_job_with_engine()` to 
 
 | Method                                 | Count | %     | Speed  | LLM Cost       |
 | :------------------------------------- | :---- | :---- | :----- | :------------- |
-| Deterministic (classifier_v1)          | 364   | 93.3% | <100ms | 0 tokens       |
+| Deterministic (classifier_v1)          | 364   | 93.3% | ~0.1–0.3s | 0 tokens    |
 | LLM Fallback (requirement_coverage_v1) | 17    | 4.4%  | 5–15s  | ~50–150 tokens |
 | Unscored (artifacts / errors)          | 9     | 2.3%  | <10ms  | 0 tokens       |
 
@@ -237,8 +243,7 @@ Run: `./.venv/bin/pytest -q tests/test_match_rescore.py`
 ## Future Enhancements
 
 1. **Learned artifact detector** (ML): Replace the `_JD_CUE_RE` regex with a classifier trained on artifact patterns.
-2. **Classifier retraining**: Shipped — `scripts/train_match_classifier.py` trains from implicit user
-   outcomes (excluded system-generated rows), gated at ≥50 trainable / ≥15 per class. Still open:
-   scheduling it periodically and versioning the model artifact.
+2. **Learned scoring**: not planned. Scoring is one deterministic scorer so a stored score can be
+   re-derived; see "Why there is no training step" in [`HYBRID_MATCHER_GUIDE.md`](HYBRID_MATCHER_GUIDE.md).
 3. **Score confidence interval**: Attach uncertainty bounds from the classifier.
 4. **Cache Tier 2 results**: Reuse LLM fallback results for duplicate JDs (e.g., LinkedIn repost).

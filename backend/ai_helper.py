@@ -12,7 +12,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar  # 
 import requests
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
-from backend.company_catalog import compute_cosine_similarity
+from backend.embeddings import cosine_similarity as compute_cosine_similarity
+from backend.scoring_constants import (
+    DISMISSAL_SIMILARITY_THRESHOLD,
+    DISTINGUISHING_COVERAGE_MIN,
+    SEMANTIC_CACHE_THRESHOLD,
+    TITLE_JACCARD_MIN,
+)
+from backend.text_utils import EMBED_SAMPLE_CHARS, PROMPT_CONTEXT_CHARS
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATS_FILE = BASE_DIR / "data" / "token_stats.json"
@@ -507,7 +514,10 @@ class TokenTracker:
     """Thread-safe counter and cost estimator for local and cloud LLM inferences with snapshot and incremental delta aggregation."""
 
     def __init__(self):
-        self._lock = threading.Lock()
+        # Reentrant: the accounting methods hold this lock while calling get_stats(), which takes
+        # it again. With a plain Lock, /api/llm/token-usage/recalculate wedged forever holding the
+        # tracker for the whole process.
+        self._lock = threading.RLock()
         self._prompt_tokens = 0
         self._completion_tokens = 0
         self._call_count = 0
@@ -570,26 +580,40 @@ class TokenTracker:
                     db = db_mod.SessionLocal()
                     close_db = True
 
+                from sqlalchemy import func
+
                 from backend.database import OperationLog
 
-                new_logs = (
-                    db.query(OperationLog)
-                    .filter(
-                        OperationLog.id > self._last_aggregated_log_id,
-                        (OperationLog.prompt_tokens > 0)
-                        | (OperationLog.completion_tokens > 0),
+                # OperationLog.prompt_tokens is a *delta of these very counters* (callers subtract
+                # a start snapshot from an end snapshot). Adding those rows back therefore double
+                # counted every call, and the totals grew on each settings load. Reconcile instead:
+                # the database is the floor (it survives a restart), the in-memory counters are the
+                # live value. Both directions are idempotent.
+                row = (
+                    db.query(
+                        func.coalesce(func.sum(OperationLog.prompt_tokens), 0),
+                        func.coalesce(func.sum(OperationLog.completion_tokens), 0),
+                        func.count(OperationLog.id),
                     )
-                    .order_by(OperationLog.id.asc())
-                    .all()
+                    .filter(
+                        (OperationLog.prompt_tokens > 0)
+                        | (OperationLog.completion_tokens > 0)
+                    )
+                    .one()
                 )
+                db_prompt, db_completion, db_calls = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
 
-                if new_logs:
-                    for log in new_logs:
-                        self._prompt_tokens += log.prompt_tokens or 0
-                        self._completion_tokens += log.completion_tokens or 0
-                        self._call_count += 1
-                        if log.id > self._last_aggregated_log_id:
-                            self._last_aggregated_log_id = log.id
+                reconciled = False
+                if db_prompt > self._prompt_tokens:
+                    self._prompt_tokens = db_prompt
+                    reconciled = True
+                if db_completion > self._completion_tokens:
+                    self._completion_tokens = db_completion
+                    reconciled = True
+                if db_calls > self._call_count:
+                    self._call_count = db_calls
+                    reconciled = True
+                if reconciled:
                     self._save_persisted()
             except Exception as e:
                 logger.debug(f"Incremental token aggregation error: {e}")
@@ -661,7 +685,10 @@ class TokenTracker:
                 # 2. Tally from Jobs with generated materials
                 jobs = db.query(Job).all()
                 for j in jobs:
-                    if j.match_score and j.match_analysis:
+                    # Only the LLM fallback produced these tokens. Deterministic classifier scores
+                    # also write match_score + match_analysis, so counting on those two fields
+                    # alone invented ~600 prompt tokens per bulk-scored job.
+                    if j.score_method == "requirement_coverage_v1" and j.match_score:
                         p_tokens += 600
                         c_tokens += 150
                         inferences += 1
@@ -1791,11 +1818,13 @@ def generate_structured(
             return schema.model_validate(parsed)
 
 
-def detect_active_llm_provider() -> dict:
-    """
-    Probes available LLM providers in priority order using the registry,
-    automatically adapts LLM queue concurrency, and returns active provider metadata.
-    """
+_PROVIDER_CACHE_TTL_SECONDS = 30.0
+_provider_cache: Dict[str, Any] = {"at": 0.0, "info": None}
+_provider_cache_lock = threading.Lock()
+
+
+def _probe_active_llm_provider() -> dict:
+    """Runs the provider probes in priority order and adapts queue concurrency."""
     sorted_providers = sorted(
         PROVIDER_REGISTRY.values(), key=lambda p: p.get("priority", 99)
     )
@@ -1814,6 +1843,47 @@ def detect_active_llm_provider() -> dict:
         "endpoint": "local",
         "status": "offline",
     }
+
+
+def detect_active_llm_provider(force: bool = False) -> dict:
+    """Active provider metadata, probed at most once per _PROVIDER_CACHE_TTL_SECONDS.
+
+    Each probe is a serial HTTP call with a 1.5 s timeout, and this used to run on every
+    ``/api/health`` request — a public route that gets polled. The memo collapses a burst of
+    callers (and the concurrency sync it performs) into one probe. ``force`` is for the
+    diagnostics route and tests, which want the live answer.
+    """
+    with _provider_cache_lock:
+        if (
+            not force
+            and _provider_cache["info"] is not None
+            and time.monotonic() - _provider_cache["at"] < _PROVIDER_CACHE_TTL_SECONDS
+        ):
+            return dict(_provider_cache["info"])
+
+    info = _probe_active_llm_provider()
+    with _provider_cache_lock:
+        _provider_cache["info"] = dict(info)
+        _provider_cache["at"] = time.monotonic()
+    return dict(info)
+
+
+def cached_active_llm_provider() -> dict:
+    """Last observed provider, never probed.
+
+    A liveness check must not spend seconds on LLM discovery or resize the worker pool, so
+    ``/api/health`` reports this snapshot and ``/api/llm/status`` is what refreshes it.
+    """
+    with _provider_cache_lock:
+        if _provider_cache["info"] is not None:
+            return dict(_provider_cache["info"])
+    return {
+        "provider": "not probed yet",
+        "model": "",
+        "endpoint": "",
+        "status": "unknown",
+    }
+
 
 
 # -------------------------------------------------------------
@@ -2349,7 +2419,7 @@ def generate_cover_letter(
             logger.debug(f"Could not load resume for cover letter LLM-Judge: {e}")
 
     if not candidate_highlights and resume_text:
-        candidate_highlights = resume_text[:600]
+        candidate_highlights = resume_text[:PROMPT_CONTEXT_CHARS]
 
     if candidate_employers or candidate_highlights:
         raw_letter = verify_and_judge_grounded_cover_letter(
@@ -2555,7 +2625,7 @@ def generate_cold_outreach_message(
             f"Role requirements the candidate genuinely matches "
             f"(anchor the note on these, most role-critical first): {matched_line}\n\n"
             f"--- JOB DESCRIPTION (untrusted data) ---\n"
-            f"{wrap_untrusted(job_description[:600])}\n\n"
+            f"{wrap_untrusted(job_description[:PROMPT_CONTEXT_CHARS])}\n\n"
         )
 
     user_prompt = (
@@ -2773,65 +2843,102 @@ def generate_embeddings(text: str, dimensions: int = 384) -> list[float]:
 # -------------------------------------------------------------
 
 
-def _token_overlap_similarity(a_text: str, b_text: str) -> float:
-    """
-    Root/substring token overlap between two texts, normalized by the first text's tokens.
+_GENERIC_ROLE_TOKENS = frozenset({
+    "senior", "junior", "staff", "sr", "jr", "principal", "lead", "head",
+    "engineer", "engineering", "developer", "development", "software",
+    "associate", "intern", "internship", "manager", "generalist", "specialist",
+    "individual", "contributor", "ic", "role", "the", "and", "for", "with",
+    "from", "this", "that", "i", "ii", "iii", "iv", "v", "seniority",
+})
 
-    Tokens shorter than 3 chars are ignored. Tokens of 4+ chars match on equality or
-    containment, so "manage" matches "management". Returns 0.0 when the first text has
-    no usable tokens.
+_TOKEN_RE = re.compile(r"[a-z0-9+#]+")
+
+
+def _tokens(text: str) -> List[str]:
+    """Lowercased word tokens of 3+ characters, with punctuation dropped."""
+    return [t for t in _TOKEN_RE.findall((text or "").lower()) if len(t) > 2]
+
+
+def _tokens_match(a: str, b: str) -> bool:
+    """Token equality, or containment for 4+ char tokens ("manage" ~ "management")."""
+    return a == b or (len(a) >= 4 and len(b) >= 4 and (a in b or b in a))
+
+
+def _token_overlap_similarity(a_text: str, b_text: str) -> float:
+    """Share of the first text's tokens present in the second (asymmetric by design).
+
+    Used where the question is "how much of *this* text is covered" — a stored Q&A question
+    against a new one. Role titles must not use it; see ``_distinguishing_title_similarity``.
     """
-    a_tokens = [t for t in (a_text or "").lower().split() if len(t) > 2]
-    b_tokens = [t for t in (b_text or "").lower().split() if len(t) > 2]
+    a_tokens = _tokens(a_text)
+    b_tokens = _tokens(b_text)
     if not a_tokens:
         return 0.0
-
-    matched = 0
-    for a in a_tokens:
-        for b in b_tokens:
-            if a == b or (len(a) >= 4 and len(b) >= 4 and (a in b or b in a)):
-                matched += 1
-                break
+    matched = sum(1 for a in a_tokens if any(_tokens_match(a, b) for b in b_tokens))
     return matched / len(a_tokens)
 
 
-def _distinguishing_token_coverage(pattern_title: str, job_title: str) -> float:
+def _distinguishing_tokens(title: str) -> List[str]:
+    """Tokens that actually say which role is meant ("ruby", "solutions"), not its level."""
+    return [t for t in _tokens(title) if t not in _GENERIC_ROLE_TOKENS]
+
+
+def _distinguishing_token_coverage(pattern_title: str, job_title: str) -> Optional[float]:
+    """Share of the pattern's distinguishing tokens found in the job title.
+
+    Returns None when the pattern carries no distinguishing token at all — such a rule
+    ("Principal Engineer") is too generic to identify a role on its own.
     """
-    Calculate how many distinguishing (non-generic) tokens from the pattern title
-    are present in the job title.
-    
-    Returns coverage ratio (0.0-1.0) of pattern's distinguishing tokens found in job title.
-    Returns None if pattern has no distinguishing tokens.
+    pattern_tokens = _distinguishing_tokens(pattern_title)
+    if not pattern_tokens:
+        return None
+    job_tokens = _tokens(job_title)
+    matched = sum(1 for p in pattern_tokens if any(_tokens_match(p, j) for j in job_tokens))
+    return matched / len(pattern_tokens)
+
+
+def _distinguishing_title_similarity(
+    pattern_title: str, job_title: str
+) -> Optional[float]:
+    """Symmetric Jaccard over distinguishing tokens.
+
+    Symmetry is the point: normalising by the pattern alone let a short generic rule swallow
+    any longer title containing its words ("Principal Engineer" -> "Principal Software
+    Engineer"). Extra tokens on *either* side now lower the score. Returns None when the
+    pattern has no distinguishing token.
     """
-    # Generic role words that don't distinguish roles
-    GENERIC_TOKENS = {
-        "senior", "junior", "staff", "sr", "jr", "principal", "lead", "head", 
-        "engineer", "engineering", "developer", "development", "software", 
-        "associate", "intern", "internship", "manager", "generalist", "specialist", 
-        "individual", "contributor", "ic", "role", "the", "and", "for", "with", 
-        "from", "this", "that", "i", "ii", "iii", "iv", "v", "seniority"
-    }
-    
-    pattern_tokens = [t for t in (pattern_title or "").lower().split() if len(t) > 2]
-    job_tokens = [t for t in (job_title or "").lower().split() if len(t) > 2]
-    
-    # Filter out generic tokens
-    distinguishing_pattern_tokens = [t for t in pattern_tokens if t not in GENERIC_TOKENS]
-    
-    if not distinguishing_pattern_tokens:
-        return None  # No distinguishing tokens to match against
-    
-    # Count how many distinguishing tokens are found in job title
-    matched = 0
-    for pattern_token in distinguishing_pattern_tokens:
-        for job_token in job_tokens:
-            if (pattern_token == job_token or 
-                (len(pattern_token) >= 4 and len(job_token) >= 4 and 
-                 (pattern_token in job_token or job_token in pattern_token))):
-                matched += 1
-                break
-    
-    return matched / len(distinguishing_pattern_tokens)
+    pattern_tokens = _distinguishing_tokens(pattern_title)
+    job_tokens = _distinguishing_tokens(job_title)
+    if not pattern_tokens:
+        return None
+    shared = min(
+        sum(1 for p in pattern_tokens if any(_tokens_match(p, j) for j in job_tokens)),
+        sum(1 for j in job_tokens if any(_tokens_match(j, p) for p in pattern_tokens)),
+    )
+    union = len(pattern_tokens) + len(job_tokens) - shared
+    return shared / union if union else 0.0
+
+
+def _titles_are_equal(a: str, b: str) -> bool:
+    """True when two titles reduce to the same token sequence (punctuation-insensitive)."""
+    return bool(_tokens(a)) and _tokens(a) == _tokens(b)
+
+
+def _seniority_conflict(pattern_title: str, job_title: str) -> bool:
+    """True when both titles state a level and the levels differ (Senior vs Staff).
+
+    One unknown level is not a conflict: a rule with no level word still applies to a title
+    that has one, which is the common case for an operator dismissing a plain role name.
+    """
+    from backend.jd_signals import seniority_level
+
+    pattern_level = seniority_level(pattern_title)
+    job_level = seniority_level(job_title)
+    return (
+        pattern_level != "unknown"
+        and job_level != "unknown"
+        and pattern_level != job_level
+    )
 
 
 def search_qa_memory(
@@ -2896,7 +3003,7 @@ def check_semantic_dismissal(
     job_title: str,
     job_description: str,
     db,
-    threshold: float = 0.80,
+    threshold: float = DISMISSAL_SIMILARITY_THRESHOLD,
     company_name: Optional[str] = None,
 ) -> Optional[dict]:
     """
@@ -2906,7 +3013,11 @@ def check_semantic_dismissal(
     Dismissals are scoped to their employer: the same role at a *different* company is NOT
     filtered (which previously hid genuinely interested opportunities). Legacy patterns with
     no stored company remain role-only for backward compatibility.
-    Returns matched pattern metadata if cosine similarity >= threshold, else None.
+
+    Two gates must both pass, so the blended score can never bypass the role evidence:
+    the title must identify the same role (symmetric overlap of distinguishing tokens, or an
+    exact title when the rule has none), and the two titles must not state different seniority
+    levels. Only then is the similarity threshold applied.
     """
     if not job_title or not job_title.strip():
         return None
@@ -2917,7 +3028,7 @@ def check_semantic_dismissal(
     if not patterns:
         return None
 
-    sample_text = f"{job_title} {job_description[:400] if job_description else ''}"
+    sample_text = f"{job_title} {job_description[:EMBED_SAMPLE_CHARS] if job_description else ''}"
     job_vec = generate_embeddings(sample_text)
 
     best_match = None
@@ -2932,40 +3043,50 @@ def check_semantic_dismissal(
 
         if not p.embedding:
             p.embedding = generate_embeddings(
-                f"{p.title} {p.description[:400] if p.description else ''}"
+                f"{p.title} {p.description[:EMBED_SAMPLE_CHARS] if p.description else ''}"
             )
             db.flush()
 
         cos_sim = compute_cosine_similarity(job_vec, p.embedding)
 
-        # Check title overlap (e.g. "Senior Sales Solutions Specialist" vs "Sales Solutions Specialist")
-        title_overlap = _token_overlap_similarity(p.title, job_title)
-        
-        # Check distinguishing token coverage
+        # Title evidence. The comparison is symmetric and seniority-aware: a rule may only
+        # dismiss a title it actually identifies, not any longer title containing its words.
+        title_similarity = _distinguishing_title_similarity(p.title, job_title)
         distinguishing_coverage = _distinguishing_token_coverage(p.title, job_title)
+
+        if title_similarity is None:
+            # The rule carries no distinguishing token ("Principal Engineer"), so the only
+            # evidence it can offer is an exact title match.
+            if not _titles_are_equal(p.title, job_title):
+                continue
+            title_similarity = 1.0
+        elif (
+            title_similarity < TITLE_JACCARD_MIN
+            or distinguishing_coverage is None
+            or distinguishing_coverage < DISTINGUISHING_COVERAGE_MIN
+        ):
+            continue
+
+        if _seniority_conflict(p.title, job_title):
+            continue
 
         effective_sim = max(
             cos_sim,
-            (0.35 * cos_sim) + (0.65 * title_overlap)
-            if title_overlap >= 0.5
+            (0.35 * cos_sim) + (0.65 * title_similarity)
+            if title_similarity >= 0.5
             else cos_sim,
         )
 
-        if effective_sim > highest_sim:
+        if effective_sim >= threshold and effective_sim > highest_sim:
             highest_sim = effective_sim
-            # Title-only dismissal requires distinguishing token coverage
-            title_trigger = title_overlap >= 0.75 and (
-                distinguishing_coverage is not None and distinguishing_coverage >= 0.5
-            )
-            if effective_sim >= threshold or title_trigger:
-                best_match = {
-                    "pattern_id": p.id,
-                    "matched_title": p.title,
-                    "company_name": p.company_name,
-                    "similarity": round(max(effective_sim, title_overlap), 3),
-                    "distinguishing_coverage": round(distinguishing_coverage or 0.0, 3) if distinguishing_coverage is not None else None,
-                    "reason": p.reason or "Semantic match to previously dismissed job",
-                }
+            best_match = {
+                "pattern_id": p.id,
+                "matched_title": p.title,
+                "company_name": p.company_name,
+                "similarity": round(max(effective_sim, title_similarity), 3),
+                "distinguishing_coverage": round(distinguishing_coverage or 0.0, 3) if distinguishing_coverage is not None else None,
+                "reason": p.reason or "Semantic match to previously dismissed job",
+            }
 
     return best_match
 
@@ -2998,7 +3119,7 @@ def index_dismissed_job_pattern(
     if existing:
         return existing
 
-    sample_text = f"{clean_title} {job_description[:400] if job_description else ''}"
+    sample_text = f"{clean_title} {job_description[:EMBED_SAMPLE_CHARS] if job_description else ''}"
     emb = generate_embeddings(sample_text)
 
     pattern = DismissedJobPattern(
@@ -3213,7 +3334,7 @@ def resolve_semantic_essay_cache(
     db,
     company_name: Optional[str] = None,
     job_title: Optional[str] = None,
-    threshold: float = 0.85,
+    threshold: float = SEMANTIC_CACHE_THRESHOLD,
 ) -> Optional[dict]:
     """
     Zero-Token Semantic Cache Resolver.
@@ -3309,7 +3430,7 @@ def generate_and_cache_essay_answer(
     company_name: str = "",
     job_title: str = "",
     auto_cache: bool = True,
-    threshold: float = 0.85,
+    threshold: float = SEMANTIC_CACHE_THRESHOLD,
     provider: Optional[str] = None,
 ) -> dict:
     """
@@ -3417,7 +3538,7 @@ def batch_autofill_essay_answers(
     company_name: str = "",
     job_title: str = "",
     auto_cache: bool = True,
-    threshold: float = 0.85,
+    threshold: float = SEMANTIC_CACHE_THRESHOLD,
     provider: Optional[str] = None,
 ) -> dict:
     """
@@ -3763,7 +3884,7 @@ def generate_grounded_anti_slop_pitch(
     resume_text: str = "",
     db=None,
     auto_cache: bool = True,
-    threshold: float = 0.85,
+    threshold: float = SEMANTIC_CACHE_THRESHOLD,
     provider: Optional[str] = None,
 ) -> dict:
     """
@@ -3862,7 +3983,7 @@ def generate_grounded_anti_slop_pitch(
             logger.debug(f"Could not load active resume for grounded pitch: {e}")
 
     if not candidate_highlights and resume_text:
-        candidate_highlights = resume_text[:600]
+        candidate_highlights = resume_text[:PROMPT_CONTEXT_CHARS]
 
     # 3. Retrieve Company Intelligence (DB first, then fallback to quick lookup)
     company_intel = {}

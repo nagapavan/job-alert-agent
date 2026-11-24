@@ -169,3 +169,43 @@ def test_linkedin_last_sync_latest_wins(db_session):
     # The higher-id (newer) log should win.
     assert data["sync_batch_id"] == BATCH_A
     assert data["total_added"] == 2
+
+
+def test_a_closed_saved_listing_only_touches_its_own_employer(db_session):
+    """Title-only pruning closed another employer's row and wrote an event on it (finding 41)."""
+    from backend.database import Company, Job
+    from backend.routers.linkedin import _find_closed_saved_job
+
+    alpha = Company(name="Alpha Corp")
+    beta = Company(name="Beta Labs")
+    db_session.add_all([alpha, beta])
+    db_session.flush()
+    alpha_job = Job(
+        company_id=alpha.id,
+        title="Backend Engineer",
+        location="Remote",
+        url="https://alpha.example/jobs/1",
+        source_type="LinkedIn",
+    )
+    db_session.add(alpha_job)
+    db_session.commit()
+
+    other_employer = {
+        "title": "Backend Engineer",
+        "company": "Beta Labs",
+        "url": "https://beta.example/jobs/9",
+        "is_closed": True,
+    }
+    assert _find_closed_saved_job(db_session, other_employer) is None
+
+    same_employer = dict(other_employer, company="Alpha Corp")
+    assert _find_closed_saved_job(db_session, same_employer).id == alpha_job.id
+
+    # With no employer on the card, only an exact URL may match.
+    assert _find_closed_saved_job(db_session, {"title": "Backend Engineer"}) is None
+    assert (
+        _find_closed_saved_job(
+            db_session, {"title": "Backend Engineer", "url": "https://alpha.example/jobs/1"}
+        ).id
+        == alpha_job.id
+    )

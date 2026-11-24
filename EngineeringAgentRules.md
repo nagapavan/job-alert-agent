@@ -2,6 +2,12 @@
 
 Engineering principles and workflow rules for the job-alert-agent project. These apply to all contributors. Detailed reference material lives in the linked docs; this file captures the rules that must be followed.
 
+> **Ownership.** This tracked file is the public summary of the project rules. `AGENTS.md` (local,
+> gitignored) is the operator's agent rulebook — workflow, memory protocol, delegation, harness
+> behaviour; `PROJECT_STRUCTURE.md` holds the module map, schema and onboarding, and `DESIGN.md` the
+> design rationale and policies. The four must not contradict each other: if they do, report the
+> conflict and fix the stale side rather than following both.
+
 ---
 
 ## 0. Core Engineering Workflow & Ground Rules
@@ -24,7 +30,7 @@ Every feature request, enhancement, or non-trivial bugfix follows a 5-phase life
 
 ## 1. Code Editing & File Integrity
 
-- **Never push without explicit approval.** Local commits and branches are fine; no `git push` unless asked.
+- **Never commit or push without explicit approval.** Approve the exact files per change; `git add` and `git commit` need the same consent as `git push`.
 - **Active file targeting** — modify only the owning file; if a change belongs elsewhere, update that file.
 - **No unnecessary files** — no new files/folders unless requested or approved.
 - **No over-engineering documentation** — do not auto-generate docs, checklists, or analyses unless explicitly requested. If asked "should we do X?", wait for a decision.
@@ -62,8 +68,8 @@ Every feature request, enhancement, or non-trivial bugfix follows a 5-phase life
 ## 5. Privacy & Opt-in Guardrails
 
 - **Server-persisted preferences** — discovery reads `UserPreference`; manual *and* scheduled runners must use it (resume-derived data only as last resort).
-- **Opt-in feature flags** (`UserPreference.features_json`) — `linkedin_sync`, `gmail_sync`, `jobspy_google` default **off**; per-portal ATS flags must be explicitly enabled for unofficial endpoints. Disabled channels are hidden in the UI and skipped server-side (`force=True` bypasses for a single manual run).
-- **Employer blocklist** (`excluded_companies`, default `amazon`) — matching companies are never scanned.
+- **Opt-in feature flags** (`UserPreference.features_json`) — `linkedin_sync`, `gmail_sync` default **off**; per-portal ATS flags must be explicitly enabled for unofficial endpoints. Disabled channels are hidden in the UI and skipped server-side (`force=True` bypasses for a single manual run).
+- **Employer blocklist** (`excluded_companies`, seeded from `DEFAULT_EXCLUDED_COMPANIES`) — matching companies are never scanned.
 - **Gmail opt-in/privacy-scoped** — BYOK Gmail API with narrow query, metadata+snippet only, page caps, `messageId` dedup; **never enumerate the full mailbox**.
 - **Single-owner browser profile** — `BrowserProfileBusy` is raised rather than deleting live locks; background tasks skip when the profile is in use.
 - **Prompt-injection boundary** — external text wrapped via `wrap_untrusted`; generated text via `sanitize_generated_text`; the LLM never submits applications (human confirms via `submission_confirmed`).
@@ -96,9 +102,9 @@ Full file-by-file index with code examples: [`PROJECT_INDEX.md`](PROJECT_INDEX.m
 
 ## 7. Reference Docs
 
-- **Dependency inventory** — `requirements.txt` (pinned) and `AGENTS.md` §8.
+- **Dependency inventory** — `requirements.txt` (pinned) and `PROJECT_STRUCTURE.md` §8.
 - **Detailed database schema** — `DESIGN_DIAGRAMS.md`, `PROJECT_INDEX.md`.
-- **Performance optimization strategies** — `AGENTS.md` §10, `AGENTIC_ARCHITECTURE.md`.
+- **Performance optimization strategies** — `DESIGN.md` §10, `AGENTIC_ARCHITECTURE.md`.
 - **Security implementation** — [`docs/SECURITY_IMPLEMENTATION.md`](docs/SECURITY_IMPLEMENTATION.md).
 - **Development setup & onboarding** — `README.md` Quick Start, `CONTRIBUTING.md`.
 - **Prompt & architecture** — `AGENTIC_ARCHITECTURE.md`, `DESIGN_DIAGRAMS.md`.

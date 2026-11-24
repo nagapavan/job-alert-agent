@@ -90,9 +90,9 @@ def test_score_scale_renormalises_when_the_jd_states_no_nice_to_haves():
     A JD with no preferred section scores over must 60 + seniority 15 + education 5 (80 points),
     so an otherwise perfect fit reaches 100 instead of being capped at 80.
     """
-    from backend.match_classifier import MatchFeatures, SimpleHeuristicClassifier
+    from backend.match_classifier import DeterministicClassifier, MatchFeatures
 
-    classifier = SimpleHeuristicClassifier()
+    classifier = DeterministicClassifier()
 
     def score(must_cov, nice_cov, must_count, nice_count):
         return classifier.predict(

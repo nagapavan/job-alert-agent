@@ -10,7 +10,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="icon"
         href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💼</text></svg>">
-    <link rel="stylesheet" href="styles.css?v=20260907_8.7">
+    <link rel="stylesheet" href="styles.css?v=20261117_9.1">
 </head>
 
 <body>
@@ -880,7 +880,8 @@
                             </div>
                             <p class="pref-card-desc">Jobs you marked as 'Not Interested' or 'Ignored' are memorized as
                                 <strong>company + role</strong> rules here. Future scrapes and syncs matching the same
-                                role <em>at the same company</em> (≥82% semantic similarity) are auto-filtered with 0
+                                role <em>at the same company</em> (≥<span data-similarity-threshold>80%</span>
+                                semantic similarity) are auto-filtered with 0
                                 LLM tokens — the same role at other companies is still surfaced.
                             </p>
 
@@ -897,12 +898,10 @@
 
             <!-- BACKGROUND TASKS & QUEUE SECTION -->
             <section id="tasks-section" class="content-section hidden">
-                <div class="tasks-container"
-                    style="max-width: 1200px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px;">
+                <div class="tasks-container tasks-section-stack">
 
                     <!-- Section Header -->
-                    <div
-                        style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #313244; padding-bottom: 15px;">
+                    <div class="tasks-section-header">
                         <div>
                             <h3
                                 style="font-size: 20px; font-weight: 700; color: #cdd6f4; display: flex; align-items: center; gap: 8px;">
@@ -922,7 +921,7 @@
                     </div>
 
                     <!-- Top 3-Column Grid: Active Tasks + LLM Queue + Discovery Channels -->
-                    <div style="display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 20px;">
+                    <div class="tasks-top-grid">
 
                         <!-- Panel 1: Active & Running Background Tasks -->
                         <div class="pref-card" style="margin: 0;">
@@ -961,7 +960,7 @@
                                     Paced</span>
                             </div>
 
-                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px;">
+                            <div class="tasks-queue-metrics">
                                 <div
                                     style="background: #11111b; border: 1px solid #313244; border-radius: 8px; padding: 10px; text-align: center;">
                                     <span style="font-size: 10px; color: #a6adc8; text-transform: uppercase;">Queue
@@ -1377,6 +1376,9 @@
                                 <span class="settings-hint">(unofficial widget endpoint)</span></label>
                             <label class="settings-check"><input type="checkbox" id="set-feat-ats_workday"> Workday
                                 <span class="settings-hint">(unofficial CXS API)</span></label>
+                            <label class="settings-check"><input type="checkbox" id="set-feat-ats_adp"> ADP
+                                Workforce Now <span class="settings-hint">(undocumented career-centre JSON
+                                    API)</span></label>
                             <label class="settings-check"><input type="checkbox" id="set-feat-ats_uber"> Uber careers
                                 <span class="settings-hint">(unofficial internal API)</span></label>
                             <label class="settings-check"><input type="checkbox" id="set-feat-ats_custom_html"> Custom
@@ -1509,10 +1511,16 @@
                 </div>
             </section>
         </main>
-    </div>
 
-    <div id="details-modal" class="modal-overlay drawer-overlay hidden">
+        <!-- Job dossier: a pinned dock on wide screens, a slide-over drawer on narrow ones. -->
+        <div id="details-modal" class="modal-overlay drawer-overlay hidden">
         <div class="modal-drawer">
+            <div class="dock-empty-state" id="dock-empty-state">
+                <div class="dock-empty-icon">🗂️</div>
+                <h4>Select a job to open its dossier</h4>
+                <p>Match score, gaps, activity and application materials stay pinned here while you scan
+                    the feed or the tracker.</p>
+            </div>
             <div class="modal-header">
                 <div>
                     <h3 id="modal-job-title">Senior Backend Engineer</h3>
@@ -1520,8 +1528,13 @@
                         <span id="modal-company-name" class="modal-subtitle">Company • Location</span>
                         <span class="badge verified" id="modal-llm-badge">⚡ AI: Detecting...</span>
                     </div>
+                    <div id="modal-job-evidence" class="modal-evidence">Loading activity…</div>
                 </div>
-                <button id="modal-close-btn" class="btn-close">✕</button>
+                <div class="modal-header-actions">
+                    <button id="modal-pin-btn" class="btn-close" aria-pressed="false"
+                        title="Pin this panel open (Gmail-style: unpinned it collapses when you close a job)">📌</button>
+                    <button id="modal-close-btn" class="btn-close" title="Close (Esc)">✕</button>
+                </div>
             </div>
 
             <!-- Modal Navigation Tabs -->
@@ -1593,7 +1606,8 @@
 
                         <!-- Gap / Growth Skills Group -->
                         <div style="margin-top: 12px;">
-                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <div
+                                style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px 10px;">
                                 <span
                                     style="font-size: 11px; text-transform: uppercase; color: #fab387; font-weight: 700; letter-spacing: 0.5px;">⚡
                                     Key Job Requirements (Growth / Target Areas)</span>
@@ -1734,6 +1748,7 @@
                 <button id="modal-apply-browser-btn" class="btn btn-success btn-block">
                     🚀 Launch Playwright Assisted Apply Session
                 </button>
+            </div>
             </div>
         </div>
     </div>
@@ -1908,6 +1923,11 @@
                     <span style="font-size: 32px; display: block; margin-bottom: 8px;">📋</span>
                     <p style="color: #a6adc8;">No operations recorded yet. Background syncs and application form-fills
                         will appear here automatically.</p>
+                </div>
+
+                <div id="operations-error" class="hidden" style="padding: 30px 20px; text-align: center;">
+                    <span style="font-size: 32px; display: block; margin-bottom: 8px;">⚠️</span>
+                    <p id="operations-error-message" style="color: #f87171;"></p>
                 </div>
 
                 <div id="operations-log-list"
@@ -2321,7 +2341,8 @@
     <!-- Notification Toast -->
     <div id="toast" class="toast hidden"></div>
 
-    <script src="app.js?v=20261029_8.8"></script>
+    <script src="fetch-timeout.js?v=20261113_1"></script>
+    <script src="app.js?v=20261117_9.0"></script>
 </body>
 
 </html>

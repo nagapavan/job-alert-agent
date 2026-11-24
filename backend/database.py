@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import datetime
+from typing import Optional
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text, 
     DateTime, Float, ForeignKey, Boolean, TypeDecorator, UniqueConstraint,
@@ -9,7 +10,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Session, declarative_base, sessionmaker, relationship, synonym
 from backend.config import (
-    DATABASE_URL, EMBEDDING_DIM, SQLITE_URL, encrypt_data, decrypt_data, cipher,
+    DATABASE_URL, EMBEDDING_DIM, SQLITE_URL, encrypt_data, decrypt_data, cipher, env_int,
 )
 
 logger = logging.getLogger("database")
@@ -18,8 +19,8 @@ Base = declarative_base()
 
 # Operation-log retention: bound table growth on long-running deployments.
 # Rows older than the retention window are dropped, then the table is capped to max_rows (oldest first).
-OPERATION_LOG_MAX_ROWS = int(os.environ.get("OPERATION_LOG_MAX_ROWS", "1000"))
-OPERATION_LOG_RETENTION_DAYS = int(os.environ.get("OPERATION_LOG_RETENTION_DAYS", "30"))
+OPERATION_LOG_MAX_ROWS = env_int("OPERATION_LOG_MAX_ROWS", 1000, minimum=1)
+OPERATION_LOG_RETENTION_DAYS = env_int("OPERATION_LOG_RETENTION_DAYS", 30, minimum=1)
 
 # -------------------------------------------------------------
 # SafeVector Type Decorator (PostgreSQL pgvector / SQLite JSON)
@@ -133,15 +134,16 @@ class Job(Base):
     __tablename__ = "jobs"
 
     id = Column(Integer, primary_key=True, index=True)
-    company_id = Column(Integer, ForeignKey("companies.id", ondelete="CASCADE"), nullable=False)
+    company_id = Column(Integer, ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True)
     title = Column(String(255), nullable=False, index=True)
     description = Column(Text, nullable=True)
-    url = Column(String(512), nullable=True)
+    # Dedup key: every ingestion path queries `Job.url == ...` for one posting.
+    url = Column(String(512), nullable=True, index=True)
     salary_range = Column(String(255), nullable=True)
     location = Column(String(255), nullable=True)
     source = Column(String(100), nullable=True)  # e.g., "LinkedIn Job Alert", "Greenhouse", "Direct"
     source_type = Column(String(50), default="Direct")  # "LinkedIn" or "Direct"
-    status = Column(String(50), default="To Apply", index=True)  # Canonical: To Apply, Shortlisted, Applied, Screening, Interview, Offered, Rejected, Not Interested
+    status = Column(String(50), default="To Apply", index=True)  # Canonical: To Apply, Shortlisted, Applied, Screening, Interview Scheduling, Interview, Offered, Rejected, Closed, Withdrawn, Not Interested
     
     # AI Scoring & Tailoring
     match_score = Column(Float, nullable=True)
@@ -167,6 +169,12 @@ class Job(Base):
     # batches that still need review. Cleared on any status change.
     sync_batch_id = Column(String(64), nullable=True, index=True)
 
+    # The employer's own requisition id for this posting ("R262578", "200045102", "gh_jid=...").
+    # It names exactly one posting, so an application mail carrying it can be attributed to this
+    # row without guessing from company + title (2026-11-16 attribution audit).
+    requisition_id = Column(String(64), nullable=True, index=True)
+    requisition_source = Column(String(32), nullable=True)
+
     # True only when match_score came from a real AI analysis (vs. a source/baseline/saved default)
     match_scored = Column(Boolean, default=False)
     # Which scoring engine produced match_score (null for legacy/baseline scores) + when.
@@ -191,7 +199,7 @@ class Job(Base):
     applied_at = Column(DateTime, nullable=True)
     interview_scheduled_at = Column(DateTime, nullable=True)
     rejected_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=utc_now)
+    created_at = Column(DateTime, default=utc_now, index=True)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     # Relationships
@@ -322,6 +330,36 @@ class DismissedJobPattern(Base):
     embedding_dim = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=utc_now)
 
+class EmailApplicationLink(Base):
+    """Which Gmail message was attributed to which tracked application, and on what evidence.
+
+    Attribution used to exist only as prose inside ``ApplicationEvent.description``: it could not
+    be queried, verified, re-evaluated, or corrected at the source. One row per message makes the
+    decision a record — ``message_id`` is unique, so a single mail can never be attached to two
+    applications, and correcting a mistake is an update instead of an appended note.
+    """
+    __tablename__ = "email_application_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(String(255), unique=True, index=True, nullable=False)
+    # Gmail thread: a reply inherits the application its thread is already linked to.
+    thread_id = Column(String(255), nullable=True, index=True)
+    job_id = Column(
+        Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # How it matched: requisition | thread | exact_domain | exact_title | title_contains |
+    # title_overlap | accepted_pending | auto_created
+    method = Column(String(40), nullable=False, default="")
+    confidence = Column(Float, nullable=True)
+    sender = Column(String(255), nullable=True)
+    subject = Column(Text, nullable=True)
+    received_at = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+
+    job = relationship("Job")
+
+
 class CustomFormField(Base):
     """
     Form Field Telemetry: Tracks recognized and unique custom form fields across company career portals
@@ -376,6 +414,9 @@ class PendingEmailApplication(Base):
     # "pending" | "accepted" | "expired"
     state = Column(String(20), nullable=False, default="pending")
     snippet = Column(Text, nullable=True)
+    # Kept so accepting the card can record which message produced the application link.
+    message_id = Column(String(255), nullable=True)
+    thread_id = Column(String(255), nullable=True)
 
     __table_args__ = (
         UniqueConstraint(
@@ -429,6 +470,23 @@ class ScoreAuditRecord(Base):
     created_at = Column(DateTime, default=utc_now)
 
 
+# Employers whose published terms forbid automated access to their own sites, so they are never
+# scanned. Tokens match case-insensitively as substrings of "<name> <domain>", which is why a
+# common-word employer is seeded by domain ("target.com", not "target"). Sources, checked
+# 2026-11-16: Amazon Conditions of Use (data mining/robots barred) + Agent Terms; Booking.com
+# Terms A15.2 (automated means and AI-powered assistants need written permission); eBay User
+# Agreement (robots, scrapers, LLM-driven bots); Target T&Cs (only its approved agents may
+# interact); HEINEKEN careers T&Cs (crawlers and auto bots). A policy that only bans automated
+# *applying* is not a reason to skip scanning, so those employers are not seeded here.
+DEFAULT_EXCLUDED_COMPANIES = ",".join((
+    "amazon",
+    "booking.com",
+    "ebay",
+    "heineken",
+    "target.com",
+))
+
+
 class UserPreference(Base):
     """
     Single-row candidate search preferences + opt-in discovery feature flags.
@@ -447,16 +505,10 @@ class UserPreference(Base):
     features_json = Column(Text, default="{}")     # opt-in feature flags (JSON)
     scoring_config_json = Column(Text, default="{}")  # tunable match-scoring weights/cutoffs (JSON)
     consents_json = Column(Text, default="{}")     # explicit per-feature consent records (JSON, versioned)
-    excluded_companies = Column(Text, default="amazon")  # comma-separated name/domain blocklist
+    excluded_companies = Column(Text, default=DEFAULT_EXCLUDED_COMPANIES)  # comma-separated name/domain blocklist
     skip_topics = Column(Text, default="")  # comma-separated skill/keyword blocklist (titles + JDs)
     extra_skills_json = Column(Text, default="[]")  # user-owned skills added on top of resume-extracted ones (JSON list)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
-
-
-# Default employer/domain blocklist (substring match, lowercased). Companies whose name or
-# domain contains any token are never scanned. Seeded with Amazon: its Conditions of Use and
-# Agent Policy explicitly restrict automated/agent access, so it must not be scraped by default.
-DEFAULT_EXCLUDED_COMPANIES = "amazon"
 
 
 # Opt-in discovery features. Disabled channels are hidden in the UI and skipped by the scheduler.
@@ -485,6 +537,7 @@ DEFAULT_FEATURE_FLAGS = {
     "ats_smartrecruiters": False,
     "ats_workable": False,
     "ats_workday": False,
+    "ats_adp": False,
     "ats_uber": False,
     "ats_custom_html": False,
 }
@@ -504,6 +557,7 @@ CONSENT_REQUIRED_FEATURES = (
     "ats_smartrecruiters",  # unofficial / ambiguous ATS endpoints
     "ats_workable",
     "ats_workday",
+    "ats_adp",
     "ats_uber",
     "ats_custom_html",
 )
@@ -515,7 +569,10 @@ def get_user_preferences(db) -> "UserPreference":
     if not pref:
         pref = UserPreference()
         db.add(pref)
-        db.commit()
+        # flush, never commit: this is called from is_feature_enabled / get_scoring_config /
+        # has_consent, i.e. from inside background runners and handlers that are mid-transaction.
+        # Committing here would publish their pending writes as a side effect of a read.
+        db.flush()
         db.refresh(pref)
     return pref
 
@@ -539,19 +596,16 @@ def is_feature_enabled(db, feature: str) -> bool:
     return bool(get_feature_flags(db).get(feature, False))
 
 
-# Tunable match-scoring parameters (mirrors backend.match_scoring.ScoringConfig defaults).
-DEFAULT_SCORING_CONFIG = {
-    "must_weight": 3.0,
-    "nice_weight": 1.0,
-    "must_floor": 0.5,
-    "cap_when_below_floor": 55.0,
-    "must_blend": 0.7,
-    "nice_blend": 0.3,
-    "strong": 85.0,
-    "good": 70.0,
-    "moderate": 55.0,
-    "weak": 40.0,
-}
+# Tunable match-scoring parameters, derived from the ScoringConfig dataclass so the two
+# cannot drift: changing a default in one place is enough (finding 82).
+def _default_scoring_config() -> dict:
+    from backend.match_scoring import ScoringConfig
+
+    cfg = ScoringConfig()
+    return {name: float(getattr(cfg, name)) for name in cfg.__dataclass_fields__}
+
+
+DEFAULT_SCORING_CONFIG = _default_scoring_config()
 
 
 def get_scoring_config(db) -> dict:
@@ -637,6 +691,41 @@ def is_company_excluded(name: str, domain: str, db) -> bool:
     return any(tok in haystack for tok in tokens)
 
 
+def known_company_names(db, limit: int = 2000) -> list:
+    """The stored employer names, for alias/synonym resolution at ingestion (finding 57).
+
+    Bounded and name-only so the call is cheap enough to run once per ingestion batch.
+    """
+    try:
+        rows = (
+            db.query(Company.name)
+            .filter(Company.name.isnot(None))
+            .limit(limit)
+            .all()
+        )
+        return [row[0] for row in rows if row[0]]
+    except Exception:  # noqa: BLE001 - resolution is an enhancement, never a blocker
+        return []
+
+
+def find_or_create_company(db, name: str, domain: Optional[str] = None):
+    """Find-or-create the employer for an ingestion path, honouring the blocklist (finding 43).
+
+    Returns ``(company, created)``, or ``(None, False)`` when the name/domain is blocklisted.
+    Ingestion callers must skip the posting in that case: the ATS path already did, and every
+    other channel used to re-create the excluded employer.
+    """
+    if is_company_excluded(name, domain or "", db):
+        return None, False
+    company = db.query(Company).filter(Company.name.ilike(name)).first()
+    if company:
+        return company, False
+    company = Company(name=name, domain=domain)
+    db.add(company)
+    db.flush()
+    return company, True
+
+
 engine = None
 SessionLocal = None
 
@@ -711,43 +800,21 @@ def _enable_sqlite_pragmas(target_engine) -> None:
             cursor.close()
 
 
-def init_db(custom_url: str = None):
-    global engine, SessionLocal
-    target_url = custom_url or DATABASE_URL
-    
-    if not custom_url:
-        try:
-            test_engine = create_engine(
-                target_url, pool_pre_ping=True, **_sqlite_connect_args(target_url)
-            )
-            with test_engine.connect() as conn:
-                pass
-            engine = test_engine
-        except Exception:
-            engine = create_engine(SQLITE_URL, **_sqlite_connect_args(SQLITE_URL))
-    else:
-        engine = create_engine(target_url, **_sqlite_connect_args(target_url))
+def _auto_migrate(engine) -> None:
+    """Adds columns and indexes that ``create_all`` does not add to an existing table.
 
-    _enable_sqlite_pragmas(engine)
-
-    # Try creating vector extension if PostgreSQL
-    if engine.dialect.name == "postgresql":
-        try:
-            from sqlalchemy import text
-            with engine.begin() as conn:
-                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
-        except Exception:
-            pass
-
-    Base.metadata.create_all(bind=engine)
-
+    Each table is migrated in its own try/except: one failing statement used to abort every
+    later migration and log a single WARNING, leaving the process running against a
+    half-migrated schema with no indication of which table was at fault.
+    """
     # Lightweight schema auto-migration for existing SQLite/PostgreSQL databases
-    try:
-        from sqlalchemy import inspect, text
-        inspector = inspect(engine)
-        existing_tables = inspector.get_table_names()
+    from sqlalchemy import inspect, text
 
-        if "operation_logs" in existing_tables:
+    inspector = inspect(engine)
+    existing_tables = inspector.get_table_names()
+
+    if "operation_logs" in existing_tables:
+        try:
             col_names = {c["name"] for c in inspector.get_columns("operation_logs")}
             with engine.begin() as conn:
                 if "prompt_tokens" not in col_names:
@@ -758,15 +825,21 @@ def init_db(custom_url: str = None):
                     conn.execute(text("ALTER TABLE operation_logs ADD COLUMN timestamp DATETIME;"))
                     conn.execute(text("UPDATE operation_logs SET timestamp = created_at WHERE timestamp IS NULL;"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_operation_logs_created_at ON operation_logs (created_at);"))
+        except Exception as mig_err:
+            logger.error(f"Schema auto-migration failed for table 'operation_logs': {mig_err}")
 
-        if "application_events" in existing_tables:
+    if "application_events" in existing_tables:
+        try:
             col_names = {c["name"] for c in inspector.get_columns("application_events")}
             with engine.begin() as conn:
                 if "created_at" not in col_names and "timestamp" in col_names:
                     conn.execute(text("ALTER TABLE application_events ADD COLUMN created_at DATETIME;"))
                     conn.execute(text("UPDATE application_events SET created_at = timestamp WHERE created_at IS NULL;"))
+        except Exception as mig_err:
+            logger.error(f"Schema auto-migration failed for table 'application_events': {mig_err}")
 
-        if "resumes" in existing_tables:
+    if "resumes" in existing_tables:
+        try:
             col_names = {c["name"] for c in inspector.get_columns("resumes")}
             with engine.begin() as conn:
                 if "parser_version" not in col_names:
@@ -792,8 +865,11 @@ def init_db(custom_url: str = None):
                         text("UPDATE resumes SET fingerprint = :fp WHERE id = :rid"),
                         {"fp": fingerprint, "rid": resume_id},
                     )
+        except Exception as mig_err:
+            logger.error(f"Schema auto-migration failed for table 'resumes': {mig_err}")
 
-        if "jobs" in existing_tables:
+    if "jobs" in existing_tables:
+        try:
             col_names = {c["name"] for c in inspector.get_columns("jobs")}
             with engine.begin() as conn:
                 if "is_ghost_job" not in col_names:
@@ -835,25 +911,55 @@ def init_db(custom_url: str = None):
                     conn.execute(text("ALTER TABLE jobs ADD COLUMN match_gaps_json TEXT;"))
                 if "match_partials_json" not in col_names:
                     conn.execute(text("ALTER TABLE jobs ADD COLUMN match_partials_json TEXT;"))
+                if "requisition_id" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN requisition_id VARCHAR(64);"))
+                    conn.execute(
+                        text("CREATE INDEX IF NOT EXISTS ix_jobs_requisition_id ON jobs (requisition_id);")
+                    )
+                if "requisition_source" not in col_names:
+                    conn.execute(text("ALTER TABLE jobs ADD COLUMN requisition_source VARCHAR(32);"))
+                # Hot query paths (finding 9): URL-keyed dedupe on every ingested posting, an
+                # unbounded created_at ORDER BY, and company joins. create_all only builds these
+                # for a fresh database, so existing ones are migrated here.
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_url ON jobs (url);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_created_at ON jobs (created_at);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_jobs_company_id ON jobs (company_id);"))
+        except Exception as mig_err:
+            logger.error(f"Schema auto-migration failed for table 'jobs': {mig_err}")
 
-        if "companies" in existing_tables:
+    if "pending_email_applications" in existing_tables:
+        try:
+            col_names = {c["name"] for c in inspector.get_columns("pending_email_applications")}
+            with engine.begin() as conn:
+                if "message_id" not in col_names:
+                    conn.execute(text("ALTER TABLE pending_email_applications ADD COLUMN message_id VARCHAR(255);"))
+                if "thread_id" not in col_names:
+                    conn.execute(text("ALTER TABLE pending_email_applications ADD COLUMN thread_id VARCHAR(255);"))
+        except Exception as mig_err:
+            logger.error(f"Schema auto-migration failed for table 'pending_email_applications': {mig_err}")
+
+    if "companies" in existing_tables:
+        try:
             col_names = {c["name"] for c in inspector.get_columns("companies")}
             with engine.begin() as conn:
                 if "market_position" not in col_names:
                     conn.execute(text("ALTER TABLE companies ADD COLUMN market_position TEXT;"))
                 if "talking_points" not in col_names:
                     conn.execute(text("ALTER TABLE companies ADD COLUMN talking_points TEXT;"))
+        except Exception as mig_err:
+            logger.error(f"Schema auto-migration failed for table 'companies': {mig_err}")
 
-        # Vector-space identity for every table that stores embeddings.
-        for vector_table in (
-            "jobs",
-            "resumes",
-            "resume_chunks",
-            "application_question_answers",
-            "dismissed_job_patterns",
-        ):
-            if vector_table not in existing_tables:
-                continue
+    # Vector-space identity for every table that stores embeddings.
+    for vector_table in (
+        "jobs",
+        "resumes",
+        "resume_chunks",
+        "application_question_answers",
+        "dismissed_job_patterns",
+    ):
+        if vector_table not in existing_tables:
+            continue
+        try:
             col_names = {c["name"] for c in inspector.get_columns(vector_table)}
             with engine.begin() as conn:
                 if "embedding_model" not in col_names:
@@ -864,14 +970,32 @@ def init_db(custom_url: str = None):
                     conn.execute(
                         text(f"ALTER TABLE {vector_table} ADD COLUMN embedding_dim INTEGER;")
                     )
+        except Exception as mig_err:
+            logger.error(f"Schema auto-migration failed for table '{vector_table}': {mig_err}")
 
-        if "user_preferences" in existing_tables:
+    if "user_preferences" in existing_tables:
+        try:
             col_names = {c["name"] for c in inspector.get_columns("user_preferences")}
             with engine.begin() as conn:
                 if "timezone" not in col_names:
                     conn.execute(text("ALTER TABLE user_preferences ADD COLUMN timezone VARCHAR(64) DEFAULT '';"))
                 if "excluded_companies" not in col_names:
-                    conn.execute(text("ALTER TABLE user_preferences ADD COLUMN excluded_companies TEXT DEFAULT 'amazon';"))
+                    # DDL cannot take a bound parameter in DEFAULT; escape any quote in the seed
+                    # so a future blocklist that contains an apostrophe cannot break the ALTER.
+                    seed_literal = DEFAULT_EXCLUDED_COMPANIES.replace("'", "''")
+                    conn.execute(text(
+                        "ALTER TABLE user_preferences ADD COLUMN excluded_companies TEXT "
+                        f"DEFAULT '{seed_literal}';"
+                    ))
+                # Upgrade rows that still hold the previous seed verbatim. A list the operator has
+                # edited no longer equals it, so their own blocklist is never overwritten.
+                conn.execute(
+                    text(
+                        "UPDATE user_preferences SET excluded_companies = :seed "
+                        "WHERE lower(trim(excluded_companies)) = 'amazon';"
+                    ),
+                    {"seed": DEFAULT_EXCLUDED_COMPANIES},
+                )
                 if "consents_json" not in col_names:
                     conn.execute(text("ALTER TABLE user_preferences ADD COLUMN consents_json TEXT DEFAULT '{}';"))
                 if "scoring_config_json" not in col_names:
@@ -880,14 +1004,62 @@ def init_db(custom_url: str = None):
                     conn.execute(text("ALTER TABLE user_preferences ADD COLUMN skip_topics TEXT DEFAULT '';"))
                 if "extra_skills_json" not in col_names:
                     conn.execute(text("ALTER TABLE user_preferences ADD COLUMN extra_skills_json TEXT DEFAULT '[]';"))
+        except Exception as mig_err:
+            logger.error(f"Schema auto-migration failed for table 'user_preferences': {mig_err}")
 
-        if "dismissed_job_patterns" in existing_tables:
+    if "dismissed_job_patterns" in existing_tables:
+        try:
             col_names = {c["name"] for c in inspector.get_columns("dismissed_job_patterns")}
             with engine.begin() as conn:
                 if "company_name" not in col_names:
                     conn.execute(text("ALTER TABLE dismissed_job_patterns ADD COLUMN company_name VARCHAR(255);"))
-    except Exception as mig_err:
-        logger.warning(f"Schema auto-migration skipped: {mig_err}")
+        except Exception as mig_err:
+            logger.error(f"Schema auto-migration failed for table 'dismissed_job_patterns': {mig_err}")
+
+
+def init_db(custom_url: str = None):
+    global engine, SessionLocal
+    target_url = custom_url or DATABASE_URL
+    
+    if not custom_url:
+        try:
+            test_engine = create_engine(
+                target_url, pool_pre_ping=True, **_sqlite_connect_args(target_url)
+            )
+            with test_engine.connect() as conn:
+                pass
+            engine = test_engine
+        except Exception as exc:
+            if target_url != SQLITE_URL:
+                # An explicitly configured database that cannot be reached must not silently
+                # become a different, empty one: every write would land in the wrong file and
+                # the operator would read a stale database with no indication.
+                logger.error(
+                    f"DATABASE_URL is set but unreachable ({exc}); refusing to fall back to "
+                    f"{SQLITE_URL}. Fix the URL or unset it to use SQLite."
+                )
+                raise
+            logger.warning(
+                f"Default database unreachable ({exc}); falling back to {SQLITE_URL}."
+            )
+            engine = create_engine(SQLITE_URL, **_sqlite_connect_args(SQLITE_URL))
+    else:
+        engine = create_engine(target_url, **_sqlite_connect_args(target_url))
+
+    _enable_sqlite_pragmas(engine)
+
+    # Try creating vector extension if PostgreSQL
+    if engine.dialect.name == "postgresql":
+        try:
+            from sqlalchemy import text
+            with engine.begin() as conn:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+        except Exception:
+            pass
+
+    Base.metadata.create_all(bind=engine)
+
+    _auto_migrate(engine)
 
     global SessionLocal
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -941,7 +1113,7 @@ def get_db():
         db.close()
 
 
-def prune_operation_logs(db, max_rows: int = None, retention_days: int = None) -> int:
+def prune_operation_logs(db=None, max_rows: int = None, retention_days: int = None) -> int:
     """
     Rotates the operation_logs table so it never grows unbounded:
       1. Deletes rows older than the retention window.
@@ -950,44 +1122,55 @@ def prune_operation_logs(db, max_rows: int = None, retention_days: int = None) -
     Safe to call periodically. It removes only the OLDEST rows (lowest ids) which are already
     reflected in the persisted cumulative token counters, so token stats are not lost.
     Returns the number of pruned rows.
+
+    This function OWNS its transaction: it commits or rolls back whatever session it is given,
+    so it must not be handed a session that is mid-transaction. Callers that omit ``db`` get a
+    short-lived session that is closed here.
     """
+    session = db
+    owns_session = session is None
+    if owns_session:
+        session = SessionLocal()
     max_rows = OPERATION_LOG_MAX_ROWS if max_rows is None else max_rows
     retention_days = OPERATION_LOG_RETENTION_DAYS if retention_days is None else retention_days
     deleted = 0
     try:
         if retention_days and retention_days > 0:
             cutoff = utc_now() - datetime.timedelta(days=retention_days)
-            deleted += db.query(OperationLog).filter(
+            deleted += session.query(OperationLog).filter(
                 OperationLog.created_at < cutoff
             ).delete(synchronize_session=False)
 
         if max_rows and max_rows > 0:
-            total = db.query(OperationLog).count()
+            total = session.query(OperationLog).count()
             if total > max_rows:
                 excess = total - max_rows
                 old_ids = [
                     row[0] for row in
-                    db.query(OperationLog.id)
+                    session.query(OperationLog.id)
                       .order_by(OperationLog.created_at.asc())
                       .limit(excess).all()
                 ]
                 if old_ids:
-                    deleted += db.query(OperationLog).filter(
+                    deleted += session.query(OperationLog).filter(
                         OperationLog.id.in_(old_ids)
                     ).delete(synchronize_session=False)
 
         if deleted:
-            db.commit()
+            session.commit()
             logger.info(
                 f"Operation-log rotation pruned {deleted} row(s) "
                 f"(max_rows={max_rows}, retention_days={retention_days})."
             )
         else:
-            db.rollback()
+            session.rollback()
     except Exception as e:
         try:
-            db.rollback()
+            session.rollback()
         except Exception:
             pass
         logger.warning(f"Operation-log rotation failed: {e}")
+    finally:
+        if owns_session:
+            session.close()
     return deleted

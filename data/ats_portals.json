@@ -143,6 +143,30 @@
       "risk_tier": "opt_in",
       "default_flag": "ats_workday",
       "enabled_by_default": false
+    },
+    {
+      "id": "adp_workforce_now",
+      "label": "ADP Workforce Now Portal",
+      "shape": "paginated_json",
+      "variant": "adp",
+      "slug_from": "adp_workforce_now",
+      "list_url": "https://workforcenow.adp.com/mascsr/default/careercenter/public/events/staffing/v1/job-requisitions?cid={cid}&ccId={ccId}&lang={lang}",
+      "response_path": "jobRequisitions",
+      "total_path": "meta.totalNumber",
+      "title_path": "requisitionTitle",
+      "page_size": 50,
+      "max_pages": 5,
+      "detail": {
+        "url": "https://workforcenow.adp.com/mascsr/default/careercenter/public/events/staffing/v1/job-requisitions/{id}?cid={cid}&ccId={ccId}&lang={lang}",
+        "desc_paths": [
+          "requisitionDescription"
+        ],
+        "html": true
+      },
+      "pacing_seconds": 1.0,
+      "risk_tier": "opt_in",
+      "default_flag": "ats_adp",
+      "enabled_by_default": false
     }
   ]
 }

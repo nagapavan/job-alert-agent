@@ -154,3 +154,105 @@ class TestTaskAPIEndpoints:
         assert "llm_queue" in data
         assert "queue_depth" in data["llm_queue"]
         assert "max_concurrency" in data["llm_queue"]
+
+
+class TestQueueAdmission:
+    """RUNNING means a worker slot is held, and a queued task can be given up (finding 10)."""
+
+    def test_a_blocked_task_is_queued_not_running(self):
+        engine = BackgroundTaskEngine(max_concurrent_tasks=1, queue_timeout_seconds=1.0)
+        gate = threading.Event()
+        started = threading.Event()
+
+        def slow_worker(cancel_token=None, progress_cb=None):
+            started.set()
+            gate.wait(3.0)
+            return {}
+
+        first = engine.submit_task("test", "First", slow_worker)
+        assert started.wait(2.0)
+        second = engine.submit_task("test", "Second", slow_worker)
+
+        time.sleep(0.1)
+        assert engine.get_task(first).status == TaskStatus.RUNNING
+        assert engine.get_task(second).status == TaskStatus.QUEUED
+
+        gate.set()
+        assert engine.get_task(first) is not None
+
+    def test_waiting_past_the_timeout_cancels_instead_of_running(self):
+        engine = BackgroundTaskEngine(max_concurrent_tasks=1, queue_timeout_seconds=0.2)
+        gate = threading.Event()
+        started = threading.Event()
+
+        def slow_worker(cancel_token=None, progress_cb=None):
+            started.set()
+            gate.wait(3.0)
+            return {}
+
+        engine.submit_task("test", "First", slow_worker)
+        assert started.wait(2.0)
+        second = engine.submit_task("test", "Second", slow_worker)
+
+        deadline = time.time() + 3.0
+        while time.time() < deadline and engine.get_task(second).status != TaskStatus.CANCELLED:
+            time.sleep(0.05)
+
+        assert engine.get_task(second).status == TaskStatus.CANCELLED
+        assert "no worker slot" in engine.get_task(second).step_label
+        gate.set()
+
+    def test_cancel_while_queued_never_executes_the_work(self):
+        engine = BackgroundTaskEngine(max_concurrent_tasks=1, queue_timeout_seconds=5.0)
+        gate = threading.Event()
+        started = threading.Event()
+        ran = threading.Event()
+
+        def slow_worker(cancel_token=None, progress_cb=None):
+            started.set()
+            gate.wait(3.0)
+            return {}
+
+        def should_not_run(cancel_token=None, progress_cb=None):
+            ran.set()
+            return {}
+
+        engine.submit_task("test", "First", slow_worker)
+        assert started.wait(2.0)
+        second = engine.submit_task("test", "Second", should_not_run)
+        assert engine.cancel_task(second)
+
+        gate.set()
+        deadline = time.time() + 3.0
+        while time.time() < deadline and engine.get_task(second).status != TaskStatus.CANCELLED:
+            time.sleep(0.05)
+
+        assert engine.get_task(second).status == TaskStatus.CANCELLED
+        assert not ran.is_set()
+
+
+class TestEventStreamBinding:
+    def test_clear_event_loop_forgets_only_its_own_loop(self):
+        engine = BackgroundTaskEngine(max_concurrent_tasks=1)
+        older = MagicMock()
+        newer = MagicMock()
+        engine.set_event_loop(newer)
+        engine.clear_event_loop(older)
+        assert engine._loop is newer
+        engine.clear_event_loop(newer)
+        assert engine._loop is None
+
+    def test_broadcast_failure_is_logged_not_swallowed(self, caplog):
+        engine = BackgroundTaskEngine(max_concurrent_tasks=1)
+        closed = MagicMock()
+        closed.put_nowait.side_effect = RuntimeError("queue closed")
+        engine.register_subscriber(closed)
+        progress = TaskProgress(task_id="tsk_x", task_type="t", task_name="n")
+
+        with caplog.at_level("WARNING"):
+            engine._broadcast_event(progress)
+
+        assert any(
+            "broadcast failed" in record.getMessage().lower()
+            for record in caplog.records
+        )

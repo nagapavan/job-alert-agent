@@ -49,24 +49,43 @@ Replace/augment the browser-session Gmail scan with the official **Gmail API**, 
 
 ## 4. Query & fetch strategy (anti-"read-all-mail" core)
 
-- Single, code-owned query (not user free-form). Label scope is **all mail** (no `labelIds`
-  ⇒ Inbox, Updates, Promotions, Social, and user labels; Gmail itself excludes Spam/Trash),
-  kept narrow by the sender/subject terms:
+- Two code-owned queries (not user free-form), because alert digests arrive several times a day
+  and used to occupy a single 100-message window, starving the status mail behind them.
+  Label scope is **all mail** for both (no `labelIds` ⇒ Inbox, Updates, Promotions, Social, and
+  user labels; Gmail itself excludes Spam/Trash), kept narrow by the sender/subject terms:
   ```
-  newer_than:90d (from:greenhouse.io OR from:lever.co OR from:ashbyhq.com
+  # status + recruiter outreach (alerts excluded)
+  <window> (from:greenhouse.io OR from:lever.co OR from:ashbyhq.com
    OR from:myworkdayjobs.com OR from:workday.com OR from:smartrecruiters.com
-   OR from:workable.com OR from:icims.com OR from:taleo.net OR from:linkedin.com
+   OR from:workable.com OR from:icims.com OR from:taleo.net
+   OR from:hit-reply@linkedin.com OR from:inmail-hit-reply@linkedin.com
+   OR from:messages-noreply@linkedin.com OR from:messaging-digest-noreply@linkedin.com
+   OR from:googlealerts-noreply@google.com
    OR subject:interview OR subject:offer OR subject:"next steps"
-   OR subject:regret OR subject:"not moving forward"
-   OR subject:"job alert" OR subject:opportunity OR subject:application)
+   OR subject:regret OR subject:"not moving forward" OR subject:application
+   # employer career-portal digests
+   OR subject:"new job" OR subject:"new jobs" OR subject:"job match"
+   OR subject:"jobs for you" OR subject:"top jobs" OR subject:"match your search"
+   OR subject:"open positions" OR subject:"career opportunities"
+   OR subject:"job opportunity" ...)
+   -from:jobalerts-noreply@linkedin.com -from:jobs-noreply@linkedin.com
+   -from:googlealerts-noreply@google.com
+
+  # alert digests only (own window and cap)
+  <window> (from:jobalerts-noreply@linkedin.com OR from:jobs-noreply@linkedin.com
+   OR from:googlealerts-noreply@google.com)
   ```
-- The browser fallback (`scan_gmail_for_job_alerts`) mirrors this: it navigates straight to the
-  global `#search/` view (mailbox-wide, not the inbox) and reads 2 result pages (≈80 emails).
-- `users().messages().list(userId="me", q=QUERY, maxResults=50, fields="messages/id,nextPageToken")`,
-  page-capped (e.g., max 2 pages).
+- `<window>` is the stored watermark (`after:YYYY/MM/DD`, minus one day of overlap) or, on a first
+  run, `newer_than:<GMAIL_STATUS_WINDOW_DAYS|GMAIL_ALERT_WINDOW_DAYS>d` (defaults 90 / 7).
+  Watermarks live in `data/gmail_sync_state.json` (`{"status": {...}, "alerts": {...}}`) and only
+  advance for a pass that ran to completion.
+- Caps are per pass and env-tunable: `GMAIL_STATUS_MAX_MESSAGES` (500) and
+  `GMAIL_ALERT_MAX_MESSAGES` (200); `messages.list` pages at 500 and pages further via `pageToken`.
+- The browser fallback (`scan_gmail_for_job_alerts`) mirrors the status query: it navigates straight
+  to the global `#search/` view (mailbox-wide, not the inbox) and reads 2 result pages (≈80 emails).
+  It runs only when the API is not connected, raises, or matches nothing on a *first* alert pass.
 - Per message: `messages().get(userId="me", id=..., format="metadata",
   metadataHeaders=["From","Subject","Date"])` → returns headers + `snippet`. Batch requests.
-- Optional small "extra senders" allowlist (still combined into the narrow `q`).
 
 ## 5. Incremental sync & dedup
 
@@ -75,13 +94,47 @@ Replace/augment the browser-session Gmail scan with the official **Gmail API**, 
 - Dedup by Gmail `messageId` via a small table `ProcessedEmail(id, message_id UNIQUE, processed_at)`
   (auto-migrated in `init_db()` per project conventions). Prevents duplicate events.
 
+### Optional manual labelling (not required by the app)
+
+The queries do not depend on labels, so these filters are only for mailbox hygiene:
+
+```
+from:(jobalerts-noreply@linkedin.com OR jobs-noreply@linkedin.com OR googlealerts-noreply@google.com)
+subject:("is hiring" OR "job alert" OR "new jobs")   → label "Job Alerts"
+
+from:(hit-reply@linkedin.com OR inmail-hit-reply@linkedin.com OR messages-noreply@linkedin.com)
+                                                     → label "Recruiter Outreach"
+```
+
 ## 6. Classification & DB mapping (reuse existing logic)
 
 - `parse_email_classification(subject, snippet, sender)` → `interview | rejection | application_received | job_alert`.
-- `job_alert` → `parse_google_alerts_digest` → ingest new jobs (as today).
+  `EMAIL_ALERT_PHRASES` mirrors the digest subject cues from §4, so the query and the classifier
+  agree: mail that is fetched because of its subject is not then dropped as `general`.
+- `job_alert` → `parse_linkedin_alert_cards` for the LinkedIn alert senders (capped at
+  `ALERT_DIGEST_MAX_JOBS` = 5 postings per digest), else `parse_google_alerts_digest` → ingest new
+  jobs. The Google parser is gated to the Google Alerts sender (`is_google_alerts_sender`): it reads
+  Google's own block format, and on an employer digest it invents rows out of prose.
+- A LinkedIn *message* notification (recruiter outreach) that only looks like a status event
+  because of body text ("next steps") is demoted to `job_alert` unless the subject carries the cue
+  or the thread already names a tracked application.
+- Interview-scheduling vendors (`goodtime.io`, `modernloop.io`, `calendly.com`, `hirevue.com`, …)
+  are relays: the employer is recovered from the subject ("your <Employer> virtual interview"),
+  and a relay mail whose employer cannot be resolved is staged, never filed under the vendor.
+  Enterprise recruiting clouds are relays for the same reason — `cloud.oracle.com` and
+  `successfactors.com` are tenant hosts, so `<tenant>.cloud.oracle.com` is not the employer
+  (the bare `oracle.com` is *not* blocked, so genuine Oracle mail still resolves). A career-portal
+  digest relayed by an ATS resolves the employer from the subject shape "new jobs? at <Employer>".
 - `interview | rejection | application_received` → `extract_company_and_role_from_email_header` →
   match existing `Job`, update status, write `ApplicationEvent` (same behavior as
-  `sync_email_application_events`, minus the browser).
+  `sync_email_application_events`, minus the browser). Markup is stripped from the snippet before
+  extraction: a text/plain alert body sometimes still carries HTML, which otherwise ends up inside
+  the extracted role.
+- **Multi-posting digests are fetched but not ingested.** Career-portal mail that lists several
+  roles in its own template (Google Careers, EY Job Alerts, Microsoft Careers, Bell, …) now matches
+  the query and classifies as `job_alert`, but a single-role extraction cannot read those bodies,
+  so the message is left unprocessed rather than guessed at. A per-template parser (cap 5 postings
+  per digest, reusing `header_segments.classify_segment`) is the follow-up in `OPEN_ISSUES.md`.
 
 ## 7. Integration points
 
@@ -109,6 +162,10 @@ Replace/augment the browser-session Gmail scan with the official **Gmail API**, 
 
 - Mock `googleapiclient.discovery.build`; no live Google calls.
 - Unit: query builder, metadata parsing, classification→event mapping, dedup, token encryption.
+- Digest suites: `tests/test_header_segments.py` (segment typing), `tests/test_linkedin_digest.py`
+  (card parsing, cap), `tests/test_employer_digests.py` (career-portal subjects → `job_alert`,
+  query cues, relay employer from the subject, markup stripping, Google-parser gating).
+  Fixtures are synthetic mail shaped like the real templates — never a checked-in inbox sample.
 - Endpoint: connect URL generation, callback token exchange (mocked), sync with mocked service,
   disabled-flag path.
 

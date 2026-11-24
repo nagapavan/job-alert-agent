@@ -489,8 +489,14 @@ class PreferenceFilter:
                 for raw_line in description.splitlines():
                     if not raw_line.strip():
                         continue
-                    if len(raw_line.split()) <= 8 and section_intent.is_must_have_heading(raw_line):
-                        in_must_have = True
+                    if len(raw_line.split()) <= 8:
+                        if section_intent.is_must_have_heading(raw_line):
+                            in_must_have = True
+                        elif section_intent.classify_heading(raw_line) != "unknown":
+                            # A recognised non-must-have heading ends the section: a skip
+                            # topic under responsibilities/perks must not reject the posting
+                            # (finding 94).
+                            in_must_have = False
                     if not in_must_have:
                         continue
                     line_lower = raw_line.lower()

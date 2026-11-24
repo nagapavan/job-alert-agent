@@ -7,7 +7,7 @@
 candidate filters are applied, and how it verifies that a tracked requisition is still open.
 
 **Related docs:** [`../DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) (DFD 1 discovery, DFD 6
-external sync), [`../AGENTS.md`](../AGENTS.md) §9–§11 (schema, performance, security),
+external sync), [`../PROJECT_STRUCTURE.md`](../PROJECT_STRUCTURE.md) §9 (schema) and [`../DESIGN.md`](../DESIGN.md) §10–§11 (performance, security),
 [`../PROJECT_INDEX.md`](../PROJECT_INDEX.md) (file responsibilities).
 
 ---
@@ -43,6 +43,9 @@ external sync), [`../AGENTS.md`](../AGENTS.md) §9–§11 (schema, performance, 
 | Tokenized application-status page | ✅ `check_greenhouse_application_status` | ❌ (not public) | ❌ (not public) | ❌ | ❌ | ❌ | ❌ | ❌ |
 | External-sync source (`POST /api/applications/sync-external`) | ✅ | ✅ | 🗺️ | ✅ | 🗺️ | ❌ | ❌ | 🗺️ |
 
+ADP Workforce Now (opt-in) supports list/detail discovery only: no requisition-active probe and
+no external-sync source, because the career-centre API exposes neither.
+
 Scrapers live in `backend/scraper.py`; discovery is dispatched from
 `backend/main.py::trigger_jobs_scrape` (`POST /api/jobs/scrape`); external status sync is
 `backend/main.py::sync_external_applications` (`POST /api/applications/sync-external`).
@@ -52,9 +55,9 @@ Scrapers live in `backend/scraper.py`; discovery is dispatched from
 | Tier | Portals | Default | Rationale |
 | :--- | :--- | :--- | :--- |
 | **Low** (public, documented APIs) | Greenhouse, Lever, Ashby | **on** | Public/no-auth; Lever explicitly permits scraping published postings |
-| **Medium** (unofficial/ambiguous) | SmartRecruiters, Workable, Workday, Uber, custom HTML | **off — opt-in with consent** | Unofficial endpoints, or ToS that restrict automated agents |
+| **Medium** (unofficial/ambiguous) | SmartRecruiters, Workable, Workday, ADP Workforce Now, Uber, custom HTML | **off — opt-in with consent** | Unofficial endpoints, or ToS that restrict automated agents |
 | **Session-driven** | LinkedIn, Gmail | **off** | Requires the user's logged-in session / inbox; ToS + account risk |
-| **Blocklisted** | `UserPreference.excluded_companies` (default `amazon`) | **never scanned** | Amazon Conditions of Use + Agent Policy restrict automated/agent access |
+| **Blocklisted** | `UserPreference.excluded_companies` (seeded: `amazon`, `booking.com`, `ebay`, `heineken`, `target.com`) | **never scanned** | Each seeded employer's own terms forbid automated/AI-agent access to its site |
 
 Control surfaces: `UserPreference.features_json` (per-portal flags) and
 `UserPreference.excluded_companies`, both exposed via `GET/PUT /api/preferences` and the SPA
@@ -82,11 +85,17 @@ until one returns jobs:
 
 ```
 Uber special-case (if name contains "uber")
-  -> Greenhouse -> Lever -> Ashby -> SmartRecruiters -> Workable -> Workday -> custom HTML
+  -> Greenhouse -> Lever -> Ashby -> SmartRecruiters -> Workable -> Workday -> ADP Workforce Now -> custom HTML
 ```
 
 Each portal scraper is independent and returns a list of job dicts. A company is not retried
 against a later portal once an earlier one yields results.
+
+**Tenant-pinned portals** (Workday, ADP Workforce Now) additionally pin the scan: when a company's
+`careers_url` is on the portal's own host (`*.myworkdayjobs.com`, `workforcenow.adp.com`), only
+that portal runs for it. Both resolvers parse the tenant out of the URL (`{tenant}/{site}` for
+Workday, `cid`/`ccId` for ADP) and return nothing when it is missing, so a scan never queries a
+guessed tenant — the company is simply skipped until a real board URL is set.
 
 ### 3.2 Scraper contract
 
@@ -232,6 +241,7 @@ Legend: **Auth** = needs a key; **Format** = response body; **Filters** = server
 | SmartRecruiters | `GET api.smartrecruiters.com/v1/companies/{id}/postings` (+ per-posting detail) | `limit`/`offset` pagination only | 🗺️ single-posting `active` |
 | Workable | `GET apply.workable.com/api/v1/widget/accounts/{slug}?details=true` | none | 🗺️ |
 | Workday | `POST {tenant}.{shard}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs` (+ detail) | `limit`/`offset` in the JSON body | 🗺️ |
+| ADP Workforce Now | `GET workforcenow.adp.com/mascsr/default/careercenter/public/events/staffing/v1/job-requisitions?cid=&ccId=` (+ `/{itemID}` detail) | `$skip`/`$top`, total in `meta.totalNumber` | n/a |
 | Uber | `POST uber.com/api/loadSearchJobsResults` | none | n/a |
 | Custom | `GET {careers_url}` + `<a>` heuristics | n/a | n/a |
 
@@ -335,8 +345,8 @@ Run: `./.venv/bin/pytest -q tests/test_scraper.py tests/test_application_trackin
   `JOB_ALERT_AGENT_RESPECT_ROBOTS=false` at your own risk). Public ATS JSON APIs keep a standard
   UA because they are documented, machine-facing endpoints.
   - Note: Google's `robots.txt` disallows `/search`, so the direct Google-for-Jobs HTML fetch is
-    skipped when robots is respected. Use the opt-in JobSpy source or the browser-session fetcher
-    as alternatives.
+    skipped when robots is respected. The opt-in Playwright browser path is the supported
+    alternative (a third-party aggregator was removed in 2026-11).
   - **Anti-bot blocking is expected, not exceptional (issue #104).** Google serves
     `/sorry/index?continue=...` once an egress address looks automated. The runner detects it as the
     `blocked` outcome, stops the query loop on the first hit, and persists a cooldown

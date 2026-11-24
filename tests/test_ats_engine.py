@@ -593,3 +593,131 @@ def test_blocked_host_is_reported_once_per_run(monkeypatch, caplog):
     with caplog.at_level(_logging.INFO, logger="scraper.ats"):
         _http("GET", "https://api.smartrecruiters.com/v1/companies/stripe/postings", cfg=cfg)
     assert len([r for r in caplog.records if r.levelno == _logging.INFO]) == 1
+
+
+# -------------------------------------------------------------
+# ADP Workforce Now variant (opt-in): $skip/$top + ExternalJobID URL
+# -------------------------------------------------------------
+def _adp_cfg():
+    return next(c for c in load_portal_configs() if c.id == "adp_workforce_now")
+
+
+def _adp_list_row(item_id="9201112035750_71", external_id="589285", title="Principal Software Engineer"):
+    return {
+        "itemID": item_id,
+        "clientRequisitionID": "1427",
+        "requisitionTitle": title,
+        "postDate": "2026-10-30",
+        "workLevelCode": {"shortName": "Full Time"},
+        "requisitionLocations": [
+            {"aliasNames": ["Remote India, IN"], "address": {"cityName": "Remote"}}
+        ],
+        "customFieldGroup": {
+            "stringFields": [{"name": "ExternalJobID", "value": external_id}]
+        },
+    }
+
+
+def test_adp_portal_is_opt_in_by_default():
+    from backend.database import DEFAULT_FEATURE_FLAGS
+
+    assert _adp_cfg().default_flag == "ats_adp"
+    assert DEFAULT_FEATURE_FLAGS["ats_adp"] is False
+
+
+@patch("backend.ats.engine.requests.get")
+def test_adp_list_and_detail_build_title_location_description_and_url(mock_get):
+    list_payload = {
+        "jobRequisitions": [_adp_list_row()],
+        "meta": {"startSequence": 0, "totalNumber": 1},
+    }
+    detail_payload = {
+        "requisitionTitle": "Principal Software Engineer",
+        "requisitionDescription": "<p>Strong expertise in Ruby on Rails.</p>",
+        "requisitionLocations": [{"aliasNames": ["Remote India, IN"]}],
+        "customFieldGroup": {"stringFields": [{"name": "ExternalJobID", "value": "589285"}]},
+    }
+
+    def _fake_get(url, headers=None, timeout=None, params=None):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = detail_payload if "/job-requisitions/" in url else list_payload
+        return resp
+
+    mock_get.side_effect = _fake_get
+
+    jobs = run_portal(
+        _adp_cfg(),
+        company_name="Acme",
+        careers_url="https://workforcenow.adp.com/mascsr/default/mdf/recruitment/recruitment.html?cid=abc123&ccId=19000101_000001",
+    )
+
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job["title"] == "Principal Software Engineer"
+    assert "Remote India, IN" in job["location"]
+    assert "Ruby on Rails" in job["description"]
+    assert "<" not in job["description"]
+    assert "jobId=589285" in job["url"]
+    assert "cid=abc123" in job["url"]
+    assert job["source"] == "ADP Workforce Now Portal"
+    # Pagination is ADP's $skip/$top, not limit/offset.
+    list_params = mock_get.call_args_list[0].kwargs.get("params") or {}
+    assert list_params.get("$skip") == 0
+    assert list_params.get("$top") == 50
+
+
+@patch("backend.ats.engine.requests.get")
+def test_adp_paginates_until_meta_total_number(mock_get):
+    def _page(skip):
+        rows = [
+            _adp_list_row(item_id=f"item_{skip}_{i}", external_id=f"ext{skip}{i}", title=f"Engineer {skip}-{i}")
+            for i in range(2)
+        ]
+        return {"jobRequisitions": rows, "meta": {"startSequence": skip, "totalNumber": 120}}
+
+    def _fake_get(url, headers=None, timeout=None, params=None):
+        resp = MagicMock()
+        resp.status_code = 200
+        if "/job-requisitions/" in url:
+            resp.json.return_value = {"requisitionDescription": "<p>JD</p>"}
+        else:
+            resp.json.return_value = _page((params or {}).get("$skip", 0))
+        return resp
+
+    mock_get.side_effect = _fake_get
+
+    jobs = run_portal(
+        _adp_cfg(),
+        company_name="Acme",
+        careers_url="https://workforcenow.adp.com/mascr/default/mdf/recruitment/recruitment.html?cid=abc123",
+        max_matches=50,
+    )
+
+    skips = [
+        (c.kwargs.get("params") or {}).get("$skip")
+        for c in mock_get.call_args_list
+        if (c.kwargs.get("params") or {}).get("$skip") is not None
+    ]
+    assert skips[:3] == [0, 50, 100]
+    assert len(jobs) == 6
+
+
+@patch("backend.ats.engine.requests.get")
+def test_adp_without_a_cid_returns_nothing_and_never_calls_out(mock_get):
+    """No tenant id -> skip the portal; never query a guessed tenant."""
+    jobs = run_portal(
+        _adp_cfg(),
+        company_name="Acme",
+        careers_url="https://careers.acme.example/jobs",
+    )
+    assert jobs == []
+    mock_get.assert_not_called()
+
+
+def test_adp_host_is_pinned_to_the_adp_portal():
+    from backend.scraper import ats_for_url
+
+    assert ats_for_url(
+        "https://workforcenow.adp.com/mascsr/default/mdf/recruitment/recruitment.html?cid=x"
+    ) == "adp_workforce_now"

@@ -1,15 +1,15 @@
-import asyncio
 import datetime
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import urllib.parse
-from collections import namedtuple
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import (
     Depends,
@@ -23,7 +23,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -31,13 +31,111 @@ from sqlalchemy.orm import Session
 
 from backend import channel_status
 from backend import linkedin_scan_queue
-from backend.ai_helper import TASK_PROFILES, TaskComplexity, get_model_for_tier
-from backend.config import (
-    DEFAULT_LLM_PROVIDER,
-    ENABLE_DYNAMIC_MODEL_ROUTING,
+from backend.job_scoring import (  # noqa: F401 - re-exported for tests
+    ScoringResult,  # noqa: F401 - re-exported for tests
+    _active_resume_row,
+    _check_eligibility,
+    _derive_strengths_gaps,
+    _deterministic_analysis_text,
+    _deterministic_match,
+    _match_analysis_text,
+    _merge_extra_skills,
+    _normalize_extra_skills,
+    _parsed_resume_of,
+    _score_job_with_engine,
+    _score_provenance,
+    get_extra_skills,
 )
+
+
+def _resume_score_counts(db: Session) -> dict:
+    """Map resume fingerprint -> number of stored scores produced by it (issue #58)."""
+    from sqlalchemy import func
+
+    rows = (
+        db.query(Job.scored_resume_fingerprint, func.count(Job.id))
+        .filter(Job.scored_resume_fingerprint.isnot(None))
+        .group_by(Job.scored_resume_fingerprint)
+        .all()
+    )
+    return {fingerprint: count for fingerprint, count in rows if fingerprint}
+
+
+def _resume_provenance_context(db: Session) -> dict:
+    """Lookup tables for deriving ``score_resume_state`` without a query per job."""
+    active = _active_resume_row(db)
+    known = {}
+    for fingerprint, filename, created_at in db.query(
+        Resume.fingerprint, Resume.filename, Resume.created_at
+    ).all():
+        if fingerprint:
+            known.setdefault(fingerprint, (filename, created_at))
+    return {
+        "active_fingerprint": active.fingerprint if active else None,
+        "known": known,
+    }
+
+
+def _apply_score_provenance(job_out: "JobOut", job: "Job", ctx: dict) -> "JobOut":
+    """Label a serialized job with the state of the resume version that produced its score.
+
+    ``current`` also covers rows scored before provenance existed: unknown is treated as current
+    (decision on #56) so the existing feed is not retroactively marked degraded.
+    """
+    fingerprint = getattr(job, "scored_resume_fingerprint", None)
+    if not fingerprint:
+        job_out.score_resume_state = "current"
+        return job_out
+    if fingerprint == ctx.get("active_fingerprint"):
+        job_out.score_resume_state = "current"
+    elif fingerprint in ctx.get("known", {}):
+        job_out.score_resume_state = "stale"
+    else:
+        job_out.score_resume_state = "deleted"
+    filename, created_at = ctx.get("known", {}).get(fingerprint, (None, None))
+    job_out.score_resume_filename = filename
+    job_out.score_resume_created_at = created_at
+    return job_out
+
+
+def _attach_outreach_guidance(db: Session, job: "Job", job_out: "JobOut") -> "JobOut":
+    """Attach human-in-the-loop talking points when the job has an outreach draft (issue #27).
+
+    Derived on read from the JD and the active resume, so nothing is persisted and no score is
+    affected. Best-effort: a failure here must never break serialization.
+    """
+    if not job.cold_message_draft:
+        return job_out
+    try:
+        active = (
+            db.query(Resume)
+            .filter(Resume.is_active == True)
+            .order_by(Resume.created_at.desc())
+            .first()
+        )
+        if not active:
+            return job_out
+        from backend.ai_helper import build_outreach_guidance
+
+        job_out.outreach_guidance = build_outreach_guidance(
+            job.description or "",
+            decrypt_data(active.content_encrypted),
+            job.title or "",
+        )
+    except Exception as e:
+        logger.debug(f"Outreach guidance unavailable for job {job.id}: {e}")
+    return job_out
+
+
+def _job_out(db: Session, job: "Job", ctx: Optional[dict] = None) -> "JobOut":
+    """Serialize a job with company name and score provenance attached."""
+    job_out = JobOut.model_validate(job)
+    job_out.company_name = job.company.name if job.company else None
+    _apply_score_provenance(job_out, job, ctx or _resume_provenance_context(db))
+    return _attach_outreach_guidance(db, job, job_out)
+
 from backend.matchers import detect_foreign_restriction
-from backend.playwright_app import BrowserProfileBusy, search_linkedin_talent_partners
+from backend.playwright_app import search_linkedin_talent_partners
 from backend.prompts import interview_prep_advisor_system
 
 logger = logging.getLogger("api")
@@ -47,20 +145,14 @@ from playwright.sync_api import sync_playwright
 from backend.ai_helper import (
     MIN_JOB_DESCRIPTION_CHARS,
     assess_job_requirements,
-    batch_autofill_essay_answers,
-    check_semantic_dismissal,
-    detect_active_llm_provider,
+    cached_active_llm_provider,
     extract_job_skills_and_alignment,
-    generate_and_cache_essay_answer,
     generate_consolidated_application_package,
     generate_embeddings,
-    generate_grounded_anti_slop_pitch,
     generate_interview_questions,
     generate_text,
     index_dismissed_job_pattern,
     parse_resume_to_json,
-    search_qa_memory,
-    token_tracker,
 )
 from backend.chat_agent import CareerChatAgent
 from backend.company_catalog import (
@@ -71,50 +163,47 @@ from backend.company_catalog import (
 from backend.config import (
     API_KEY,
     BASE_DIR,
-    DETERMINISTIC_BULK_SCORING,
-    LINKEDIN_AUTOMATION_PACING_SECONDS,
+    INTERACTIVE_SESSION_HOLD_SECONDS,
     LLM_INTERACTIVE_TIMEOUT,
     clear_gmail_settings,
     decrypt_data,
     encrypt_data,
     get_gmail_settings,
-    get_llm_credentials,
-    is_cloud_fallback_allowed,
     is_gmail_configured,
     is_valid_api_key,
     save_gmail_settings,
-    save_llm_settings,
 )
+from backend.country_hubs import load_country_hubs
 from backend.database import (
     CONSENT_REQUIRED_FEATURES,
     CONSENT_VERSION,
     DEFAULT_FEATURE_FLAGS,
+    DEFAULT_EXCLUDED_COMPANIES,
     ApplicationEvent,
-    ApplicationQuestionAnswer,
     Company,
-    CustomFormField,
-    DismissedJobPattern,
     Job,
     OperationLog,
     Resume,
     ScoreAuditRecord,
+    EmailApplicationLink,
     EmailSuppression,
     PendingEmailApplication,
+    find_or_create_company,
     get_consents,
+    known_company_names,
     get_db,
     get_feature_flags,
     get_scoring_config,
     get_user_preferences,
     has_consent,
     init_db,
-    is_company_excluded,
     is_feature_enabled,
     record_consent,
 )
-from backend.llm_queue import LLMPriority, llm_queue
+from backend.llm_queue import LLMPriority
 from backend.matchers import check_title_match
 from backend.match_scoring import ScoringConfig
-from backend.observability import setup_observability, tail_log_file
+from backend.observability import sanitize_log_details, setup_observability  # noqa: F401 - re-exported for tests
 from backend.parser import (
     RESUME_PARSER_VERSION,
     clean_job_description,
@@ -122,108 +211,119 @@ from backend.parser import (
     resume_fingerprint,
     split_candidate_name,
 )
+from backend.scoring_constants import DISMISSAL_SIMILARITY_THRESHOLD
+from backend.text_utils import SNIPPET_CHARS, truncate_preview
+from backend.routers.discovery import (  # noqa: F401 - ScrapeResponse re-exported for tests
+    ScrapeRequest,
+    ScrapeResponse,
+    _execute_ats_scrape,
+    router as discovery_router,
+)
+from backend.routers.operations import router as operations_router
+from backend.google_searches import (  # noqa: F401 - re-exported for the dispatch route and tests
+    load_google_searches,
+    normalize_google_query,
+)
+from backend.routers.google_jobs import (  # noqa: F401 - re-exported for the sync-all runner and tests
+    _GOOGLE_JOBS_MAX_PREF_QUERIES,
+    _run_google_jobs_task_runner,
+    router as google_jobs_router,
+)
+from backend.routers.linkedin import (  # noqa: F401 - re-exported for the sync-all runner and tests
+    LinkedInSyncResponse,
+    _LINKEDIN_SCAN_GATE,
+    _log_linkedin_automation_warning,
+    _run_linkedin_sync_task_runner,
+    _run_queued_linkedin_scan,
+    _submit_queued_linkedin_scan,
+    router as linkedin_router,
+)
+from backend.routers.memory_qa import router as memory_qa_router
+from backend.routers.settings import router as settings_router
+from backend.routers.tasks import router as tasks_router
 from backend.playwright_app import (
-    fetch_google_jobs_followed_queries_playwright,
-    fetch_google_jobs_playwright,
-    fetch_linkedin_job_details,
-    get_persistent_browser_context,
     scan_and_sync_hirist_applications,
-    scan_and_sync_linkedin_saved_jobs,
-    scan_linkedin_job_alerts,
-    scan_linkedin_job_recommendations,
     sync_email_application_events,
 )
 from backend.preference_filter import (
-    PreferenceCriteria,
     PreferenceFilter,
     check_location_match,
     check_workmode_match,
 )
 from backend.resume_index import index_resume_chunks, top_evidence
-from backend.scheduler import ScheduledJobConfig, scheduler
+from backend.scheduler import scheduler
 from backend.scraper import (
-    ats_for_url,
-    evaluate_job_due_diligence,
     extract_opportunity_company_and_title,
-    extract_portal_info_from_job_url,
     find_talent_partners,
     gather_company_intelligence,
     probe_greenhouse_job_active,
     probe_lever_job_active,
     probe_smartrecruiters_job_active,
-    scrape_ashby_jobs,
-    scrape_custom_jobs,
-    scrape_greenhouse_jobs,
-    scrape_lever_jobs,
-    scrape_smartrecruiters_jobs,
-    scrape_uber_jobs,
-    scrape_workable_jobs,
-    scrape_workday_jobs,
     _is_ats_or_freemail_domain,
     _is_freemail_domain,
-    _sender_domain,
 )
-from backend.task_engine import CancellationToken, TaskProgress, task_engine
+from backend.requisition import extract_requisition_id
+from backend.task_engine import CancellationToken, task_engine
+from backend.title_parser import (
+    resolve_company_name,
+    safe_company_name as _safe_company_name,
+)
 
-# Config-driven ATS portals wired to their scraper wrappers, in dispatch order.
-# Each entry's ``default_flag`` is the opt-in feature flag that gates it; the portal id matches
-# data/ats_portals.json. Adding a new portal = one config entry + (usually) one registry line here.
-# Values are *attribute names* on this module (resolved at dispatch time so tests can patch them).
-_ATS_PORTAL_SCRAPERS = {
-    "greenhouse": "scrape_greenhouse_jobs",
-    "lever": "scrape_lever_jobs",
-    "ashby": "scrape_ashby_jobs",
-    "smartrecruiters": "scrape_smartrecruiters_jobs",
-    "workable": "scrape_workable_jobs",
-    "workday": "scrape_workday_jobs",
-}
+# Graceful shutdown is driven entirely by the ASGI lifespan (see `_lifespan` below). We
+# deliberately do NOT register our own signal handlers: uvicorn owns SIGTERM/SIGINT and calls the
+# lifespan on every exit path (--reload child, --workers, standalone). See backend/shutdown.py for
+# why.
 
 
-_AtsPortal = namedtuple("_AtsPortal", "id label default_flag scraper_attr")
+@asynccontextmanager
+async def _lifespan(application):
+    """The one startup/shutdown hook (the three ``on_event`` handlers were deprecated).
+
+    Order matters: observability and the schema must exist before the handlers that query the
+    database, and the recovery step re-queues work only after the task engine is usable.
+    """
+    _bootstrap_runtime()
+    _startup_operation_log_maintenance()
+    _recover_queued_linkedin_scans()
+    try:
+        yield
+    finally:
+        _graceful_shutdown_drain()
 
 
-def _load_ats_portals():
-    """Returns the configured ATS portals (id, label, default_flag, scraper attr) for dispatch."""
-    from backend.ats.engine import load_portal_configs
-
-    portals = []
-    for cfg in load_portal_configs():
-        attr = _ATS_PORTAL_SCRAPERS.get(cfg.id)
-        if attr is None:
-            continue
-        portals.append(
-            _AtsPortal(
-                id=cfg.id,
-                label=cfg.label,
-                default_flag=cfg.default_flag,
-                scraper_attr=attr,
-            )
-        )
-    return portals
-
-
-_ATS_PORTALS = _load_ats_portals()
-
-# Initialize Observability, DB tables, and Periodic Scheduler on startup
-setup_observability()
-init_db()
-# Maintenance scripts import this module (for the shared scorer) but must not boot the
-# discovery scheduler in their own process. They set JOB_ALERT_AGENT_NO_SCHEDULER=1.
-if os.environ.get("JOB_ALERT_AGENT_NO_SCHEDULER") != "1":
-    scheduler.start()
-
-# Graceful shutdown is driven entirely by the ASGI shutdown lifecycle (see the
-# `@app.on_event("shutdown")` handler below). We deliberately do NOT register our own
-# signal handlers: uvicorn owns SIGTERM/SIGINT and calls the lifecycle on every exit
-# path (--reload child, --workers, standalone). See backend/shutdown.py for why.
 app = FastAPI(
     title="Job Alert Agent API",
     description="Autonomous job hunting, application tracking, resume ATS tailoring, and browser assistance.",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
+app.include_router(discovery_router)
+app.include_router(google_jobs_router)
+app.include_router(linkedin_router)
+app.include_router(operations_router)
+app.include_router(tasks_router)
+app.include_router(memory_qa_router)
+app.include_router(settings_router)
 
-@app.on_event("startup")
+
+def _bootstrap_runtime():
+    """Observability, schema and scheduler — once per process, on startup, not on import.
+
+    These ran at module scope, so every ``import backend.main`` (including pytest collection
+    and every maintenance script) opened the configured database, flipped it to WAL, ran
+    ``create_all`` plus the migrations, and could start a discovery scheduler thread. Importing
+    a module must not do that; a server starting must. Scripts therefore call
+    ``backend.database.init_db()`` themselves.
+    """
+    setup_observability()
+    init_db()
+    # Maintenance scripts set JOB_ALERT_AGENT_NO_SCHEDULER=1 so importing the app never starts
+    # a discovery thread in their process.
+    if os.environ.get("JOB_ALERT_AGENT_NO_SCHEDULER") != "1":
+        scheduler.start()
+
+
 def _startup_operation_log_maintenance():
     """Rotates the operation_logs table once on startup so long-running DBs stay bounded."""
     try:
@@ -238,7 +338,6 @@ def _startup_operation_log_maintenance():
         logger.debug(f"Startup operation-log rotation skipped: {e}")
 
 
-@app.on_event("startup")
 def _recover_queued_linkedin_scans():
     """Re-queue LinkedIn scans that were still waiting when the previous process exited (#115).
 
@@ -260,7 +359,6 @@ def _recover_queued_linkedin_scans():
         logger.debug(f"Startup LinkedIn queue recovery skipped: {e}")
 
 
-@app.on_event("shutdown")
 def _graceful_shutdown_drain():
     """Drain background work on server shutdown (SIGTERM/SIGINT/reload).
 
@@ -309,13 +407,6 @@ _extension_origin_regex = (
     else None
 )
 
-ScoringResult = namedtuple(
-    "ScoringResult",
-    ["score", "analysis", "scored", "method", "timestamp", "band", "recommendation",
-     "strengths", "gaps", "partials"],
-)
-
-
 def _origin_is_local(value: Optional[str]) -> bool:
     """True only when a URL's parsed host is exactly a loopback host.
 
@@ -343,38 +434,12 @@ app.add_middleware(
 )
 
 
-@app.middleware("http")
-async def request_observability_middleware(request: Request, call_next):
-    """
-    HTTP Request Observability & Correlation Middleware.
-    Assigns unique X-Request-ID, logs request lifecycle, status codes, and latency in milliseconds.
-    """
-    req_id = (
-        request.headers.get("X-Request-ID")
-        or f"req_{int(time.time() * 1000) % 1000000:06d}"
-    )
-    request.state.request_id = req_id
-    t0 = time.perf_counter()
-
-    try:
-        response = await call_next(request)
-        latency_ms = (time.perf_counter() - t0) * 1000
-        response.headers["X-Request-ID"] = req_id
-
-        # Avoid noisy health check polling logs at INFO level
-        if request.url.path not in ("/api/health", "/favicon.ico"):
-            logger.info(
-                f"{request.method} {request.url.path} -> {response.status_code} ({latency_ms:.1f}ms)",
-                extra={"request_id": req_id},
-            )
-        return response
-    except Exception as exc:
-        latency_ms = (time.perf_counter() - t0) * 1000
-        logger.error(
-            f"{request.method} {request.url.path} -> ERROR: {exc} ({latency_ms:.1f}ms)",
-            extra={"request_id": req_id},
-        )
-        raise
+def _log_safe_header(value: Optional[str], limit: int = 200) -> str:
+    """Make a request header safe for a single log line (no CR/LF, bounded length)."""
+    if not value:
+        return "-"
+    cleaned = "".join(ch for ch in str(value) if ch.isprintable())
+    return cleaned[:limit] or "-"
 
 
 @app.middleware("http")
@@ -384,6 +449,11 @@ async def security_firewall_middleware(request: Request, call_next):
     - Automatically allows public documentation, health endpoints, and static assets.
     - Requires verified X-API-Key or verified same-origin session for all REST API endpoints.
     - Blocks cross-site unauthorized requests from arbitrary websites.
+
+    Declared BEFORE ``request_observability_middleware`` on purpose: Starlette inserts each
+    middleware at the front of the stack, so the last one declared is the outermost. The firewall
+    rejects with a 401 without calling ``call_next``, so it must sit *inside* the observability
+    middleware or the rejection produces no log line and no ``X-Request-ID`` (issue #92/#93).
     """
     path = request.url.path
     if (
@@ -442,6 +512,53 @@ async def security_firewall_middleware(request: Request, call_next):
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
 
+@app.middleware("http")
+async def request_observability_middleware(request: Request, call_next):
+    """
+    HTTP Request Observability & Correlation Middleware.
+    Assigns unique X-Request-ID, logs request lifecycle, status codes, and latency in milliseconds.
+
+    Outermost middleware, so it also sees the security firewall's own 401 responses.
+    """
+    req_id = (
+        request.headers.get("X-Request-ID")
+        or f"req_{int(time.time() * 1000) % 1000000:06d}"
+    )
+    request.state.request_id = req_id
+    t0 = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+        latency_ms = (time.perf_counter() - t0) * 1000
+        response.headers["X-Request-ID"] = req_id
+
+        # Avoid noisy health check polling logs at INFO level
+        if request.url.path not in ("/api/health", "/favicon.ico"):
+            if response.status_code == 404:
+                # An unknown path is usually a stale client build or an external probe. Without
+                # caller identity a 404 storm cannot be attributed to anything (issue #93), so
+                # record headers only - never bodies.
+                logger.info(
+                    f"{request.method} {request.url.path} -> 404 ({latency_ms:.1f}ms) "
+                    f"ua={_log_safe_header(request.headers.get('user-agent'))} "
+                    f"referer={_log_safe_header(request.headers.get('referer'))}",
+                    extra={"request_id": req_id},
+                )
+            else:
+                logger.info(
+                    f"{request.method} {request.url.path} -> {response.status_code} ({latency_ms:.1f}ms)",
+                    extra={"request_id": req_id},
+                )
+        return response
+    except Exception as exc:
+        latency_ms = (time.perf_counter() - t0) * 1000
+        logger.error(
+            f"{request.method} {request.url.path} -> ERROR: {exc} ({latency_ms:.1f}ms)",
+            extra={"request_id": req_id},
+        )
+        raise
+
+
 # -------------------------------------------------------------
 # API Key Authentication & Verification Dependency
 # -------------------------------------------------------------
@@ -491,34 +608,6 @@ def verify_api_key(
         detail="Unauthorized: Valid X-API-Key header or same-origin session required.",
         headers={"WWW-Authenticate": "ApiKey"},
     )
-
-
-def sanitize_log_details(details: Optional[Union[str, dict, list]]) -> Optional[str]:
-    """
-    Redacts PII/credentials before persisting to OperationLog. Always returns valid JSON text
-    (or None), so callers can safely ``json.loads`` the stored value.
-    """
-    if not details:
-        return None
-    try:
-        raw = details if isinstance(details, str) else json.dumps(details)
-        # Redact common credentials/tokens if present
-        raw = re.sub(
-            r'("?(?:api_key|token|password|secret|refresh_token|client_secret|access_token)"?\s*:\s*)"[^"]+"',
-            r'\1"[REDACTED]"',
-            raw,
-            flags=re.IGNORECASE,
-        )
-        # Redact email addresses in logs
-        raw = re.sub(
-            r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", "[REDACTED_EMAIL]", raw
-        )
-        return raw
-    except Exception:
-        try:
-            return json.dumps(str(details))
-        except Exception:
-            return None
 
 
 # -------------------------------------------------------------
@@ -597,11 +686,18 @@ JOB_STATUSES = [
     "Shortlisted",
     "Applied",
     "Screening",
+    "Interview Scheduling",
     "Interview",
     "Offered",
     "Rejected",
+    "Closed",
+    "Withdrawn",
     "Not Interested",
 ]
+
+# States that end an application. "Closed" is a posting that disappeared (filled, expired,
+# unlisted) and "Withdrawn" is the operator backing out — neither is a rejection by the employer.
+TERMINAL_JOB_STATUSES = ("Rejected", "Closed", "Withdrawn", "Not Interested")
 
 
 def _canonical_job_status(value: str) -> str:
@@ -638,7 +734,7 @@ class JobCreate(BaseModel):
 class JobStatusUpdate(BaseModel):
     status: str = Field(
         ...,
-        description="To Apply, Shortlisted, Applied, Screening, Interview, Offered, Rejected, Not Interested",
+        description="To Apply, Shortlisted, Applied, Screening, Interview Scheduling, Interview, Offered, Rejected, Closed, Withdrawn, Not Interested",
     )
     note: Optional[str] = None
 
@@ -725,26 +821,11 @@ class ResumeOut(BaseModel):
     score_count: int = 0
 
 
-class ScrapeRequest(BaseModel):
-    company_id: Optional[int] = None
-    target_titles: Optional[str] = None
-    target_locations: Optional[str] = None
-    target_cities: Optional[str] = None
-    work_mode: Optional[str] = None
-
-
 class PruneJobsRequest(BaseModel):
     target_titles: Optional[str] = None
     target_locations: Optional[str] = None
     target_cities: Optional[str] = None
     work_mode: Optional[str] = None
-
-
-class ScrapeResponse(BaseModel):
-    jobs_found: int
-    jobs_added: int
-    companies_updated: int
-    message: str
 
 
 class ApplyMaterial(BaseModel):
@@ -799,7 +880,6 @@ class ExternalSyncResponse(BaseModel):
     channels: List[dict] = []
 
 
-LATEST_SCRAPE_AUDIT: List[dict] = []
 
 
 class ChatRequest(BaseModel):
@@ -875,123 +955,6 @@ class MatchAnalyzeResponse(BaseModel):
     )
 
 
-GOOGLE_SEARCHES_FILE = BASE_DIR / "data" / "google_searches.json"
-DEFAULT_GOOGLE_SEARCHES = [
-    "Staff Software Engineer remote",
-    "Senior Backend Engineer distributed systems",
-    "Principal Software Engineer",
-    "Senior Data Engineer Python SQL",
-]
-
-
-def normalize_google_query(query: str) -> str:
-    """
-    Cleans a Google Jobs search/alert query:
-    - collapses consecutive duplicate words (e.g. "jobs in India India" -> "jobs in India")
-    - drops a trailing word that already appeared earlier (e.g. "Acme india jobs India" -> "Acme india jobs")
-    Never renames the user's alerts on Google; only what we store/search with.
-    """
-    if not query:
-        return query
-    s = " ".join(str(query).split())
-    s = re.sub(r"\b(\w+)(?:\s+\1\b)+", r"\1", s, flags=re.IGNORECASE)
-    words = s.split()
-    if len(words) >= 2:
-        earlier = {w.lower() for w in words[:-1]}
-        if words[-1].lower() in earlier:
-            words = words[:-1]
-            s = " ".join(words)
-    return s.strip()
-
-
-def _normalize_google_queries(searches: List[str]) -> List[str]:
-    clean: List[str] = []
-    seen = set()
-    for q in searches:
-        n = normalize_google_query(str(q))
-        key = n.lower()
-        if n and key not in seen:
-            seen.add(key)
-            clean.append(n)
-    return clean
-
-
-def load_google_searches() -> List[str]:
-    try:
-        if GOOGLE_SEARCHES_FILE.exists():
-            with open(GOOGLE_SEARCHES_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list) and data:
-                    return _normalize_google_queries(
-                        [str(q) for q in data if str(q).strip()]
-                    )
-    except Exception as e:
-        logger.debug(f"Could not load google_searches.json: {e}")
-    return list(DEFAULT_GOOGLE_SEARCHES)
-
-
-def save_google_searches(searches: List[str]) -> List[str]:
-    try:
-        GOOGLE_SEARCHES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        clean = _normalize_google_queries(searches)
-        with open(GOOGLE_SEARCHES_FILE, "w", encoding="utf-8") as f:
-            json.dump(clean, f, indent=2)
-        return clean
-    except Exception as e:
-        logger.debug(f"Could not save google_searches.json: {e}")
-        return searches
-
-
-class GoogleSearchesUpdate(BaseModel):
-    queries: List[str]
-
-
-class GoogleJobsScrapeRequest(BaseModel):
-    queries: Optional[List[str]] = None
-    query: Optional[str] = None
-    location: Optional[str] = None
-    limit: int = 15
-    use_browser: bool = False
-    sync_followed_tabs: bool = False
-
-
-class GoogleJobsScrapeResponse(BaseModel):
-    total_discovered: int = 0
-    total_added: int = 0
-    already_existing: int = 0
-    dismissed_filtered: int = 0
-    queries_scanned: List[str] = []
-    per_query_breakdown: List[dict] = []
-    message: str
-
-
-class LinkedInSyncResponse(BaseModel):
-    total_processed: int = 0
-    recommendations_found: int
-    recommendations_added: int
-    saved_jobs_checked: int
-    saved_jobs_added: int = 0
-    already_existing: int = 0
-    dismissed_filtered: int = 0
-    closed_jobs_pruned: int
-    message: str
-
-
-class LinkedInLastSyncOut(BaseModel):
-    """Summary of the most recent LinkedIn sync, powering the "N new from sync" review banner."""
-
-    sync_batch_id: Optional[str] = None
-    total_added: int = 0
-    saved_jobs_added: int = 0
-    recommendations_added: int = 0
-    already_existing: int = 0
-    closed_jobs_pruned: int = 0
-    # Jobs from this batch still unreviewed (sync_batch_id set, not yet acted on).
-    pending_review: int = 0
-    created_at: Optional[datetime.datetime] = None
-    has_sync: bool = False
-
-
 class SkillItem(BaseModel):
     name: str
     status: str
@@ -1028,484 +991,29 @@ class JobHiringTeamResponse(BaseModel):
     contacts: List[HiringContact]
 
 
-class OperationLogOut(BaseModel):
-    id: int
-    operation_type: str
-    status: str
-    summary: str
-    details_json: Optional[str] = None
-    jobs_count: int = 0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    created_at: datetime.datetime
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class QAMemoryIn(BaseModel):
-    question_text: str
-    answer_text: str
-    category: Optional[str] = "general"
-
-
-class QAMemoryOut(BaseModel):
-    id: int
-    question_text: str
-    answer_text: str
-    category: str
-    use_count: int
-    created_at: datetime.datetime
-    updated_at: datetime.datetime
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class QASearchRequest(BaseModel):
-    query_question: str
-    top_k: Optional[int] = 3
-    min_similarity: Optional[float] = 0.65
-
-
-class QAResolveRequest(BaseModel):
-    question_text: str
-    company_name: Optional[str] = None
-    job_title: Optional[str] = None
-    auto_cache: bool = True
-    threshold: float = 0.85
-    provider: Optional[str] = None
-
-
-class QABatchAutofillRequest(BaseModel):
-    questions: List[str]
-    company_name: Optional[str] = None
-    job_title: Optional[str] = None
-    auto_cache: bool = True
-    threshold: float = 0.85
-    provider: Optional[str] = None
-
-
-class GroundedPitchRequest(BaseModel):
-    question_text: str
-    company_name: Optional[str] = None
-    job_title: Optional[str] = None
-    job_description: Optional[str] = None
-    auto_cache: bool = True
-    threshold: float = 0.85
-    provider: Optional[str] = None
-
-
-class FormFieldItem(BaseModel):
-    field_name: Optional[str] = None
-    field_id: Optional[str] = None
-    field_label: Optional[str] = None
-    field_type: Optional[str] = "text"
-    is_recognized: bool = False
-    suggested_category: Optional[str] = "unknown"
-
-
-class FormTelemetryRequest(BaseModel):
-    domain: str
-    ats_type: Optional[str] = "custom"
-    url: Optional[str] = None
-    fields: List[FormFieldItem]
-
-
-class FormFieldOut(BaseModel):
-    id: int
-    ats_type: str
-    domain: str
-    field_name: Optional[str] = None
-    field_id: Optional[str] = None
-    field_label: Optional[str] = None
-    field_type: str
-    is_recognized: bool
-    classified_category: str
-    occurrence_count: int
-    created_at: datetime.datetime
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class DismissedPatternOut(BaseModel):
-    id: int
-    title: str
-    company_name: Optional[str] = None
-    description: Optional[str] = None
-    reason: Optional[str] = None
-    created_at: datetime.datetime
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-@app.get("/api/operations/logs", response_model=List[OperationLogOut])
-def get_operation_logs(limit: int = 50, db: Session = Depends(get_db)):
-    """Retrieves persistent audit history of all sync, scrape, and application operations."""
-    return (
-        db.query(OperationLog)
-        .order_by(OperationLog.created_at.desc())
-        .limit(limit)
-        .all()
-    )
-
-
-@app.delete("/api/operations/logs")
-def clear_operation_logs(db: Session = Depends(get_db)):
-    """Clears past operation history logs."""
-    deleted = db.query(OperationLog).delete()
-    db.commit()
-    return {"message": f"Successfully cleared {deleted} operation log record(s)."}
-
-
-@app.get("/api/learning/readiness")
-def get_learning_readiness(db: Session = Depends(get_db)):
-    """Reports whether enough implicit user outcomes exist to train the scorer.
-
-    Labels are derived from behaviour (applying, dismissing) — never from the model's own
-    output — so this makes "not enough data yet" an explicit outcome rather than a silent,
-    overfitted model.
-    """
-    from backend.learning_signals import learning_readiness
-    from backend.match_classifier import MIN_PER_CLASS_SAMPLES, MIN_TRAINING_SAMPLES
-
-    status = learning_readiness(db)
-    ready = (
-        status["trainable"] >= MIN_TRAINING_SAMPLES
-        and status["positives"] >= MIN_PER_CLASS_SAMPLES
-        and status["negatives"] >= MIN_PER_CLASS_SAMPLES
-    )
-    return {
-        **status,
-        "ready_to_train": ready,
-        "training_floor": {
-            "min_total": MIN_TRAINING_SAMPLES,
-            "min_per_class": MIN_PER_CLASS_SAMPLES,
-        },
-    }
-
-
-@app.get("/api/logs")
-def get_application_logs(
-    lines: int = Query(default=100, ge=1, le=1000),
-    level: Optional[str] = Query(default=None),
-    search: Optional[str] = Query(default=None),
-):
-    """
-    Observability Log Streamer.
-    Tails the active rotating structured JSON log file (logs/app.log).
-    Supports optional log level filtering (INFO, WARNING, ERROR) and substring search.
-    """
-    raw_logs = tail_log_file(lines=lines * 2 if (level or search) else lines)
-    filtered = raw_logs
-    if level:
-        lvl_upper = level.upper()
-        filtered = [l for l in filtered if l.get("level", "").upper() == lvl_upper]
-    if search:
-        s_lower = search.lower()
-        filtered = [l for l in filtered if s_lower in json.dumps(l).lower()]
-
-    return {"count": len(filtered[:lines]), "logs": filtered[:lines]}
-
-
-# -------------------------------------------------------------
-# Semantic Memory & Question Bank Endpoints
-# -------------------------------------------------------------
-@app.get("/api/memory/qa", response_model=List[QAMemoryOut])
-def get_qa_memory_items(category: Optional[str] = None, db: Session = Depends(get_db)):
-    """Retrieves all saved application question-answer memory pairs."""
-    query = db.query(ApplicationQuestionAnswer)
-    if category and category != "all":
-        query = query.filter(ApplicationQuestionAnswer.category == category)
-    return query.order_by(
-        ApplicationQuestionAnswer.use_count.desc(),
-        ApplicationQuestionAnswer.updated_at.desc(),
-    ).all()
-
-
-@app.post(
-    "/api/memory/qa", response_model=QAMemoryOut, status_code=status.HTTP_201_CREATED
-)
-def save_qa_memory_item(payload: QAMemoryIn, db: Session = Depends(get_db)):
-    """Saves or updates an application question-answer pair with semantic embedding vector."""
-    clean_q = payload.question_text.strip()
-    clean_a = payload.answer_text.strip()
-    if not clean_q or not clean_a:
-        raise HTTPException(
-            status_code=400, detail="Both question and answer text are required."
-        )
-
-    # Check if exact question already exists
-    existing = (
-        db.query(ApplicationQuestionAnswer)
-        .filter(ApplicationQuestionAnswer.question_text.ilike(clean_q))
-        .first()
-    )
-
-    emb = generate_embeddings(clean_q)
-
-    if existing:
-        existing.answer_text = clean_a
-        existing.category = payload.category or existing.category
-        existing.embedding = emb
-        existing.use_count += 1
-        db.commit()
-        db.refresh(existing)
-        return existing
-
-    new_item = ApplicationQuestionAnswer(
-        question_text=clean_q,
-        answer_text=clean_a,
-        category=payload.category or "general",
-        embedding=emb,
-        use_count=1,
-    )
-    db.add(new_item)
-    db.commit()
-    db.refresh(new_item)
-    return new_item
-
-
-@app.post("/api/memory/qa/search")
-def search_qa_memory_endpoint(payload: QASearchRequest, db: Session = Depends(get_db)):
-    """Searches the Q&A memory bank using semantic vector similarity."""
-    results = search_qa_memory(
-        query_question=payload.query_question,
-        db=db,
-        top_k=payload.top_k or 3,
-        min_similarity=payload.min_similarity or 0.65,
-    )
-    return {"query": payload.query_question, "matches": results}
-
-
-@app.delete("/api/memory/qa/{qa_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_qa_memory_item(qa_id: int, db: Session = Depends(get_db)):
-    """Deletes a saved question-answer memory pair."""
-    item = (
-        db.query(ApplicationQuestionAnswer)
-        .filter(ApplicationQuestionAnswer.id == qa_id)
-        .first()
-    )
-    if not item:
-        raise HTTPException(status_code=404, detail="Q&A item not found.")
-    db.delete(item)
-    db.commit()
-    return None
-
-
-@app.get("/api/memory/dismissed-patterns", response_model=List[DismissedPatternOut])
-def get_dismissed_patterns(db: Session = Depends(get_db)):
-    """Retrieves all learned negative job patterns for zero-token ignore filtering."""
-    return (
-        db.query(DismissedJobPattern)
-        .order_by(DismissedJobPattern.created_at.desc())
-        .all()
-    )
-
-
-@app.delete(
-    "/api/memory/dismissed-patterns/{pattern_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-def delete_dismissed_pattern(pattern_id: int, db: Session = Depends(get_db)):
-    """Removes a learned ignore rule so future matching jobs are no longer auto-filtered."""
-    pattern = (
-        db.query(DismissedJobPattern)
-        .filter(DismissedJobPattern.id == pattern_id)
-        .first()
-    )
-    if not pattern:
-        raise HTTPException(status_code=404, detail="Pattern not found.")
-    db.delete(pattern)
-    db.commit()
-    return None
-
-
-# -------------------------------------------------------------
-# Semantic Essay Prompt & Response Caching Endpoints
-# -------------------------------------------------------------
-@app.post("/api/qa/grounded-pitch")
-def generate_grounded_pitch_endpoint(
-    payload: GroundedPitchRequest, db: Session = Depends(get_db)
-):
-    """
-    Generates a crisp, authentic, 3-5 sentence application essay / screener pitch.
-    Eliminates all AI clichés, grounding the answer in company intelligence and candidate resume evidence.
-    """
-    active_resume = db.query(Resume).filter(Resume.is_active == True).first()
-    resume_text = decrypt_data(active_resume.content_encrypted) if active_resume else ""
-
-    return generate_grounded_anti_slop_pitch(
-        question=payload.question_text,
-        company_name=payload.company_name or "",
-        job_title=payload.job_title or "",
-        job_description=payload.job_description or "",
-        resume_text=resume_text,
-        db=db,
-        auto_cache=payload.auto_cache,
-        threshold=payload.threshold,
-        provider=payload.provider,
-    )
-
-
-@app.post("/api/forms/telemetry")
-def ingest_form_telemetry(payload: FormTelemetryRequest, db: Session = Depends(get_db)):
-    """
-    Ingests and aggregates field detection telemetry from the Chrome extension,
-    learning custom form fields across career portals.
-    """
-    processed = 0
-    clean_domain = payload.domain.strip().lower()
-    for field in payload.fields:
-        existing = (
-            db.query(CustomFormField)
-            .filter(
-                CustomFormField.domain == clean_domain,
-                (CustomFormField.field_id == field.field_id)
-                | (CustomFormField.field_name == field.field_name)
-                | (CustomFormField.field_label == field.field_label),
-            )
-            .first()
-        )
-
-        if existing:
-            existing.occurrence_count += 1
-            existing.is_recognized = field.is_recognized or existing.is_recognized
-            if field.suggested_category and field.suggested_category != "unknown":
-                existing.classified_category = field.suggested_category
-            existing.updated_at = datetime.datetime.now(datetime.timezone.utc)
-        else:
-            new_field = CustomFormField(
-                ats_type=payload.ats_type or "custom",
-                domain=clean_domain,
-                field_name=field.field_name,
-                field_id=field.field_id,
-                field_label=field.field_label,
-                field_type=field.field_type or "text",
-                is_recognized=field.is_recognized,
-                classified_category=field.suggested_category or "unknown",
-                occurrence_count=1,
-            )
-            db.add(new_field)
-        processed += 1
-
-    db.commit()
-    return {"status": "ok", "processed_count": processed}
-
-
-@app.get("/api/forms/telemetry", response_model=List[FormFieldOut])
-def get_form_telemetry(
-    domain: Optional[str] = None,
-    unrecognized_only: bool = False,
-    db: Session = Depends(get_db),
-):
-    """
-    Returns aggregated custom form fields and learned portal patterns.
-    """
-    query = db.query(CustomFormField)
-    if domain:
-        query = query.filter(CustomFormField.domain == domain.strip().lower())
-    if unrecognized_only:
-        query = query.filter(CustomFormField.is_recognized == False)
-    return query.order_by(CustomFormField.occurrence_count.desc()).all()
-
-
-@app.post("/api/qa/resolve-or-generate")
-def resolve_or_generate_qa_endpoint(
-    payload: QAResolveRequest, db: Session = Depends(get_db)
-):
-    """
-    Evaluates semantic question against memory cache first (0 tokens if >= threshold).
-    Falls back to JIT LLM generation and auto-indexes fresh answer into database.
-    """
-    active_resume = db.query(Resume).filter(Resume.is_active == True).first()
-    resume_text = decrypt_data(active_resume.content_encrypted) if active_resume else ""
-
-    return generate_and_cache_essay_answer(
-        question=payload.question_text,
-        resume_text=resume_text,
-        db=db,
-        company_name=payload.company_name or "",
-        job_title=payload.job_title or "",
-        auto_cache=payload.auto_cache,
-        threshold=payload.threshold,
-        provider=payload.provider,
-    )
-
-
-@app.post("/api/qa/batch-autofill")
-def batch_autofill_qa_endpoint(
-    payload: QABatchAutofillRequest, db: Session = Depends(get_db)
-):
-    """
-    Resolves a list of application form essay questions in a single call with mixed cache hits/misses.
-    """
-    active_resume = db.query(Resume).filter(Resume.is_active == True).first()
-    resume_text = decrypt_data(active_resume.content_encrypted) if active_resume else ""
-
-    return batch_autofill_essay_answers(
-        questions=payload.questions,
-        resume_text=resume_text,
-        db=db,
-        company_name=payload.company_name or "",
-        job_title=payload.job_title or "",
-        auto_cache=payload.auto_cache,
-        threshold=payload.threshold,
-        provider=payload.provider,
-    )
-
-
-@app.get("/api/qa/cache-stats")
-def get_qa_cache_stats(db: Session = Depends(get_db)):
-    """
-    Returns observability metrics for the Semantic Q&A Cache.
-    """
-    all_qa = db.query(ApplicationQuestionAnswer).all()
-    total_cached = len(all_qa)
-    reused_count = sum(item.use_count - 1 for item in all_qa if item.use_count > 1)
-
-    categories_breakdown = {}
-    for item in all_qa:
-        cat = item.category or "general"
-        categories_breakdown[cat] = categories_breakdown.get(cat, 0) + 1
-
-    top_reused = sorted(all_qa, key=lambda x: x.use_count, reverse=True)[:5]
-    top_reused_data = [
-        {
-            "id": item.id,
-            "question": item.question_text,
-            "category": item.category,
-            "use_count": item.use_count,
-            "updated_at": item.updated_at,
-        }
-        for item in top_reused
-    ]
-
-    return {
-        "total_cached_pairs": total_cached,
-        "total_inferences_saved": reused_count,
-        "categories_breakdown": categories_breakdown,
-        "top_reused_questions": top_reused_data,
-    }
-
-
 # -------------------------------------------------------------
 # Health & Status Endpoint
 # -------------------------------------------------------------
 @app.get("/api/health")
 def health_check(db: Session = Depends(get_db)):
-    """Health check verifying API, Database, and Active LLM Engine readiness.
+    """Liveness check: database reachable, and whether a graceful drain is in progress.
 
     Reports ``shutting_down: true`` while a graceful drain is in progress, so a
     supervisor can distinguish "draining" from "dead" during a restart.
+
+    Deliberately cheap and side-effect free. It used to probe every LLM provider (serial HTTP,
+    1.5 s timeout each) and resize the worker pool on each call, on a public route that gets
+    polled continuously. ``active_llm`` is now the last observed snapshot; ``/api/llm/status``
+    is the route that probes, and the SPA asks for it separately.
     """
     try:
         db.query(Company).count()
-        active_llm = detect_active_llm_provider()
         from backend.shutdown import is_shutting_down
 
         return {
             "status": "shutting_down" if is_shutting_down() else "ok",
             "database": "connected",
-            "active_llm": active_llm,
+            "active_llm": cached_active_llm_provider(),
             "shutting_down": is_shutting_down(),
         }
     except Exception as e:
@@ -1513,224 +1021,6 @@ def health_check(db: Session = Depends(get_db)):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Database connectivity failed: {str(e)}",
         )
-
-
-@app.get("/api/llm/status")
-def get_llm_status():
-    """Returns detailed status and metadata of the currently active LLM provider."""
-    return detect_active_llm_provider()
-
-
-@app.get("/api/llm/routing-status")
-def get_llm_routing_status():
-    """Returns dynamic model routing configuration, tier assignments, and task complexity profiles."""
-
-    active_provider = detect_active_llm_provider()
-    provider_id = active_provider.get("provider", DEFAULT_LLM_PROVIDER).lower()
-
-    return {
-        "dynamic_routing_enabled": ENABLE_DYNAMIC_MODEL_ROUTING,
-        "active_provider": active_provider,
-        "resolved_provider_tiers": {
-            "fast": get_model_for_tier(provider_id, TaskComplexity.FAST),
-            "standard": get_model_for_tier(provider_id, TaskComplexity.STANDARD),
-            "deep_reasoning": get_model_for_tier(
-                provider_id, TaskComplexity.DEEP_REASONING
-            ),
-        },
-        "task_profiles": {
-            k: {
-                "complexity": v["complexity"].value
-                if hasattr(v["complexity"], "value")
-                else str(v["complexity"]),
-                "temperature": v["temperature"],
-                "max_tokens": v["max_tokens"],
-                "description": v["description"],
-                "top_p": v["top_p"],
-            }
-            for k, v in TASK_PROFILES.items()
-        },
-    }
-
-
-@app.get("/api/llm/queue-status")
-def get_llm_queue_status():
-    """Returns live metrics, queue depth, active task, and backpressure alerts for the local LLM worker queue."""
-    return llm_queue.get_status()
-
-
-@app.get("/api/llm/token-usage")
-def get_llm_token_usage():
-    """Returns total prompt tokens, completion tokens, inference counts, and cost/savings analytics in O(1) time."""
-    from backend.ai_helper import token_tracker
-
-    return token_tracker.get_stats()
-
-
-@app.post("/api/llm/token-usage/sync")
-def sync_llm_token_usage(db: Session = Depends(get_db)):
-    """Incrementally aggregates delta token usage from newer operation logs."""
-    from backend.ai_helper import token_tracker
-
-    token_tracker.sync_incremental_db_tokens(db=db)
-    return token_tracker.get_stats()
-
-
-@app.post("/api/llm/token-usage/recalculate")
-def recalculate_llm_token_usage(db: Session = Depends(get_db)):
-    """Reconstructs lifetime token counters from all historical database records."""
-    from backend.ai_helper import token_tracker
-
-    return token_tracker.recalculate_from_database(db=db)
-
-
-@app.delete("/api/llm/token-usage")
-def reset_llm_token_usage():
-    """Resets the session token usage counter."""
-    from backend.ai_helper import token_tracker
-
-    token_tracker.reset()
-    return {"message": "Token usage counter successfully reset."}
-
-
-# -------------------------------------------------------------
-# BYOK LLM Settings (persisted, encrypted; env vars override)
-# -------------------------------------------------------------
-class LlmSettingsIn(BaseModel):
-    openai_api_key: Optional[str] = None
-    gemini_api_key: Optional[str] = None
-    anthropic_api_key: Optional[str] = None
-    allow_cloud_fallback: Optional[bool] = None
-
-
-class LlmSettingsOut(BaseModel):
-    openai_configured: bool
-    gemini_configured: bool
-    anthropic_configured: bool
-    allow_cloud_fallback: bool
-
-
-def _masked_llm_settings() -> LlmSettingsOut:
-    creds = get_llm_credentials()
-    return LlmSettingsOut(
-        openai_configured=bool(creds["openai"]),
-        gemini_configured=bool(creds["gemini"]),
-        anthropic_configured=bool(creds["anthropic"]),
-        allow_cloud_fallback=is_cloud_fallback_allowed(),
-    )
-
-
-@app.get("/api/settings/llm", response_model=LlmSettingsOut)
-def get_llm_settings():
-    """Returns masked BYOK credential status and the cloud-fallback toggle (never raw keys)."""
-    return _masked_llm_settings()
-
-
-@app.put("/api/settings/llm", response_model=LlmSettingsOut)
-def update_llm_settings(payload: LlmSettingsIn):
-    """
-    Persists BYOK credentials (encrypted at rest) and the cloud-fallback toggle.
-    Pass an empty string to clear a key; omit a field (null) to leave it unchanged.
-    """
-    save_llm_settings(
-        openai_api_key=payload.openai_api_key,
-        gemini_api_key=payload.gemini_api_key,
-        anthropic_api_key=payload.anthropic_api_key,
-        allow_cloud_fallback=payload.allow_cloud_fallback,
-    )
-    # Re-evaluate the active provider so LLM queue concurrency/pacing follows the new config.
-    try:
-        detect_active_llm_provider()
-    except Exception:
-        pass
-    return _masked_llm_settings()
-
-
-# -------------------------------------------------------------
-# Embedding Backend Settings (local-first, 384-d contract)
-# - Selecting a model is a machine-level choice; switching the model invalidates
-#   existing vectors, so the frontend prompts the user to reindex.
-# -------------------------------------------------------------
-class EmbeddingSettingsIn(BaseModel):
-    backend: Optional[str] = None
-    model: Optional[str] = None
-    allow_download: Optional[bool] = None
-    server_url: Optional[str] = None
-    server_model: Optional[str] = None
-
-
-class EmbeddingSettingsOut(BaseModel):
-    backend: str
-    model: str
-    allow_download: bool
-    server_url: str
-    server_model: str
-    active_backend: str
-    model_cached: bool
-    dim: int
-
-
-def _embedding_settings_out() -> "EmbeddingSettingsOut":
-    from backend import embeddings
-    from backend.config import EMBEDDING_DIM, get_embedding_settings
-
-    settings = get_embedding_settings()
-    return EmbeddingSettingsOut(
-        backend=settings["backend"],
-        model=settings["model"],
-        allow_download=settings["allow_download"],
-        server_url=settings["server_url"],
-        server_model=settings["server_model"],
-        active_backend=embeddings.active_backend_name(settings),
-        model_cached=embeddings.local_model_cached(settings),
-        dim=EMBEDDING_DIM,
-    )
-
-
-@app.get("/api/settings/embeddings", response_model=EmbeddingSettingsOut)
-def get_embedding_settings_endpoint():
-    """Returns the effective embedding backend/model and whether the model is cached."""
-    return _embedding_settings_out()
-
-
-@app.put("/api/settings/embeddings", response_model=EmbeddingSettingsOut)
-def update_embedding_settings_endpoint(payload: EmbeddingSettingsIn):
-    """Persists embedding backend/model selection (env vars still override)."""
-    from backend.config import save_embedding_settings
-
-    save_embedding_settings(
-        backend=payload.backend,
-        model=payload.model,
-        allow_download=payload.allow_download,
-        server_url=payload.server_url,
-        server_model=payload.server_model,
-    )
-    return _embedding_settings_out()
-
-
-@app.post("/api/settings/embeddings/download", response_model=EmbeddingSettingsOut)
-def download_embedding_model():
-    """
-    Downloads/warms the local ONNX model by embedding a probe text. Enables downloads for
-    the call so the model is fetched, then reports cache status.
-    """
-    from backend import embeddings
-    from backend.config import get_embedding_settings
-
-    settings = dict(get_embedding_settings())
-    try:
-        backend = embeddings.OnnxEmbeddingBackend(
-            model_id=settings["model"],
-            cache_dir=embeddings.get_embedding_settings_cache_dir(),
-            allow_download=True,
-        )
-        backend.embed(["warmup"])
-    except Exception as e:  # noqa: BLE001 - surfaced to the caller as a failed download
-        logger.warning(f"Embedding model download failed: {e}")
-        raise HTTPException(
-            status_code=502, detail=f"Embedding model download failed: {e}"
-        ) from e
-    return _embedding_settings_out()
 
 
 # -------------------------------------------------------------
@@ -1797,14 +1087,41 @@ def gmail_connect():
         raise HTTPException(
             status_code=500, detail=f"Could not build Google auth URL: {e}"
         )
-    # Persist the PKCE verifier so the callback can complete the token exchange.
-    save_gmail_settings(code_verifier=result.get("code_verifier", ""))
+    # Persist the PKCE verifier and the OAuth nonce: the callback needs the first to finish the
+    # exchange and the second to prove the redirect answers a Connect this app started.
+    save_gmail_settings(
+        code_verifier=result.get("code_verifier", ""),
+        oauth_state=result.get("state", ""),
+    )
     return {"auth_url": result["auth_url"]}
 
 
 @app.get("/api/gmail/oauth2callback")
-def gmail_oauth2callback(code: Optional[str] = None, error: Optional[str] = None):
-    """Google loopback redirect target: exchanges the code and stores the refresh token."""
+def gmail_oauth2callback(
+    code: Optional[str] = None,
+    error: Optional[str] = None,
+    state: Optional[str] = None,
+):
+    """Google loopback redirect target: validates ``state``, exchanges the code, stores the token.
+
+    The route is public (it is the OAuth redirect), so ``state`` is the only thing that ties a
+    redirect to a Connect the operator started. Without it any cross-site navigation carrying a
+    ``code`` could force-connect a mailbox.
+    """
+    settings = get_gmail_settings()
+    expected_state = (settings.get("oauth_state") or "").strip()
+    if not expected_state or not state or not secrets.compare_digest(
+        state, expected_state
+    ):
+        logger.warning("Gmail OAuth callback rejected: state did not match a pending Connect.")
+        return HTMLResponse(
+            "<h3>OAuth state mismatch.</h3>"
+            "<p>Start the connection from the app's Gmail panel and try again.</p>",
+            status_code=400,
+        )
+    # Single use: consume the nonce before the exchange, so a replayed redirect cannot reuse it.
+    save_gmail_settings(oauth_state="")
+
     if error:
         return HTMLResponse(
             f"<h3>Gmail connection failed:</h3><p>{error}</p>", status_code=400
@@ -1849,9 +1166,109 @@ def gmail_disconnect():
     return {"status": "disconnected"}
 
 
+def _execute_gmail_sync(db: Session, progress_cb: Optional[Callable] = None) -> Dict[str, Any]:
+    """Fetch → classify → apply one Gmail run, persisting an honest OperationLog.
+
+    Shared by the synchronous endpoint and the background task runner so both paths record
+    the same counts and the same status vocabulary (issue #84). Deterministic: no LLM.
+    """
+    def _step(step: int, label: str) -> None:
+        if progress_cb:
+            progress_cb(step, label)
+
+    outcomes: List[Dict[str, Any]] = []
+    stats: Dict[str, Any] = {}
+    events: List[Dict[str, Any]] = []
+    updates = 0
+    opportunities = 0
+    error: Optional[str] = None
+
+    _step(1, "Fetching mail")
+    try:
+        events = gmail_client.run_gmail_sync(db, stats=stats)
+        _step(2, "Classifying applications")
+        updates = _apply_email_events_to_db(db, events)
+        _step(3, "Recording opportunities")
+        opportunities = _ingest_email_opportunities_to_db(db, events)
+    except Exception as exc:  # noqa: BLE001 - the failure is the record we must keep
+        error = str(exc)
+        logger.error(f"Gmail sync failed: {exc}")
+        # A failed run must not burn dedup marks on the messages it did process.
+        db.rollback()
+
+    messages_matched = int(stats.get("messages_matched") or 0)
+    if error:
+        channel_status.record(outcomes, "gmail", channel_status.ERROR, error)
+    elif not events:
+        # A quiet mailbox is a valid zero. Only matched-but-unclassified mail is a
+        # degradation (finding 63).
+        if messages_matched:
+            channel_status.record(
+                outcomes, "gmail", channel_status.DEGRADED_ZERO,
+                f"{messages_matched} message(s) matched, none classified",
+            )
+        else:
+            channel_status.record(
+                outcomes, "gmail", channel_status.OK,
+                "no matching messages in the window",
+            )
+    else:
+        channel_status.record(
+            outcomes, "gmail", channel_status.OK, f"{len(events)} event(s) classified"
+        )
+
+    status = channel_status.aggregate_status(outcomes)
+    pending = (
+        db.query(PendingEmailApplication)
+        .filter(PendingEmailApplication.state == "pending")
+        .count()
+    )
+    summary = (
+        f"Gmail sync: {messages_matched} messages matched, {len(events)} events, "
+        f"{updates} status updates, {opportunities} opportunities added."
+    )
+    note = channel_status.describe(outcomes)
+    if note:
+        summary = f"{summary} Degraded — {note}"
+    db.add(
+        OperationLog(
+            operation_type="gmail_sync",
+            status=status,
+            summary=summary,
+            details_json=sanitize_log_details(
+                {
+                    "emails_scanned": messages_matched,
+                    "status_messages": int(stats.get("status_messages_matched") or 0),
+                    "alert_messages": int(stats.get("alert_messages_matched") or 0),
+                    "emails_new": int(stats.get("new_processed") or 0),
+                    "events": len(events),
+                    "status_updates": updates,
+                    "opportunities_added": opportunities,
+                    "pending_email_applications": pending,
+                    "channels": outcomes,
+                }
+            ),
+            jobs_count=opportunities,
+            prompt_tokens=0,
+            completion_tokens=0,
+        )
+    )
+    db.commit()
+    _step(4, "Done")
+    return {
+        "status": status,
+        "emails_scanned": messages_matched,
+        "status_updates": updates,
+        "opportunities_added": opportunities,
+        "pending_email_applications": pending,
+        "error": error,
+        "message": summary,
+    }
+
+
 @app.post("/api/gmail/sync", response_model=GmailSyncResponse)
 def gmail_sync_now(db: Session = Depends(get_db)):
-    """Runs the opt-in, narrowly-scoped Gmail API sync."""
+    """Runs the opt-in, narrowly-scoped Gmail API sync (synchronous, for API/CLI callers)."""
     if not is_feature_enabled(db, "gmail_sync"):
         return GmailSyncResponse(
             status="disabled",
@@ -1861,18 +1278,15 @@ def gmail_sync_now(db: Session = Depends(get_db)):
         return GmailSyncResponse(
             status="not_connected", message="Connect Gmail in Settings first."
         )
-    try:
-        events = gmail_client.run_gmail_sync(db)
-        updates = _apply_email_events_to_db(db, events)
-        opportunities = _ingest_email_opportunities_to_db(db, events)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Gmail sync failed: {e}")
+    result = _execute_gmail_sync(db)
+    if result["error"]:
+        raise HTTPException(status_code=502, detail=f"Gmail sync failed: {result['error']}")
     return GmailSyncResponse(
         status="ok",
-        emails_scanned=len(events),
-        status_updates=updates,
-        opportunities_added=opportunities,
-        message=f"Gmail sync complete: {len(events)} events, {updates} status updates, {opportunities} opportunities added.",
+        emails_scanned=result["emails_scanned"],
+        status_updates=result["status_updates"],
+        opportunities_added=result["opportunities_added"],
+        message=result["message"],
     )
 
 
@@ -2212,11 +1626,15 @@ def list_jobs(
     source_type: Optional[str] = None,
     sync_batch: Optional[str] = None,
     new_from_sync: bool = Query(False),
+    limit: int = Query(1000, ge=1, le=5000),
     db: Session = Depends(get_db),
 ):
     """
     Lists tracked jobs with optional filters for status, in-progress state, company, score, title, location, work mode,
     source type (LinkedIn / Direct / Email), a specific sync batch, or "new from sync" review items.
+
+    Bounded by ``limit``: the ORDER BY is on the indexed ``created_at`` now, but an unbounded
+    ``.all()`` still serialises every row the table has ever held.
     """
     query = db.query(Job)
 
@@ -2286,7 +1704,7 @@ def list_jobs(
         elif wm == "onsite":
             query = query.filter(~Job.location.ilike("%remote%"))
 
-    jobs = query.order_by(Job.created_at.desc()).all()
+    jobs = query.order_by(Job.created_at.desc()).limit(limit).all()
 
     # Attach company_name helper
     prov_ctx = _resume_provenance_context(db)
@@ -2346,7 +1764,7 @@ HIRING_INTENT_KEYWORDS = (
 
 RADAR_ACTIVE_STATUSES = ("To Apply", "Shortlisted", "Saved")
 RADAR_APPLIED_STATUSES = ("Applied", "Screening", "Interview", "Offered")
-RADAR_EXCLUDED_STATUSES = ("Rejected", "Not Interested", "Ignored")
+RADAR_EXCLUDED_STATUSES = ("Rejected", "Closed", "Withdrawn", "Not Interested", "Ignored")
 
 
 class OpportunityRadarItem(BaseModel):
@@ -2373,19 +1791,6 @@ class OpportunityRadarItem(BaseModel):
     intent_score: int = 0
     intent_reasons: List[str] = []
 
-
-_UNKNOWN_COMPANY_NAMES = {"", "unknown company", "unknown", "n/a", "none", "null"}
-
-# Upper bound on per-sync LinkedIn saved-job detail-page navigations (each fetches the real
-# "About the job" text so the scorer has signal). Keeps a large saved-jobs library from turning
-# one sync into hundreds of page loads; the remainder stay unscored baselines.
-LINKEDIN_SAVED_JOB_DESC_FETCH_LIMIT = 25
-
-
-def _safe_company_name(name: Optional[str], fallback: str) -> str:
-    """Returns a usable employer name, substituting ``fallback`` for empty/placeholder values."""
-    cleaned = (name or "").strip()
-    return cleaned if cleaned.lower() not in _UNKNOWN_COMPANY_NAMES else fallback
 
 
 def compute_hiring_intent(job, now: Optional[datetime.datetime] = None):
@@ -2685,28 +2090,6 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
     return _apply_score_provenance(j_out, job, _resume_provenance_context(db))
 
 
-@app.get("/api/jobs/scrape-audit")
-def get_scrape_audit(db: Session = Depends(get_db)):
-    """Returns detailed diagnostics of the last job scrape run broken down by company from persistent OperationLogs."""
-    latest_op = (
-        db.query(OperationLog)
-        .filter(OperationLog.operation_type == "ats_scrape")
-        .order_by(OperationLog.created_at.desc())
-        .first()
-    )
-    audit_list = []
-    if latest_op and latest_op.details_json:
-        try:
-            details = json.loads(latest_op.details_json)
-            audit_list = details.get("audit_records", [])
-        except Exception:
-            pass
-    if not audit_list:
-        audit_list = LATEST_SCRAPE_AUDIT
-
-    return {"total_companies": len(audit_list), "audit": audit_list}
-
-
 @app.get("/api/jobs/{job_id}", response_model=JobOut)
 def get_job(job_id: int, db: Session = Depends(get_db)):
     """Retrieves a single job's details."""
@@ -2729,6 +2112,13 @@ def update_job_status(
         raise HTTPException(status_code=404, detail="Job not found.")
 
     old_status = job.status
+    if payload.status == old_status:
+        # The SPA's status <select> fires `change` even when the same option is re-picked, and a
+        # no-op write appended a "Shortlisted -> Shortlisted" event to the dossier (job 238).
+        # Nothing changed, so nothing is written.
+        j_out = JobOut.model_validate(job)
+        j_out.company_name = job.company.name if job.company else None
+        return _apply_score_provenance(j_out, job, _resume_provenance_context(db))
     job.status = payload.status
     # The user acted on this job, so it's no longer a "new from sync" review item.
     job.sync_batch_id = None
@@ -2902,13 +2292,6 @@ def get_job_hiring_team(job_id: int, db: Session = Depends(get_db)):
     )
 
 
-@app.post("/api/llm/queue/clear-background")
-def clear_background_tasks():
-    """Clears all background tasks from the LLM queue."""
-    llm_queue.clear_background_tasks()
-    return {"message": "Background tasks cleared successfully."}
-
-
 # -------------------------------------------------------------
 # Resume Endpoints (Encrypted Storage & Document Attachment)
 # -------------------------------------------------------------
@@ -2991,7 +2374,7 @@ async def upload_resume(file: UploadFile = File(...), db: Session = Depends(get_
         filename=new_resume.filename,
         is_active=new_resume.is_active,
         created_at=new_resume.created_at,
-        raw_preview=raw_text[:400] + ("..." if len(raw_text) > 400 else ""),
+        raw_preview=truncate_preview(raw_text),
         parsed_json=parsed_json,
         parser_version=new_resume.parser_version,
         parse_stale=(new_resume.parser_version or 0) < RESUME_PARSER_VERSION,
@@ -3172,6 +2555,8 @@ class UserPreferenceOut(BaseModel):
     consent_version: int = CONSENT_VERSION
     consent_required_features: List[str] = []
     scoring_config: Dict[str, float] = {}
+    similarity_thresholds: Dict[str, float] = {}
+    country_hubs: Dict[str, Any] = {}
     excluded_companies: str = ""
     skip_topics: str = ""
     extra_skills: List[str] = []
@@ -3192,49 +2577,6 @@ def normalize_target_cities(raw: Optional[str]) -> str:
     return ", ".join(p for p in parts if p.lower() != "remote")
 
 
-def _normalize_extra_skills(raw: Any) -> List[str]:
-    """Dedupe/trim a raw extra-skills payload (list or JSON) case-insensitively."""
-    items = raw if isinstance(raw, list) else []
-    seen: set = set()
-    out: List[str] = []
-    for s in items:
-        token = str(s).strip()
-        key = token.lower()
-        if token and key not in seen:
-            seen.add(key)
-            out.append(token)
-    return out
-
-
-def get_extra_skills(pref: "UserPreference") -> List[str]:
-    """Reads the user-owned extra-skills list from preferences JSON (deduped, trimmed)."""
-    try:
-        raw = json.loads(pref.extra_skills_json or "[]")
-    except Exception:
-        raw = []
-    return _normalize_extra_skills(raw)
-
-
-def _merge_extra_skills(parsed_resume: Optional[dict], extra_skills: List[str]) -> Optional[dict]:
-    """Merges the user-owned extra skills on top of the resume-derived skill list.
-
-    Returns a shallow copy (never mutates the caller's dict). Case-insensitive dedupe so a
-    skill the resume already covers is not double-counted by the scorer.
-    """
-    existing = [str(s) for s in ((parsed_resume or {}).get("skills") or [])]
-    seen = {s.lower() for s in existing}
-    additions: List[str] = []
-    for s in extra_skills or []:
-        token = (s or "").strip()
-        key = token.lower()
-        if token and key not in seen:
-            seen.add(key)
-            additions.append(token)
-    merged = dict(parsed_resume or {})
-    merged["skills"] = existing + additions
-    return merged
-
-
 @app.get("/api/preferences", response_model=UserPreferenceOut)
 def get_preferences(db: Session = Depends(get_db)):
     """Returns server-persisted candidate discovery preferences and opt-in feature flags."""
@@ -3252,9 +2594,13 @@ def get_preferences(db: Session = Depends(get_db)):
         consent_version=CONSENT_VERSION,
         consent_required_features=list(CONSENT_REQUIRED_FEATURES),
         scoring_config=get_scoring_config(db),
+        similarity_thresholds={
+            "dismissal": DISMISSAL_SIMILARITY_THRESHOLD,
+        },
+        country_hubs=load_country_hubs(),
         excluded_companies=pref.excluded_companies
         if pref.excluded_companies is not None
-        else "amazon",
+        else DEFAULT_EXCLUDED_COMPANIES,
         skip_topics=pref.skip_topics or "",
         extra_skills=get_extra_skills(pref),
         pending_email_applications=(
@@ -3363,8 +2709,7 @@ def list_resumes(db: Session = Depends(get_db)):
                 filename=r.filename,
                 is_active=r.is_active,
                 created_at=r.created_at,
-                raw_preview=decrypted_content[:400]
-                + ("..." if len(decrypted_content) > 400 else ""),
+                raw_preview=truncate_preview(decrypted_content),
                 parsed_json=parsed_json,
                 parser_version=r.parser_version,
                 parse_stale=(r.parser_version or 0) < RESUME_PARSER_VERSION,
@@ -3620,8 +2965,6 @@ def clean_system_cache(
 # -------------------------------------------------------------
 
 # Global cancellation events for background scraping & sync tasks
-scrape_cancel_event = threading.Event()
-linkedin_cancel_event = threading.Event()
 
 
 class SingleTailorRequest(BaseModel):
@@ -3775,417 +3118,6 @@ def enrich_role_titles(payload: RoleEnrichRequest):
             add(variant, f"Related to '{title}'")
 
     return RoleEnrichResponse(suggestions=suggestions[:15])
-
-
-@app.post("/api/companies/{company_id}/scrape-jobs", response_model=ScrapeResponse)
-def scrape_single_company_jobs(
-    company_id: int,
-    target_titles: Optional[str] = None,
-    target_locations: Optional[str] = None,
-    target_cities: Optional[str] = None,
-    work_mode: Optional[str] = None,
-    db: Session = Depends(get_db),
-):
-    """Scrapes latest job postings for a single target organization with optional
-    role/country/city/work-mode filters."""
-    return trigger_jobs_scrape(
-        ScrapeRequest(
-            company_id=company_id,
-            target_titles=target_titles,
-            target_locations=target_locations,
-            target_cities=target_cities,
-            work_mode=work_mode,
-        ),
-        db=db,
-    )
-
-
-@app.post("/api/jobs/scrape", response_model=ScrapeResponse)
-def trigger_jobs_scrape(
-    payload: ScrapeRequest = ScrapeRequest(), db: Session = Depends(get_db)
-):
-    """Synchronous ATS portal discovery scan (request path)."""
-    return _execute_ats_scrape(payload, db)
-
-
-def _execute_ats_scrape(
-    payload: ScrapeRequest,
-    db: Session,
-    cancel_token: Optional[CancellationToken] = None,
-    progress_cb: Optional[Callable] = None,
-) -> ScrapeResponse:
-    """
-    Triggers fast job discovery across ATS portals (Greenhouse/Lever/Custom)
-    with instant match scoring without blocking on heavy LLM text generation.
-    """
-    scrape_cancel_event.clear()
-    if progress_cb:
-        progress_cb(
-            step=1,
-            label="Scanning ATS portals (Greenhouse/Lever/Ashby/custom)...",
-            total_steps=1,
-        )
-    start_tok = token_tracker.get_stats()
-    # Opt-in portal gating: disabled portals/blocklisted companies are skipped entirely.
-    _flags = get_feature_flags(db)
-    _ats_on = bool(_flags.get("ats_portals", True))
-    query = db.query(Company)
-    if payload.company_id:
-        query = query.filter(Company.id == payload.company_id)
-    companies = query.all()
-
-    if not companies:
-        return ScrapeResponse(
-            jobs_found=0,
-            jobs_added=0,
-            companies_updated=0,
-            message="No companies configured for scraping.",
-        )
-
-    # Fetch active candidate resume for automated scoring
-    active_resume = (
-        db.query(Resume)
-        .filter(Resume.is_active == True)
-        .order_by(Resume.created_at.desc())
-        .first()
-    )
-    resume_text = decrypt_data(active_resume.content_encrypted) if active_resume else ""
-    parsed_resume = _parsed_resume_of(active_resume)
-
-    # Parse target criteria filters into the shared preference gate (single source of truth).
-    title_filters = (
-        [t.strip().lower() for t in payload.target_titles.split(",") if t.strip()]
-        if payload.target_titles
-        else []
-    )
-    loc_filters = (
-        [l.strip().lower() for l in payload.target_locations.split(",") if l.strip()]
-        if payload.target_locations
-        else []
-    )
-    city_filters = (
-        [c.strip().lower() for c in payload.target_cities.split(",") if c.strip()]
-        if payload.target_cities
-        else []
-    )
-    wm_filter = (payload.work_mode or "").strip().lower()
-    pref_filter = PreferenceFilter(
-        PreferenceCriteria(
-            titles=title_filters,
-            locations=loc_filters,
-            cities=city_filters,
-            work_mode=wm_filter,
-        )
-    )
-
-    total_found = 0
-    total_added = 0
-    companies_updated = 0
-
-    # One shared pacer for the whole run: same-host requests across portals stay spaced and share
-    # the per-run request ceiling. See docs/POLITE_CRAWLING_AND_WORKDAY.md §2.
-    try:
-        from backend.ats.engine import set_active_pacer
-        from backend.ats.pacing import build_pacer
-
-        set_active_pacer(build_pacer())
-    except Exception as _pacing_err:  # noqa: BLE001 - pacing is best-effort
-        logger.warning(f"Could not initialise scrape pacing: {_pacing_err}")
-
-    global LATEST_SCRAPE_AUDIT
-    audit_records = []
-
-    for comp in companies:
-        if cancel_token:
-            cancel_token.check()
-        if scrape_cancel_event.is_set():
-            logger.info("Job scraping cancelled by user.")
-            break
-
-        # Blocklist gate: never scan excluded employers/domains (e.g. Amazon).
-        if is_company_excluded(comp.name, comp.domain or comp.careers_url or "", db):
-            logger.info(f"Skipping scan for excluded company '{comp.name}'.")
-            audit_records.append(
-                {
-                    "company": comp.name,
-                    "portal_type": "Excluded",
-                    "careers_url": comp.careers_url or "",
-                    "status": "Excluded",
-                    "raw_found": 0,
-                    "added": 0,
-                    "diagnostics": "Skipped: company matches the excluded-companies blocklist.",
-                }
-            )
-            continue
-
-        # 1. Update company intelligence if empty from catalog or config
-        if not comp.recent_news or not comp.salary_insights:
-            cat_match = get_catalog_company(comp.name)
-            if cat_match:
-                comp.description = comp.description or cat_match.get("description")
-                comp.recent_news = cat_match.get("recent_news")
-                comp.salary_insights = cat_match.get("salary_insights")
-                comp.hiring_process = cat_match.get("hiring_process")
-                companies_updated += 1
-
-        discovered_jobs = []
-        comp_lower = comp.name.lower()
-
-        # A. Specialized company APIs (e.g. Uber) — opt-in (unofficial internal API)
-        if _ats_on and _flags.get("ats_uber") and "uber" in comp_lower:
-            discovered_jobs.extend(scrape_uber_jobs()[:35])
-
-        # B–C. Config-driven ATS portals (Greenhouse/Lever/Ashby/SmartRecruiters/Workable/Workday).
-        # One loop over data/ats_portals.json; each portal is gated by its own opt-in feature flag.
-        # A careers_url that *is* an ATS board pins the scan to that portal. Any other careers_url
-        # (auto-derived `https://www.<domain>/careers`, a direct portal) is never usable as a board
-        # slug, so those companies are probed by name instead (Uber (A) and Custom HTML (D) stay
-        # bespoke).
-        _pinned_portal = ats_for_url(comp.careers_url) if comp.careers_url else None
-        for _portal in _ATS_PORTALS:
-            if not (_ats_on and _flags.get(_portal.default_flag)):
-                continue
-            if _pinned_portal and _portal.id != _pinned_portal:
-                continue
-            _portal_fn = globals()[_portal.scraper_attr]
-            _portal_jobs = _portal_fn(
-                comp.name,
-                title_filters=title_filters,
-                city_filters=city_filters,
-                location_filters=loc_filters,
-                work_mode=wm_filter,
-                max_matches=35,
-                careers_url=comp.careers_url if _pinned_portal == _portal.id else None,
-            )
-            if _portal_jobs:
-                discovered_jobs.extend(_portal_jobs)
-
-        # D. Custom HTML portal scraper — opt-in (arbitrary HTML scraping)
-        if _ats_on and _flags.get("ats_custom_html") and comp.careers_url:
-            custom_jobs = scrape_custom_jobs(comp.careers_url)
-            if custom_jobs:
-                discovered_jobs.extend(custom_jobs[:35])
-
-        comp_raw_count = len(discovered_jobs)
-        total_found += comp_raw_count
-        comp_added = 0
-
-        # remove duplicates from discovered jobs based on url
-        unique_jobs = []
-        seen_urls = set()
-        for job in discovered_jobs:
-            if job["url"] not in seen_urls:
-                seen_urls.add(job["url"])
-                unique_jobs.append(job)
-        discovered_jobs = unique_jobs
-
-        # 3. Process each discovered job
-        for j in discovered_jobs:
-            if scrape_cancel_event.is_set():
-                logger.info("Job scraping cancelled by user.")
-                break
-
-            # Semantic & Synonym Filtering via the shared preference gate
-            if not pref_filter.accepts(j.get("title", ""), j.get("location", ""), j.get("description", "")):
-                continue
-
-            existing = (
-                db.query(Job)
-                .filter(Job.company_id == comp.id, Job.title == j["title"])
-                .first()
-            )
-
-            if existing:
-                continue
-
-            # Evaluate due diligence / ghost job flags
-            dd = evaluate_job_due_diligence(
-                job_title=j["title"],
-                source_type=j.get("source_type", "Direct"),
-                portal_jobs=discovered_jobs,
-            )
-
-            # Negative Role Filter
-            dismissal_match = check_semantic_dismissal(
-                j["title"], j.get("description", ""), db, company_name=comp.name
-            )
-            job_status = "Not Interested" if dismissal_match else "To Apply"
-            match_analysis = (
-                f"Auto-filtered by semantic ignore rule (matched: '{dismissal_match['matched_title']}' with {int(dismissal_match['similarity'] * 100)}% similarity)"
-                if dismissal_match
-                else None
-            )
-
-            # Requirement-coverage match score (deterministic engine).
-            match_score = 0
-            match_scored = False
-            score_method = match_scored_at = match_band = apply_recommendation = None
-            if not dismissal_match:
-                (
-                    match_score,
-                    engine_analysis,
-                    match_scored,
-                    score_method,
-                    match_scored_at,
-                    match_band,
-                    apply_recommendation,
-                    strengths,
-                    gaps,
-                    partials,
-                ) = _score_job_with_engine(
-                    db,
-                    resume_text,
-                    j.get("description") or "",
-                    parsed_resume=parsed_resume,
-                    job_title=j.get("title") or "",
-                )
-                if engine_analysis:
-                    match_analysis = engine_analysis
-
-            job_emb = generate_embeddings(
-                f"{j['title']} {clean_job_description(j.get('description', '') or j['title'])}"
-            )
-            new_job = Job(
-                company_id=comp.id,
-                title=j["title"],
-                description=j.get("description", ""),
-                url=j.get("url", comp.careers_url or ""),
-                salary_range=j.get("salary_range")
-                or comp.salary_insights
-                or "Competitive",
-                location=j.get("location", "Remote / Various"),
-                source=j.get("source", "Careers Portal"),
-                source_type=j.get("source_type", "Direct"),
-                status=job_status,
-                match_score=match_score,
-                match_analysis=match_analysis,
-                match_scored=match_scored,
-                score_method=score_method,
-                match_scored_at=match_scored_at,
-                **(_score_provenance(db) if match_scored else {}),
-                match_band=match_band,
-                apply_recommendation=apply_recommendation,
-                match_strengths_json=json.dumps(strengths) if match_scored else None,
-                match_gaps_json=json.dumps(gaps) if match_scored else None,
-                match_partials_json=json.dumps(partials) if match_scored else None,
-                cover_letter_draft=None,
-                tailored_resume_points=None,
-                cold_message_draft=None,
-                is_ghost_job=dd["is_ghost_job"],
-                repost_count=0,
-                embedding=job_emb,
-            )
-            db.add(new_job)
-            total_added += 1
-            comp_added += 1
-
-        # Commit per company so the SQLite write lock is held for one portal fetch instead of the
-        # whole scan: a long run starved every other writer past the 30 s busy_timeout.
-        persist_error = None
-        try:
-            db.commit()
-        except Exception as commit_err:  # noqa: BLE001 - one failed batch must not abort the scan
-            persist_error = str(commit_err)[:200]
-            logger.warning(
-                f"Failed to persist scrape batch for '{comp.name}': {commit_err}"
-            )
-            try:
-                db.rollback()
-            except Exception:  # noqa: BLE001 - recovery is best-effort
-                pass
-            total_added -= comp_added
-            comp_added = 0
-
-        status_text = (
-            "Success"
-            if comp_added > 0
-            else ("Filtered" if comp_raw_count > 0 else "0 Postings Found")
-        )
-        cat_match = get_catalog_company(comp.name)
-        comp_portal_type = (cat_match.get("portal_type") if cat_match else None) or (
-            "Greenhouse"
-            if "greenhouse" in (comp.careers_url or "").lower()
-            else "Direct"
-        )
-        diag_text = (
-            f"Found {comp_raw_count} postings, added {comp_added} matching targets."
-        )
-        if comp_raw_count == 0:
-            diag_text = f"No public API listings returned for {comp.name} ({comp_portal_type}). May require direct portal login or SPA renderer."
-        if persist_error:
-            status_text = "Failed"
-            diag_text = (
-                f"Found {comp_raw_count} postings, none persisted: batch write failed "
-                f"({persist_error})."
-            )
-
-        audit_records.append(
-            {
-                "company": comp.name,
-                "portal_type": comp_portal_type,
-                "careers_url": comp.careers_url or "",
-                "status": status_text,
-                "raw_found": comp_raw_count,
-                "added": comp_added,
-                "diagnostics": diag_text,
-            }
-        )
-
-    LATEST_SCRAPE_AUDIT = audit_records
-    is_cancelled = scrape_cancel_event.is_set()
-    if is_cancelled:
-        msg = f"Scrape stopped by user. {total_added} targeted jobs saved."
-    elif total_added == 0 and total_found > 0:
-        filter_summary = f"Roles: '{payload.target_titles or 'All'}' | Loc: '{payload.target_locations or 'All'}'"
-        msg = f"Scanned {total_found} positions across {len(companies)} companies. 0 matched filters ({filter_summary}). Tip: Select 'All Countries' or adjust role keywords."
-    else:
-        msg = f"Scrape completed: {total_found} positions scanned, {total_added} targeted jobs added."
-
-    # Persist Operation Audit Log
-    try:
-        end_tok = token_tracker.get_stats()
-        p_used = max(0, end_tok["prompt_tokens"] - start_tok["prompt_tokens"])
-        c_used = max(0, end_tok["completion_tokens"] - start_tok["completion_tokens"])
-
-        op_log = OperationLog(
-            operation_type="ats_scrape",
-            status="Cancelled" if is_cancelled else "Completed",
-            summary=msg,
-            details_json=sanitize_log_details(
-                {
-                    "companies_scanned": len(companies),
-                    "jobs_found": total_found,
-                    "jobs_added": total_added,
-                    "audit": audit_records,
-                }
-            ),
-            jobs_count=total_added,
-            prompt_tokens=p_used,
-            completion_tokens=c_used,
-        )
-        db.add(op_log)
-        db.commit()
-    except Exception as op_err:
-        logger.warning(f"Failed to persist OperationLog for scrape: {op_err}")
-
-    if progress_cb:
-        progress_cb(step=1, label=msg, items_found=total_added, total_steps=1)
-
-    # Drop the run-level pacer: its per-host counters/cooldowns are run-scoped and must not leak
-    # into the next run. See backend/ats/engine.py::clear_active_pacer.
-    try:
-        from backend.ats.engine import clear_active_pacer
-
-        clear_active_pacer()
-    except Exception:  # noqa: BLE001 - best-effort cleanup
-        pass
-
-    return ScrapeResponse(
-        jobs_found=total_found,
-        jobs_added=total_added,
-        companies_updated=companies_updated,
-        message=msg,
-    )
 
 
 @app.post("/api/jobs/prune")
@@ -4411,32 +3343,6 @@ def bulk_update_job_status(payload: BulkStatusRequest, db: Session = Depends(get
         "message": f"Updated {len(updated)} job(s) to '{payload.status}'.",
         "job_ids": updated,
     }
-
-
-@app.post("/api/jobs/scrape/stop")
-def stop_jobs_scrape():
-    """Signals the active job scraping background loop to cancel immediately."""
-    scrape_cancel_event.set()
-    return {"message": "Job scraping process stopped."}
-
-
-@app.post("/api/linkedin/sync/stop")
-def stop_linkedin_sync(db: Session = Depends(get_db)):
-    """Signals the active LinkedIn sync to abort and cancels any queued (not yet started) scan."""
-    linkedin_cancel_event.set()
-    cancelled = 0
-    try:
-        for row in linkedin_scan_queue.cancel_pending(db):
-            cancelled += 1
-            if row.task_id:
-                task_engine.cancel_task(row.task_id)
-    except Exception as cancel_err:  # noqa: BLE001 - stopping the live scan still succeeds
-        logger.warning(f"Could not cancel queued LinkedIn scans: {cancel_err}")
-
-    message = "LinkedIn sync process stopped."
-    if cancelled:
-        message += f" {cancelled} queued scan(s) cancelled."
-    return {"message": message}
 
 
 @app.post("/api/jobs/{job_id}/apply", response_model=ApplyResponse)
@@ -4815,321 +3721,6 @@ def career_copilot_chat(req: ChatAssistantRequest, db: Session = Depends(get_db)
         )
 
 
-def _derive_strengths_gaps(assessment, match=None) -> tuple:
-    """Derive the strengths/gaps/partials bullet lists from the requirement breakdown.
-
-    Returns ``(strengths, gaps, partials)``:
-    - strengths: requirements whose status is ``met`` (top up to 4 with partials so the
-      panel is never empty when the resume meets at least some requirements).
-    - gaps: must-have requirements with status ``missing`` (truly absent from the resume).
-    - partials: must-have requirements with status ``partial`` (resume has *some*
-      evidence but not full coverage — e.g. "10+ years" when the candidate has fewer).
-      Surfaced separately so a moderate score is explainable without polluting the
-      Skills Insights aggregation (which only counts truly-missing skills).
-
-    ``match`` is optional; missing must-haves are derived from the assessment when it is
-    omitted (used by the deterministic classifier path).
-    """
-    reqs = assessment.requirements
-    strengths = [r.text for r in reqs if r.status == "met" and r.text]
-    partials = [
-        r.text
-        for r in reqs
-        if r.category == "must_have" and r.status == "partial" and r.text
-    ]
-    # Case-insensitive helper so JD-text duplicates that differ only in case are treated
-    # as the same requirement.
-    def _norm(s: str) -> str:
-        return s.strip().lower()
-
-    seen_strengths = {_norm(s) for s in strengths}
-    # Pad strengths to 4 with partials first, so the padding items are removed from the
-    # partials list afterward (an item never appears in BOTH panels).
-    if len(strengths) < 4:
-        for p in partials:
-            if len(strengths) >= 4:
-                break
-            if _norm(p) not in seen_strengths:
-                seen_strengths.add(_norm(p))
-                strengths.append(p)
-    strengths = list(dict.fromkeys(strengths))[:4]  # case-sensitive dedupe + hard cap
-    # Now build partials: drop anything already claimed by strengths (case-insensitive),
-    # and dedupe among themselves.
-    seen_partials: set = set()
-    unique_partials: List[str] = []
-    for p in partials:
-        key = _norm(p)
-        if key not in seen_strengths and key not in seen_partials:
-            seen_partials.add(key)
-            unique_partials.append(p)
-    partials = unique_partials[:4]
-    if match is not None:
-        gaps = list(match.missing_must_haves)
-    else:
-        gaps = [
-            r.text
-            for r in reqs
-            if r.category == "must_have" and r.status == "missing" and r.text
-        ]
-    for req in reqs:
-        if req.status == "missing" and req.text and req.text not in gaps:
-            gaps.append(req.text)
-    return strengths[:4], gaps[:3], partials[:4]
-
-
-def _parsed_resume_of(resume):
-    """Decrypt and parse a resume's structured JSON, or None."""
-    if not (resume and getattr(resume, "parsed_json_encrypted", None)):
-        return None
-    try:
-        return json.loads(decrypt_data(resume.parsed_json_encrypted))
-    except Exception:
-        return None
-
-
-def _active_resume_row(db: Session):
-    return (
-        db.query(Resume)
-        .filter(Resume.is_active == True)  # noqa: E712 - ORM filter
-        .order_by(Resume.created_at.desc())
-        .first()
-    )
-
-
-def _score_provenance(db: Session) -> dict:
-    """The resume version a score computed now belongs to (issue #56).
-
-    Returns kwargs for ``Job(...)`` / setattr on an existing row. Empty when there is no resume,
-    so an unscored row is never given provenance it does not have.
-    """
-    resume = _active_resume_row(db)
-    if not resume:
-        return {}
-    return {
-        "scored_resume_id": resume.id,
-        "scored_resume_fingerprint": resume.fingerprint,
-    }
-
-
-def _resume_score_counts(db: Session) -> dict:
-    """Map resume fingerprint -> number of stored scores produced by it (issue #58)."""
-    from sqlalchemy import func
-
-    rows = (
-        db.query(Job.scored_resume_fingerprint, func.count(Job.id))
-        .filter(Job.scored_resume_fingerprint.isnot(None))
-        .group_by(Job.scored_resume_fingerprint)
-        .all()
-    )
-    return {fingerprint: count for fingerprint, count in rows if fingerprint}
-
-
-def _resume_provenance_context(db: Session) -> dict:
-    """Lookup tables for deriving ``score_resume_state`` without a query per job."""
-    active = _active_resume_row(db)
-    known = {}
-    for fingerprint, filename, created_at in db.query(
-        Resume.fingerprint, Resume.filename, Resume.created_at
-    ).all():
-        if fingerprint:
-            known.setdefault(fingerprint, (filename, created_at))
-    return {
-        "active_fingerprint": active.fingerprint if active else None,
-        "known": known,
-    }
-
-
-def _apply_score_provenance(job_out: "JobOut", job: Job, ctx: dict) -> "JobOut":
-    """Label a serialized job with the state of the resume version that produced its score.
-
-    ``current`` also covers rows scored before provenance existed: unknown is treated as current
-    (decision on #56) so the existing feed is not retroactively marked degraded.
-    """
-    fingerprint = getattr(job, "scored_resume_fingerprint", None)
-    if not fingerprint:
-        job_out.score_resume_state = "current"
-        return job_out
-    if fingerprint == ctx.get("active_fingerprint"):
-        job_out.score_resume_state = "current"
-    elif fingerprint in ctx.get("known", {}):
-        job_out.score_resume_state = "stale"
-    else:
-        job_out.score_resume_state = "deleted"
-    filename, created_at = ctx.get("known", {}).get(fingerprint, (None, None))
-    job_out.score_resume_filename = filename
-    job_out.score_resume_created_at = created_at
-    return job_out
-
-
-def _attach_outreach_guidance(db: Session, job: Job, job_out: "JobOut") -> "JobOut":
-    """Attach human-in-the-loop talking points when the job has an outreach draft (issue #27).
-
-    Derived on read from the JD and the active resume, so nothing is persisted and no score is
-    affected. Best-effort: a failure here must never break serialization.
-    """
-    if not job.cold_message_draft:
-        return job_out
-    try:
-        active = (
-            db.query(Resume)
-            .filter(Resume.is_active == True)
-            .order_by(Resume.created_at.desc())
-            .first()
-        )
-        if not active:
-            return job_out
-        from backend.ai_helper import build_outreach_guidance
-
-        job_out.outreach_guidance = build_outreach_guidance(
-            job.description or "",
-            decrypt_data(active.content_encrypted),
-            job.title or "",
-        )
-    except Exception as e:
-        logger.debug(f"Outreach guidance unavailable for job {job.id}: {e}")
-    return job_out
-
-
-def _job_out(db: Session, job: Job, ctx: Optional[dict] = None) -> "JobOut":
-    """Serialize a job with company name and score provenance attached."""
-    job_out = JobOut.model_validate(job)
-    job_out.company_name = job.company.name if job.company else None
-    _apply_score_provenance(job_out, job, ctx or _resume_provenance_context(db))
-    return _attach_outreach_guidance(db, job, job_out)
-
-
-_JD_CUE_RE = re.compile(
-    r"\b(experience|responsibilit\w*|qualification\w*|requirements?|skills?|"
-    r"proficien\w*|knowledge|you(?:'ll| will)|we(?:'re| are) looking for|"
-    r"years? of|degree|what you(?:'ll| will)|about (?:the|this) role)\b",
-    re.IGNORECASE,
-)
-
-
-def _looks_like_job_description(text: str) -> bool:
-    """Substantive JDs carry role/qualification cues; discovery artifacts (LinkedIn
-    alert/saved snippets, Gmail recruiter lines, truncated link previews) do not, so
-    they should not consume a bounded LLM fallback call."""
-    return bool(_JD_CUE_RE.search(text or ""))
-
-
-def _deterministic_analysis_text(det) -> str:
-    """Compact strengths/gaps/partials narrative for the deterministic classifier path."""
-    strengths, gaps, partials = det.get("strengths") or [], det.get("gaps") or [], det.get("partials") or []
-    parts = []
-    if strengths:
-        parts.append(f"Strengths: {', '.join(strengths)}")
-    if partials:
-        parts.append(f"Partial coverage: {', '.join(partials)}")
-    if gaps:
-        parts.append(f"Gaps: {', '.join(gaps)}")
-    if parts:
-        return ". ".join(parts)
-    return det["feedback"]
-
-
-def _score_job_with_engine(
-    db, resume_text, description, parsed_resume=None, job_title=""
-) -> ScoringResult:
-    """Score a discovered job: deterministic engine first, bounded LLM fallback.
-
-    Returns a :class:`ScoringResult` namedtuple ``(score, analysis, scored, method, timestamp,
-    band, recommendation, strengths, gaps, partials)``. Failures degrade to an unscored baseline
-    rather than fabricating a score.
-    """
-    unscored = ScoringResult(0, "", False, None, None, None, None, [], [], [])
-    if not (resume_text or "").strip() or not (description or "").strip():
-        return unscored
-    if len(description.strip()) < MIN_JOB_DESCRIPTION_CHARS:
-        # No substantive job description -> do not fabricate a score.
-        return unscored
-
-    # The user-owned extra-skills profile is evidence on top of the resume: every scoring
-    # path (deterministic + LLM fallback) reads parsed_resume, so merge once here.
-    try:
-        extra = get_extra_skills(get_user_preferences(db))
-    except Exception:
-        extra = []
-    if extra:
-        parsed_resume = _merge_extra_skills(parsed_resume, extra)
-
-    det_errored = False
-    det_match_details = None
-    if DETERMINISTIC_BULK_SCORING:
-        try:
-            det_match_details = _deterministic_match(
-                db, resume_text, description, parsed_resume=parsed_resume, job_title=job_title
-            )
-        except Exception as det_err:
-            logger.warning(
-                f"Deterministic scoring errored ({det_err}); falling back to the LLM engine."
-            )
-            det_errored = True
-            det_match_details = None
-    if det_match_details:
-        return ScoringResult(
-            score=det_match_details["score"],
-            analysis=_deterministic_analysis_text(det_match_details),
-            scored=True,
-            method=det_match_details["method"],
-            timestamp=datetime.datetime.now(datetime.timezone.utc),
-            band=det_match_details["band"],
-            recommendation=det_match_details["recommendation"],
-            strengths=list(det_match_details.get("strengths") or []),
-            gaps=list(det_match_details.get("gaps") or []),
-            partials=list(det_match_details.get("partials") or []),
-        )
-
-    # A deterministic *error* always falls back (per requirement); a clean "no requirements"
-    # result on a non-JD discovery artifact does not, so it does not burn an LLM call.
-    if (
-        DETERMINISTIC_BULK_SCORING
-        and not det_errored
-        and not _looks_like_job_description(description)
-    ):
-        return unscored
-
-    # Bounded LLM fallback for signal-less JDs the deterministic extractor cannot use.
-    try:
-        assessment, match = assess_job_requirements(
-            resume_text,
-            description,
-            parsed_resume=parsed_resume,
-            scoring_config=ScoringConfig.from_mapping(get_scoring_config(db)),
-            timeout=LLM_INTERACTIVE_TIMEOUT,
-        )
-    except Exception as e:
-        logger.warning(f"Match scoring skipped: {e}")
-        return unscored
-
-    if match.score is None or not assessment.requirements:
-        return ScoringResult(
-            score=0,
-            analysis=(assessment.summary if assessment else ""),
-            scored=False,
-            method=None,
-            timestamp=None,
-            band=None,
-            recommendation=None,
-            strengths=[],
-            gaps=[],
-            partials=[],
-        )
-    l_strengths, l_gaps, l_partials = _derive_strengths_gaps(assessment, match)
-    return ScoringResult(
-        score=match.score,
-        analysis=_match_analysis_text(assessment, match),
-        scored=True,
-        method=match.method,
-        timestamp=datetime.datetime.now(datetime.timezone.utc),
-        band=match.band,
-        recommendation=match.apply_recommendation,
-        strengths=list(l_strengths),
-        gaps=list(l_gaps),
-        partials=list(l_partials),
-    )
-
-
 @app.post("/api/match/analyze", response_model=MatchAnalyzeResponse)
 def analyze_job_match_endpoint(
     payload: MatchAnalyzeRequest, db: Session = Depends(get_db)
@@ -5198,14 +3789,20 @@ def analyze_job_match_endpoint(
         except Exception as ev_err:
             logger.debug(f"Resume evidence retrieval skipped: {ev_err}")
 
-    det_match_details = _deterministic_match(
-        db,
-        resume_text,
-        description,
-        parsed_resume,
-        job_title=payload.job_title or "",
-        location=payload.location or "",
-    )
+    try:
+        det_match_details = _deterministic_match(
+            db,
+            resume_text,
+            description,
+            parsed_resume,
+            job_title=payload.job_title or "",
+            location=payload.location or "",
+        )
+    except Exception as det_err:
+        # A deterministic crash is an error, not "no requirements": fall through to the
+        # LLM path instead of surfacing a 500 (finding 86).
+        logger.warning(f"Deterministic match errored ({det_err}); using LLM analysis.")
+        det_match_details = None
     if det_match_details:
         return MatchAnalyzeResponse(
             match_score=det_match_details["score"],
@@ -5396,8 +3993,7 @@ def launch_interactive_browser_session(
     Launches an interactive (headed) Chromium browser session using the persistent Chrome profile (.chrome_profile).
     Allows user to sign in to LinkedIn and career portals once so cookies/tokens persist for all future agent operations.
     """
-    from backend.playwright_app import clean_stale_profile_locks
-    import subprocess
+    from backend.playwright_app import run_interactive_session
 
     final_url = "https://www.linkedin.com/login"
     if payload and payload.url:
@@ -5412,1128 +4008,24 @@ def launch_interactive_browser_session(
             detail="Invalid URL scheme. Only 'http://' and 'https://' URLs are permitted for interactive sessions.",
         )
 
-    def run_browser():
-        try:
-            clean_stale_profile_locks()
-            with sync_playwright() as p:
-                context = get_persistent_browser_context(p, headless=False)
-                page = context.pages[0] if context.pages else context.new_page()
-                page.goto(final_url, wait_until="domcontentloaded", timeout=60000)
-                page.bring_to_front()
-
-                # Force foreground focus on macOS
-                for app_name in [
-                    "Google Chrome for Testing",
-                    "Google Chrome",
-                    "Chromium",
-                ]:
-                    subprocess.run(
-                        [
-                            "osascript",
-                            "-e",
-                            f'tell application "{app_name}" to activate',
-                        ],
-                        check=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-
-                # Keep session open for user to log in
-                page.wait_for_timeout(600000)
-                context.close()
-        except Exception as e:
-            logger.error(f"Interactive browser session error: {e}")
-
-    thread = threading.Thread(target=run_browser, daemon=True)
-    thread.start()
+    task_id = task_engine.submit_task(
+        "browser_session",
+        "Interactive browser login",
+        run_interactive_session,
+        final_url,
+    )
 
     return {
         "status": "Launched",
-        "message": f"Interactive browser launched for '{final_url}'. Sign in to your account, and your session will persist automatically in .chrome_profile.",
+        "task_id": task_id,
+        "hold_seconds": INTERACTIVE_SESSION_HOLD_SECONDS,
+        "message": (
+            f"Interactive browser launched for '{final_url}'. Sign in to your account, "
+            f"and your session will persist automatically in .chrome_profile. The window "
+            f"closes itself after {INTERACTIVE_SESSION_HOLD_SECONDS // 60} minutes, or "
+            f"cancel it from the task list."
+        ),
     }
-
-
-def _linkedin_upsert_company(db: Session, raw_name: Optional[str]) -> Company:
-    """Find or create the employer row for a LinkedIn posting (flush assigns the id)."""
-    comp_name = _safe_company_name(raw_name, "LinkedIn Network")
-    comp = db.query(Company).filter(Company.name.ilike(comp_name)).first()
-    if not comp:
-        comp = Company(
-            name=comp_name,
-            domain=f"{comp_name.lower().replace(' ', '')}.com",
-        )
-        db.add(comp)
-        db.flush()
-    return comp
-
-
-def _linkedin_resolve_portal(
-    comp: Company, url: str, company_name: str
-) -> Tuple[str, Optional[dict]]:
-    """
-    Upgrade a LinkedIn posting URL to the employer's canonical ATS apply URL when
-    discoverable, and backfill the company's careers URL / domain. Returns the resolved
-    URL plus the raw portal metadata (or None when nothing was discoverable).
-    """
-    portal_info = extract_portal_info_from_job_url(url, company_name)
-    if not portal_info:
-        return url, None
-    if portal_info.get("careers_url") and (
-        not comp.careers_url or "linkedin.com" in (comp.careers_url or "")
-    ):
-        comp.careers_url = portal_info["careers_url"]
-    if portal_info.get("domain") and not comp.domain:
-        comp.domain = portal_info["domain"]
-    canonical = portal_info.get("canonical_apply_url")
-    if canonical and "linkedin.com" not in canonical:
-        return canonical, portal_info
-    return url, portal_info
-
-
-def _linkedin_enrich_saved_job(page, item: Dict[str, Any]) -> str:
-    """Fetches a saved-job posting's detail page to (a) supply a real description for scoring and
-    (b) repair a merged title / placeholder employer produced by a collapsed list card.
-
-    Mutates ``item`` in place for title/company and returns the description text. Best-effort:
-    any failure leaves the item untouched so ingest degrades to the unscored baseline.
-    """
-    url = item.get("url", "")
-    if "/jobs/view/" not in url:
-        return (item.get("description") or "").strip()
-    try:
-        details = fetch_linkedin_job_details(page, url)
-    except Exception as e:
-        logger.debug(f"LinkedIn saved-job detail fetch skipped: {e}")
-        return (item.get("description") or "").strip()
-
-    dom_title = (details.get("title") or "").strip()
-    dom_company = (details.get("company") or "").strip()
-    cur_title = (item.get("title") or "").strip()
-    cur_company = (item.get("company") or "").strip()
-
-    # Repair the merged "TitleCompany" title when the detail page gives a shorter, clean title.
-    if dom_title:
-        norm_title = re.sub(r"[^a-z0-9]", "", cur_title.lower())
-        norm_dom = re.sub(r"[^a-z0-9]", "", dom_title.lower())
-        if not cur_title or (norm_dom and norm_dom in norm_title):
-            item["title"] = dom_title
-
-    if dom_company and (
-        not cur_company
-        or cur_company.lower() in ("unknown company", "linkedin network", "linkedin")
-    ):
-        item["company"] = dom_company
-
-    if details.get("canonical_url"):
-        item["url"] = details["canonical_url"]
-    return (details.get("description") or "").strip()
-
-
-def _linkedin_find_existing_job(
-    db: Session, title: str, url: str, company_id: Optional[int] = None
-) -> Optional[Job]:
-    """Locate an already-tracked posting by URL, or by title + employer/source."""
-    if company_id is not None:
-        cond = (Job.url == url) | (
-            (Job.title == title) & (Job.company_id == company_id)
-        )
-    else:
-        cond = (Job.url == url) | (
-            (Job.title.ilike(title)) & (Job.source_type == "LinkedIn")
-        )
-    return db.query(Job).filter(cond).first()
-
-
-def _log_linkedin_automation_warning() -> None:
-    """Emits a one-line WARNING whenever authenticated LinkedIn automation runs."""
-    logger.warning(
-        "Authenticated LinkedIn automation is active. This drives your logged-in session "
-        "and performs DOM scraping/un-saves that may conflict with LinkedIn's User Agreement "
-        "and risk account limits. Proceeding at the user's own risk."
-    )
-
-
-@app.get("/api/linkedin/last-sync", response_model=LinkedInLastSyncOut)
-def linkedin_last_sync(db: Session = Depends(get_db)):
-    """
-    Returns the most recent LinkedIn sync batch so the SPA can show a "N new from sync"
-    review banner and deep-link to the jobs that still need review.
-    """
-    log = (
-        db.query(OperationLog)
-        .filter(OperationLog.operation_type == "linkedin_sync")
-        .order_by(OperationLog.id.desc())
-        .first()
-    )
-    if not log:
-        return LinkedInLastSyncOut(has_sync=False)
-
-    details: Dict[str, Any] = {}
-    try:
-        details = json.loads(log.details_json or "{}") or {}
-    except Exception:
-        details = {}
-
-    batch_id = details.get("sync_batch_id")
-    if batch_id:
-        pending = (
-            db.query(Job)
-            .filter(Job.sync_batch_id == batch_id)
-            .count()
-        )
-    else:
-        pending = 0
-
-    return LinkedInLastSyncOut(
-        sync_batch_id=batch_id,
-        total_added=int(details.get("total_added", 0) or 0),
-        saved_jobs_added=int(details.get("saved_jobs_added", 0) or 0),
-        recommendations_added=int(details.get("recommendations_added", 0) or 0),
-        already_existing=int(details.get("already_existing", 0) or 0),
-        closed_jobs_pruned=int(details.get("closed_jobs_pruned", 0) or 0),
-        pending_review=pending,
-        created_at=log.created_at,
-        has_sync=True,
-    )
-
-
-# One LinkedIn saved-jobs scan at a time. The manual endpoint and the Sync-All stage share the
-# single-owner browser profile, and is_profile_in_use() only reflects a browser that already holds
-# it, so two callers entering together both pass that check (issue #114). A request that arrives
-# while the gate is held is queued rather than rejected (issue #115).
-_LINKEDIN_SCAN_GATE = linkedin_scan_queue.gate
-
-
-def _submit_queued_linkedin_scan(request_id: int) -> str:
-    """Queue a LinkedIn scan as a background task and stamp the task id on its row."""
-    task_id = task_engine.submit_task(
-        task_type="linkedin_sync",
-        task_name=f"LinkedIn sync (queued #{request_id})",
-        fn=_run_queued_linkedin_scan,
-        request_id=request_id,
-        total_steps=3,
-    )
-    try:
-        from backend.database import SessionLocal
-
-        db = SessionLocal()
-        try:
-            linkedin_scan_queue.attach_task_id(db, request_id, task_id)
-        finally:
-            db.close()
-    except Exception as stamp_err:  # noqa: BLE001 - the id is display-only
-        logger.warning(
-            f"Could not stamp task id on queued LinkedIn scan #{request_id}: {stamp_err}"
-        )
-    return task_id
-
-
-def _run_queued_linkedin_scan(
-    request_id: int,
-    cancel_token: Optional[CancellationToken] = None,
-    progress_cb: Optional[Callable] = None,
-) -> Dict[str, Any]:
-    """Background entry point for a queued LinkedIn scan: wait for the gate, then scan."""
-    db_gen = get_db()
-    db = next(db_gen)
-    acquired = False
-    try:
-        if progress_cb:
-            progress_cb(
-                step=1,
-                label="Waiting for the running LinkedIn scan to finish...",
-                total_steps=3,
-            )
-
-        def _cancelled() -> bool:
-            return bool(cancel_token and cancel_token.is_cancelled)
-
-        acquired = _LINKEDIN_SCAN_GATE.acquire(should_cancel=_cancelled)
-        if not acquired:
-            linkedin_scan_queue.mark_finished(
-                db,
-                request_id,
-                linkedin_scan_queue.STATUS_CANCELLED,
-                summary="Cancelled before it started.",
-            )
-            return {"jobs_found": 0, "skipped": "cancelled_before_start"}
-
-        linkedin_scan_queue.mark_running(db, request_id)
-        if progress_cb:
-            progress_cb(
-                step=2,
-                label="Scanning LinkedIn saved jobs...",
-                items_found=0,
-                total_steps=3,
-            )
-
-        result = _sync_linkedin_alerts_and_saved(db)
-        linkedin_scan_queue.mark_finished(
-            db,
-            request_id,
-            linkedin_scan_queue.STATUS_COMPLETED,
-            summary=result.message,
-        )
-        if progress_cb:
-            progress_cb(
-                step=3,
-                label=result.message,
-                items_found=result.saved_jobs_added,
-                total_steps=3,
-            )
-        return {
-            "jobs_found": result.saved_jobs_added,
-            "total_processed": result.total_processed,
-            "saved_jobs_added": result.saved_jobs_added,
-            "message": result.message,
-        }
-    except Exception as scan_err:
-        try:
-            db.rollback()
-        except Exception:  # noqa: BLE001 - recovery is best-effort
-            pass
-        try:
-            linkedin_scan_queue.mark_finished(
-                db,
-                request_id,
-                linkedin_scan_queue.STATUS_FAILED,
-                error=str(scan_err),
-            )
-        except Exception as mark_err:  # noqa: BLE001 - never mask the scan error
-            logger.warning(
-                f"Could not mark queued LinkedIn scan #{request_id} failed: {mark_err}"
-            )
-        raise
-    finally:
-        if acquired:
-            _LINKEDIN_SCAN_GATE.release()
-        db.close()
-
-
-@app.post("/api/linkedin/sync", response_model=LinkedInSyncResponse)
-def sync_linkedin_alerts_and_saved(db: Session = Depends(get_db)):
-    """
-    Syncs live LinkedIn subscribed job alerts, recommended openings, and saved jobs.
-    Prunes stale unacted 'To Apply' alert jobs (>7 days old) while strictly preserving Shortlisted & Applied jobs.
-    Prunes/unsaves any closed or expired jobs from the LinkedIn saved list and updates DB status.
-
-    When another scan already owns the browser profile the request is queued (202) instead of
-    rejected; it runs as a background task as soon as the running scan finishes.
-    """
-    if _LINKEDIN_SCAN_GATE.try_acquire():
-        try:
-            return _sync_linkedin_alerts_and_saved(db)
-        finally:
-            _LINKEDIN_SCAN_GATE.release()
-
-    queued = linkedin_scan_queue.enqueue(db, origin="manual")
-    position = linkedin_scan_queue.queue_position(db, queued.id)
-    try:
-        task_id = _submit_queued_linkedin_scan(queued.id)
-    except Exception as submit_err:  # noqa: BLE001 - report, never leave a dangling row
-        logger.warning(f"Could not queue LinkedIn scan #{queued.id}: {submit_err}")
-        linkedin_scan_queue.mark_finished(
-            db,
-            queued.id,
-            linkedin_scan_queue.STATUS_FAILED,
-            error=str(submit_err),
-        )
-        raise HTTPException(
-            status_code=503,
-            detail=f"Could not queue the LinkedIn scan: {submit_err}",
-        )
-
-    logger.info(
-        f"LinkedIn scan queued as task {task_id} (request #{queued.id}, position {position})."
-    )
-    return JSONResponse(
-        status_code=202,
-        content={
-            "status": "queued",
-            "queued": True,
-            "request_id": queued.id,
-            "task_id": task_id,
-            "queue_position": position,
-            "message": (
-                f"A LinkedIn scan is already running; this request is queued as task {task_id} "
-                f"(position {position}). It starts automatically when the current scan finishes."
-            ),
-        },
-    )
-
-
-def _sync_linkedin_alerts_and_saved(db: Session) -> LinkedInSyncResponse:
-    if not is_feature_enabled(db, "linkedin_sync"):
-        return LinkedInSyncResponse(
-            total_processed=0,
-            recommendations_found=0,
-            recommendations_added=0,
-            saved_jobs_checked=0,
-            saved_jobs_added=0,
-            already_existing=0,
-            dismissed_filtered=0,
-            closed_jobs_pruned=0,
-            message="LinkedIn automation is disabled. Enable it under Settings → Opt-in Discovery Features.",
-        )
-    if not has_consent(db, "linkedin_sync"):
-        raise HTTPException(
-            status_code=403,
-            detail="Consent required for LinkedIn automation. Acknowledge the risk in Settings → Discovery Features.",
-        )
-
-    _log_linkedin_automation_warning()
-
-    active_resume = (
-        db.query(Resume)
-        .filter(Resume.is_active == True)
-        .order_by(Resume.created_at.desc())
-        .first()
-    )
-    resume_text = decrypt_data(active_resume.content_encrypted) if active_resume else ""
-    parsed_resume = _parsed_resume_of(active_resume)
-
-    # Prefer server-persisted user preferences; fall back to resume-derived targets.
-    pref = get_user_preferences(db)
-    target_roles = [
-        t.strip() for t in (pref.target_titles or "").split(",") if t.strip()
-    ]
-    _pref_cities = [
-        c.strip() for c in (pref.target_cities or "").split(",") if c.strip()
-    ]
-    target_location = (
-        (pref.target_country or "").strip() or ", ".join(_pref_cities[:2]) or "India"
-    )
-    if not target_roles and active_resume and active_resume.parsed_json_encrypted:
-        try:
-            p_json = json.loads(decrypt_data(active_resume.parsed_json_encrypted))
-            target_roles = p_json.get("skills", [])[:5]
-            target_location = p_json.get("location") or target_location
-        except Exception:
-            pass
-
-    # 1. Prune stale LinkedIn 'To Apply' alert jobs older than 7 days (leaving Shortlisted & Applied 100% untouched)
-    stale_pruned = 0
-    try:
-        stale_cutoff = datetime.datetime.now(
-            datetime.timezone.utc
-        ) - datetime.timedelta(days=7)
-        stale_pruned = (
-            db.query(Job)
-            .filter(
-                Job.source_type == "LinkedIn",
-                Job.status == "To Apply",
-                Job.created_at < stale_cutoff,
-            )
-            .delete(synchronize_session=False)
-        )
-        db.commit()
-    except Exception as prune_err:
-        logger.debug(f"Stale alert prune notice: {prune_err}")
-
-    start_tok = token_tracker.get_stats()
-    recs_found = 0
-    recs_added = 0
-    saved_checked = 0
-    saved_added = 0
-    closed_pruned = 0
-    already_existing = 0
-    dismissed_filtered = 0
-    # Review batch id: every job newly ingested by this run is tagged with it so the UI can
-    # show a "new from sync" review queue until the user acts on each job.
-    sync_batch_id = f"li-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S')}"
-
-    try:
-        with sync_playwright() as p:
-            context = get_persistent_browser_context(p, headless=True)
-            page = (
-                context.pages[0]
-                if (
-                    hasattr(context, "pages")
-                    and isinstance(context.pages, list)
-                    and len(context.pages) > 0
-                )
-                else context.new_page()
-            )
-            time.sleep(LINKEDIN_AUTOMATION_PACING_SECONDS)
-
-            try:
-                # 2. Scan subscribed job alert feeds + recommendations on shared page
-                alert_postings = scan_linkedin_job_alerts(
-                    p,
-                    headless=True,
-                    max_alerts=5,
-                    max_jobs_per_alert=10,
-                    target_roles=target_roles,
-                    target_location=target_location,
-                    page=page,
-                )
-                time.sleep(LINKEDIN_AUTOMATION_PACING_SECONDS)
-                recommendations = scan_linkedin_job_recommendations(
-                    p, headless=True, limit=10, page=page
-                )
-
-                # Combine alert items without duplicate URLs
-                all_alert_items = []
-                seen_urls = set()
-                for item in alert_postings + recommendations:
-                    u = item.get("url")
-                    if u and u not in seen_urls:
-                        seen_urls.add(u)
-                        all_alert_items.append(item)
-
-                recs_found = len(all_alert_items)
-
-                for rec in all_alert_items:
-                    comp = _linkedin_upsert_company(db, rec.get("company"))
-
-                    # Resolve external portal link if available
-                    resolved_url, portal_info = _linkedin_resolve_portal(
-                        comp, rec.get("url", ""), comp.name
-                    )
-                    if portal_info and resolved_url != rec.get("url", ""):
-                        rec["url"] = resolved_url
-                        rec["source_type"] = "Direct"
-                        rec["source"] = (
-                            f"{portal_info.get('portal_type', 'Direct')} Portal"
-                        )
-
-                    # Check if job already exists
-                    existing = _linkedin_find_existing_job(
-                        db, rec["title"], rec["url"], comp.id
-                    )
-
-                    if existing:
-                        already_existing += 1
-                    else:
-                        # Due diligence & AI scoring
-                        dd = evaluate_job_due_diligence(
-                            job_title=rec["title"],
-                            source_type=rec.get("source_type", "LinkedIn"),
-                            portal_jobs=[],
-                        )
-
-                        # Zero-Token Negative Role Filter
-                        dismissal_match = check_semantic_dismissal(
-                            rec["title"],
-                            rec.get("description", ""),
-                            db,
-                            company_name=comp.name,
-                        )
-                        job_status = "Not Interested" if dismissal_match else "To Apply"
-
-                        score_method = None
-                        match_scored_at = None
-                        match_band = None
-                        apply_recommendation = None
-                        strengths = []
-                        gaps = []
-                        if dismissal_match:
-                            dismissed_filtered += 1
-                            match_score, match_scored = 0, False
-                            match_analysis = f"Auto-filtered by semantic ignore rule (matched: '{dismissal_match['matched_title']}' with {int(dismissal_match['similarity'] * 100)}% similarity)"
-                        else:
-                            (
-                                match_score,
-                                match_analysis,
-                                match_scored,
-                                score_method,
-                                match_scored_at,
-                                match_band,
-                                apply_recommendation,
-                                strengths,
-                                gaps,
-                                partials,
-                            ) = _score_job_with_engine(
-                                db,
-                                resume_text,
-                                rec.get("description") or "",
-                                parsed_resume=parsed_resume,
-                                job_title=rec.get("title") or "",
-                            )
-                            if not match_analysis:
-                                match_analysis = "Direct LinkedIn Job Alert match."
-
-                        job_emb = generate_embeddings(
-                            f"{rec['title']} {clean_job_description(rec.get('description', '') or rec['title'])}"
-                        )
-                        new_job = Job(
-                            company_id=comp.id,
-                            title=rec["title"],
-                            description=rec.get("description", ""),
-                            url=rec.get("url", ""),
-                            location=rec.get("location", "Remote / Various"),
-                            source=rec.get("source", "LinkedIn Job Alert"),
-                            source_type=rec.get("source_type", "LinkedIn"),
-                            status=job_status,
-                            sync_batch_id=sync_batch_id,
-                            match_score=match_score,
-                            match_analysis=match_analysis,
-                            match_scored=match_scored,
-                            score_method=score_method,
-                            match_scored_at=match_scored_at,
-                            **(_score_provenance(db) if match_scored else {}),
-                            match_band=match_band,
-                            apply_recommendation=apply_recommendation,
-                            match_strengths_json=json.dumps(strengths) if match_scored else None,
-                            match_gaps_json=json.dumps(gaps) if match_scored else None,
-                            match_partials_json=json.dumps(partials) if match_scored else None,
-                            cover_letter_draft=None,
-                            tailored_resume_points=None,
-                            cold_message_draft=None,
-                            is_ghost_job=dd.get("is_ghost_job", False),
-                            embedding=job_emb,
-                        )
-                        db.add(new_job)
-                        recs_added += 1
-
-                # 3. Scan saved jobs across all pages on shared page, ingest active ones as Shortlisted, and prune closed listings
-                saved_jobs = scan_and_sync_linkedin_saved_jobs(
-                    p, headless=True, auto_unsave_closed=True, page=page
-                )
-                saved_checked = len(saved_jobs)
-                saved_added = 0
-                saved_jd_fetches = 0
-
-                for item in saved_jobs:
-                    if item.get("is_closed"):
-                        # Find job in DB
-                        matched_job = (
-                            db.query(Job)
-                            .filter(
-                                (Job.title.ilike(item["title"]))
-                                | (Job.url == item.get("url", "___"))
-                            )
-                            .first()
-                        )
-
-                        if matched_job:
-                            # Only auto-reject pre-application states; never clobber active progress.
-                            if matched_job.status in (
-                                "To Apply",
-                                "Shortlisted",
-                                "Not Interested",
-                            ):
-                                matched_job.status = "Rejected"
-                                matched_job.rejected_at = datetime.datetime.now(
-                                    datetime.timezone.utc
-                                )
-                                event = ApplicationEvent(
-                                    job_id=matched_job.id,
-                                    event_type="status_change",
-                                    description="Closed on LinkedIn: position expired or no longer accepting applications (automatically unsaved).",
-                                )
-                                db.add(event)
-                            closed_pruned += 1
-                        elif item.get("unsaved"):
-                            closed_pruned += 1
-                    else:
-                        # Active saved job - check if already in DB
-                        existing_job = _linkedin_find_existing_job(
-                            db, item["title"], item.get("url", "___")
-                        )
-
-                        if existing_job:
-                            already_existing += 1
-                            # Respect the user's explicit save: promote anything not yet actioned.
-                            # Back-catalog repair of rows ingested before the card parser was fixed
-                            # is handled by backend/scripts/repair_linkedin_saved_jobs.py, not here.
-                            if existing_job.status in ("To Apply", "Not Interested"):
-                                existing_job.status = "Shortlisted"
-                        else:
-                            # Ingest new active saved job. Enrich from the detail page first so a
-                            # merged card title / placeholder employer is repaired and the scorer
-                            # gets the real JD text (cards carry no description).
-                            saved_jd = (item.get("description") or "").strip()
-                            if saved_jd_fetches < LINKEDIN_SAVED_JOB_DESC_FETCH_LIMIT:
-                                saved_jd_fetches += 1
-                                saved_jd = _linkedin_enrich_saved_job(page, item) or saved_jd
-
-                            comp = _linkedin_upsert_company(db, item.get("company"))
-
-                            resolved_url, _portal_info = _linkedin_resolve_portal(
-                                comp, item.get("url", ""), comp.name
-                            )
-                            item["url"] = resolved_url
-
-                            dd = evaluate_job_due_diligence(
-                                job_title=item["title"],
-                                source_type="LinkedIn",
-                                portal_jobs=[],
-                            )
-
-                            (
-                                match_score,
-                                match_analysis,
-                                match_scored,
-                                score_method,
-                                match_scored_at,
-                                match_band,
-                                apply_recommendation,
-                                strengths,
-                                gaps,
-                                partials,
-                            ) = _score_job_with_engine(
-                                db,
-                                resume_text,
-                                saved_jd or "",
-                                parsed_resume=parsed_resume,
-                                job_title=item.get("title") or "",
-                            )
-                            if not match_analysis:
-                                match_analysis = "Saved directly on LinkedIn."
-
-                            job_emb = generate_embeddings(
-                                f"{item['title']} {clean_job_description(saved_jd or item['title'])}"
-                            )
-                            new_saved_job = Job(
-                                company_id=comp.id,
-                                title=item["title"],
-                                description=saved_jd or f"LinkedIn Saved Job opening for {item['title']} at {comp.name}.",
-                                url=item.get("url", ""),
-                                location=item.get("location", "Remote / Various"),
-                                source="LinkedIn Saved Jobs",
-                                source_type="LinkedIn",
-                                status="Shortlisted",
-                                sync_batch_id=sync_batch_id,
-                                match_score=match_score,
-                                match_analysis=match_analysis,
-                                match_scored=match_scored,
-                                score_method=score_method,
-                                match_scored_at=match_scored_at,
-                                **(_score_provenance(db) if match_scored else {}),
-                                match_band=match_band,
-                                apply_recommendation=apply_recommendation,
-                                match_strengths_json=json.dumps(strengths) if match_scored else None,
-                                match_gaps_json=json.dumps(gaps) if match_scored else None,
-                                match_partials_json=json.dumps(partials) if match_scored else None,
-                                cover_letter_draft=None,
-                                tailored_resume_points=None,
-                                cold_message_draft=None,
-                                is_ghost_job=dd.get("is_ghost_job", False),
-                                embedding=job_emb,
-                            )
-                            db.add(new_saved_job)
-                            saved_added += 1
-
-                db.commit()
-            finally:
-                try:
-                    context.close()
-                except Exception:
-                    pass
-
-        total_processed = recs_found + saved_checked
-        total_added = recs_added + saved_added
-        summary_msg = f"LinkedIn sync complete: Scanned {total_processed} total posting(s) ({recs_found} alerts/recommendations, {saved_checked} saved). {total_added} new added, {already_existing} already tracked, {closed_pruned} closed job(s) pruned."
-
-        # Persist Operation Audit Log
-        try:
-            end_tok = token_tracker.get_stats()
-            p_used = max(0, end_tok["prompt_tokens"] - start_tok["prompt_tokens"])
-            c_used = max(
-                0, end_tok["completion_tokens"] - start_tok["completion_tokens"]
-            )
-
-            op_log = OperationLog(
-                operation_type="linkedin_sync",
-                status="Completed",
-                summary=summary_msg,
-                details_json=sanitize_log_details(
-                    {
-                        "total_processed": total_processed,
-                        "recommendations_found": recs_found,
-                        "recommendations_added": recs_added,
-                        "saved_jobs_checked": saved_checked,
-                        "saved_jobs_added": saved_added,
-                        "already_existing": already_existing,
-                        "dismissed_filtered": dismissed_filtered,
-                        "closed_jobs_pruned": closed_pruned,
-                        "sync_batch_id": sync_batch_id,
-                        "total_added": total_added,
-                    }
-                ),
-                jobs_count=total_added + closed_pruned,
-                prompt_tokens=p_used,
-                completion_tokens=c_used,
-            )
-            db.add(op_log)
-            db.commit()
-        except Exception as op_err:
-            logger.warning(
-                f"Failed to persist OperationLog for LinkedIn sync: {op_err}"
-            )
-
-    except Exception as e:
-        logger.error(f"Error during LinkedIn sync: {e}")
-        total_processed = recs_found + saved_checked
-        return LinkedInSyncResponse(
-            total_processed=total_processed,
-            recommendations_found=recs_found,
-            recommendations_added=recs_added,
-            saved_jobs_checked=saved_checked,
-            saved_jobs_added=0,
-            already_existing=already_existing,
-            dismissed_filtered=dismissed_filtered,
-            closed_jobs_pruned=closed_pruned,
-            message=f"LinkedIn sync completed with notice: {str(e)}",
-        )
-
-    return LinkedInSyncResponse(
-        total_processed=total_processed,
-        recommendations_found=recs_found,
-        recommendations_added=recs_added,
-        saved_jobs_checked=saved_checked,
-        saved_jobs_added=saved_added,
-        already_existing=already_existing,
-        dismissed_filtered=dismissed_filtered,
-        closed_jobs_pruned=closed_pruned,
-        message=summary_msg,
-    )
-
-
-# -------------------------------------------------------------
-# Google for Jobs Followed Searches & Discovery Endpoints
-# -------------------------------------------------------------
-
-
-@app.get("/api/jobs/google-jobs/queries")
-def get_google_jobs_queries():
-    """Returns the list of followed / configured Google Jobs search queries."""
-    return {"queries": load_google_searches()}
-
-
-@app.post("/api/jobs/google-jobs/queries")
-def update_google_jobs_queries(payload: GoogleSearchesUpdate):
-    """Updates and saves the configured Google Jobs search queries."""
-    saved = save_google_searches(payload.queries)
-    return {
-        "queries": saved,
-        "message": f"Successfully saved {len(saved)} search queries.",
-    }
-
-
-@app.post("/api/jobs/google-jobs/sync-followed")
-def sync_google_jobs_followed_queries():
-    """
-    Spawns Playwright to navigate to Google for Jobs 'Following' tab,
-    extracts followed alert queries, merges them into saved searches, and returns the updated list.
-    """
-    discovered = []
-    try:
-        with sync_playwright() as p:
-            discovered = fetch_google_jobs_followed_queries_playwright(p, headless=True)
-    except Exception as e:
-        logger.warning(f"Failed to extract followed queries via Playwright: {e}")
-
-    current = load_google_searches()
-    new_queries = [q for q in discovered if q and q not in current]
-    all_queries = current + new_queries
-    if new_queries:
-        all_queries = save_google_searches(all_queries)
-
-    return {
-        "queries": all_queries,
-        "new_queries_found": len(new_queries),
-        "discovered": discovered,
-        "message": f"Followed searches synced. Discovered {len(discovered)} alert(s), {len(new_queries)} new query(ies) saved.",
-    }
-
-
-@app.post("/api/jobs/google-jobs/scrape", response_model=GoogleJobsScrapeResponse)
-def scrape_google_jobs_endpoint(
-    req: Optional[GoogleJobsScrapeRequest] = None, db: Session = Depends(get_db)
-):
-    """
-    Scrapes Google for Jobs (`udm=8`) and SERP Schema.org JobPosting listings
-    across multiple configured followed queries.
-    Performs cross-source deduplication, ATS portal learning, zero-token filtering,
-    match alignment scoring, and automated 384-d vector embeddings indexing.
-    """
-    req = req or GoogleJobsScrapeRequest()
-    start_tok = token_tracker.get_stats()
-
-    # If requested, sync followed tabs first
-    if req.sync_followed_tabs:
-        try:
-            with sync_playwright() as p:
-                discovered_tabs = fetch_google_jobs_followed_queries_playwright(
-                    p, headless=True
-                )
-                if discovered_tabs:
-                    current_searches = load_google_searches()
-                    new_tabs = [
-                        t for t in discovered_tabs if t and t not in current_searches
-                    ]
-                    if new_tabs:
-                        save_google_searches(current_searches + new_tabs)
-        except Exception as e:
-            logger.warning(f"Sync followed tabs in scrape endpoint failed: {e}")
-
-    # Determine query list
-    queries_to_run = []
-    if req.queries and len(req.queries) > 0:
-        queries_to_run = [q.strip() for q in req.queries if q.strip()]
-    elif req.query and req.query.strip():
-        queries_to_run = [req.query.strip()]
-    else:
-        queries_to_run = load_google_searches()
-
-    # Candidate active resume data for match scoring
-    active_resume = db.query(Resume).filter(Resume.is_active == True).first()
-    resume_text = decrypt_data(active_resume.content_encrypted) if active_resume else ""
-    parsed_resume = _parsed_resume_of(active_resume)
-    resume_skills = (parsed_resume or {}).get("skills", [])
-
-    if not queries_to_run:
-        default_q = "Software Engineer"
-        if resume_skills:
-            default_q = f"{resume_skills[0]} Software Engineer"
-        queries_to_run = [default_q]
-
-    total_discovered = 0
-    total_added = 0
-    already_existing = 0
-    dismissed_filtered = 0
-    per_query_breakdown = []
-    seen_in_batch_urls = set()
-
-    search_loc = req.location or "India"
-
-    try:
-        for query_str in queries_to_run:
-            q_discovered = 0
-            q_added = 0
-            q_existing = 0
-            q_dismissed = 0
-            discovered_jobs = []
-
-            try:
-                # Playwright is the sole Google Jobs fetcher: the direct SERP is permanently
-                # robots-gated (google.com/robots.txt disallows /search) and can never succeed.
-                with sync_playwright() as p:
-                    discovered_jobs = fetch_google_jobs_playwright(
-                        p,
-                        query=query_str,
-                        location=search_loc,
-                        headless=True,
-                        max_results=req.limit,
-                    )
-            except Exception as q_err:
-                logger.warning(f"Error fetching jobs for query '{query_str}': {q_err}")
-                discovered_jobs = []
-
-            q_discovered = len(discovered_jobs)
-            total_discovered += q_discovered
-
-            for j in discovered_jobs:
-                job_url = j.get("url", "").strip()
-                job_title = j.get("title", "").strip()
-                comp_name = _safe_company_name(j.get("company"), "Google Jobs Employer")
-
-                # Batch deduplication check
-                batch_key = (
-                    job_url if job_url else f"{job_title}::{comp_name}"
-                ).lower()
-                if batch_key in seen_in_batch_urls:
-                    q_existing += 1
-                    already_existing += 1
-                    continue
-                seen_in_batch_urls.add(batch_key)
-
-                # Database deduplication check
-                existing = None
-                if job_url:
-                    existing = db.query(Job).filter(Job.url == job_url).first()
-                if not existing:
-                    existing = (
-                        db.query(Job)
-                        .filter(
-                            (Job.title.ilike(job_title)) & (Job.source_type == "Google")
-                        )
-                        .first()
-                    )
-
-                if existing:
-                    q_existing += 1
-                    already_existing += 1
-                    continue
-
-                # Employer resolution & ATS portal learning
-                comp = db.query(Company).filter(Company.name.ilike(comp_name)).first()
-                if not comp:
-                    comp = Company(
-                        name=comp_name,
-                        domain=f"{comp_name.lower().replace(' ', '')}.com",
-                    )
-                    db.add(comp)
-                    db.flush()
-
-                portal_info = extract_portal_info_from_job_url(job_url, comp_name)
-                if portal_info:
-                    if portal_info.get("careers_url") and (
-                        not comp.careers_url or "google.com" in (comp.careers_url or "")
-                    ):
-                        comp.careers_url = portal_info["careers_url"]
-                    if portal_info.get("domain") and not comp.domain:
-                        comp.domain = portal_info["domain"]
-                    if (
-                        portal_info.get("canonical_apply_url")
-                        and "google.com" not in portal_info["canonical_apply_url"]
-                    ):
-                        j["url"] = portal_info["canonical_apply_url"]
-
-                # Due diligence
-                dd = evaluate_job_due_diligence(
-                    job_title=job_title, source_type="Direct", portal_jobs=[]
-                )
-
-                # Zero-token negative role filter
-                dismissal_match = check_semantic_dismissal(
-                    job_title, j.get("description", ""), db, company_name=comp.name
-                )
-                job_status = "Not Interested" if dismissal_match else "To Apply"
-
-                match_score = 0
-                match_scored = False
-                score_method = match_scored_at = match_band = apply_recommendation = (
-                    None
-                )
-                strengths = []
-                gaps = []
-                if dismissal_match:
-                    q_dismissed += 1
-                    dismissed_filtered += 1
-                    match_analysis = f"Auto-filtered by semantic ignore rule (matched: '{dismissal_match['matched_title']}' with {int(dismissal_match['similarity'] * 100)}% similarity)"
-                else:
-                    (
-                        match_score,
-                        match_analysis,
-                        match_scored,
-                        score_method,
-                        match_scored_at,
-                        match_band,
-                        apply_recommendation,
-                        strengths,
-                        gaps,
-                        partials,
-                    ) = _score_job_with_engine(
-                        db,
-                        resume_text,
-                        j.get("description") or "",
-                        parsed_resume=parsed_resume,
-                        job_title=j.get("title") or "",
-                    )
-                    if not match_analysis:
-                        match_analysis = (
-                            f"Direct Google Jobs match for alert: '{query_str}'."
-                        )
-
-                # Vector Embedding
-                job_emb = generate_embeddings(
-                    f"{job_title} {clean_job_description(j.get('description', '') or job_title)}"
-                )
-
-                new_job = Job(
-                    company_id=comp.id,
-                    title=job_title,
-                    description=j.get(
-                        "description",
-                        f"Google for Jobs opening: {job_title} at {comp.name}",
-                    ),
-                    url=j.get("url", ""),
-                    salary_range=j.get("salary_range", "Competitive"),
-                    location=j.get("location", "Remote / Various"),
-                    source=f"Google Jobs ({query_str})",
-                    source_type="Google",
-                    status=job_status,
-                    match_score=match_score,
-                    match_analysis=match_analysis,
-                    match_scored=match_scored,
-                    score_method=score_method,
-                    match_scored_at=match_scored_at,
-                    **(_score_provenance(db) if match_scored else {}),
-                    match_band=match_band,
-                    apply_recommendation=apply_recommendation,
-                    match_strengths_json=json.dumps(strengths) if match_scored else None,
-                    match_gaps_json=json.dumps(gaps) if match_scored else None,
-                    match_partials_json=json.dumps(partials) if match_scored else None,
-                    cover_letter_draft=None,
-                    tailored_resume_points=None,
-                    cold_message_draft=None,
-                    is_ghost_job=dd.get("is_ghost_job", False),
-                    embedding=job_emb,
-                )
-                db.add(new_job)
-                q_added += 1
-                total_added += 1
-
-            db.commit()
-
-            per_query_breakdown.append(
-                {
-                    "query": query_str,
-                    "discovered": q_discovered,
-                    "added": q_added,
-                    "existing": q_existing,
-                    "dismissed": q_dismissed,
-                }
-            )
-
-        summary_msg = f"Google Jobs discovery complete across {len(queries_to_run)} alert query(ies): Discovered {total_discovered} posting(s). Added {total_added} new target(s), {already_existing} already tracked, {dismissed_filtered} auto-dismissed."
-
-        # OperationLog
-        try:
-            end_tok = token_tracker.get_stats()
-            p_used = max(0, end_tok["prompt_tokens"] - start_tok["prompt_tokens"])
-            c_used = max(
-                0, end_tok["completion_tokens"] - start_tok["completion_tokens"]
-            )
-
-            op_log = OperationLog(
-                operation_type="google_jobs_scrape",
-                status="Completed",
-                summary=summary_msg,
-                details_json=sanitize_log_details(
-                    {
-                        "queries_scanned": queries_to_run,
-                        "location": search_loc,
-                        "total_discovered": total_discovered,
-                        "total_added": total_added,
-                        "already_existing": already_existing,
-                        "dismissed_filtered": dismissed_filtered,
-                        "per_query_breakdown": per_query_breakdown,
-                    }
-                ),
-                jobs_count=total_added,
-                prompt_tokens=p_used,
-                completion_tokens=c_used,
-            )
-            db.add(op_log)
-            db.commit()
-        except Exception as log_err:
-            logger.warning(f"Failed to log operation for Google Jobs scrape: {log_err}")
-
-        return GoogleJobsScrapeResponse(
-            total_discovered=total_discovered,
-            total_added=total_added,
-            already_existing=already_existing,
-            dismissed_filtered=dismissed_filtered,
-            queries_scanned=queries_to_run,
-            per_query_breakdown=per_query_breakdown,
-            message=summary_msg,
-        )
-
-    except Exception as e:
-        logger.error(f"Error during Google Jobs scrape: {e}")
-        return GoogleJobsScrapeResponse(
-            total_discovered=total_discovered,
-            total_added=total_added,
-            already_existing=already_existing,
-            dismissed_filtered=dismissed_filtered,
-            queries_scanned=queries_to_run,
-            per_query_breakdown=per_query_breakdown,
-            message=f"Google Jobs scrape encountered notice: {str(e)}",
-        )
 
 
 # -------------------------------------------------------------
@@ -6547,86 +4039,288 @@ EMAIL_AUTO_CREATE_MIN_CONFIDENCE = 0.75  # to create a brand-new job from an ema
 EMAIL_OPPORTUNITY_MIN_CONFIDENCE = 0.6  # to create a job from an email opportunity
 
 
-def _match_within_company(db, company, role: str, pipeline_statuses):
-    """Finds the best Job at a specific Company for a role (title-aware, then most recent)."""
-    jobs_query = db.query(Job).filter(Job.company_id == company.id)
-    if role:
-        match = (
-            jobs_query.filter(Job.title.ilike(f"%{role}%"))
-            .filter(Job.status.in_(pipeline_statuses))
-            .order_by(Job.id.desc())
-            .first()
-        )
-        if not match:
-            match = (
-                jobs_query.filter(Job.title.ilike(f"%{role}%"))
-                .order_by(Job.id.desc())
-                .first()
-            )
-        if match:
-            return match
-    candidates = jobs_query.order_by(Job.id.desc()).limit(2).all()
-    if len(candidates) == 1:
-        return candidates[0]
-    return (
-        jobs_query.filter(Job.status.in_(pipeline_statuses))
-        .order_by(Job.id.desc())
-        .first()
+# One spelling per concept: "Software Engineering PMTS" and "Software Engineer" describe the
+# same role, and the mismatch used to rank the correct application below a sibling title.
+_TITLE_TOKEN_SYNONYMS = {
+    "engineering": "engineer",
+    "development": "developer",
+    "technologies": "technology",
+    "applications": "application",
+    "systems": "system",
+    "platforms": "platform",
+}
+
+
+def _title_tokens(title: str) -> set:
+    """Normalised token set for title comparison (case/punctuation/seniority-agnostic)."""
+    return {
+        _TITLE_TOKEN_SYNONYMS.get(t, t)
+        for t in re.split(r"[^a-z0-9+#]+", (title or "").lower())
+        if t and t not in _TITLE_NOISE_TOKENS
+    }
+
+
+# Words that carry no discriminative value when comparing a parsed email role to a tracked title.
+_TITLE_NOISE_TOKENS = {"the", "and", "for", "with", "role", "position", "opening", "job", "a", "an"}
+
+# Attribution keys strong enough to *create* an application from a scheduling mail. A title
+# guess must never do that (2026-11-16: someone else's invite turned a Shortlisted row Applied).
+_STRONG_MATCH_SOURCES = ("requisition", "thread", "exact_title", "auto_created")
+
+# A role made only of these says nothing about WHICH application the mail is about. A generic
+# "Software Engineer" is a subset of every sibling engineering title, so it used to win the
+# subset tier against the row the mail actually named (2026-11-16 Salesforce poisoning).
+_GENERIC_ROLE_TOKENS = {
+    "engineer", "developer", "programmer", "software", "sre", "devops", "architect",
+    "manager", "analyst", "scientist", "designer", "specialist", "consultant", "director",
+    "lead", "senior", "staff", "principal", "junior", "associate", "intern", "head",
+    "officer", "technical", "technology", "it", "member", "generalist", "ic",
+}
+
+
+def _is_live_application(job) -> bool:
+    """True when this row is an application still in play.
+
+    An application counts as live once the operator has applied (``applied_at`` or a status past
+    applied) **and** it has not reached a terminal state. A discovery row in 'To Apply' /
+    'Shortlisted' is not an application, and a 'Rejected' / 'Withdrawn' / 'Not Interested' row is
+    no longer in play — an email must not be attributed to either when a live application exists.
+    'Closed' stays eligible: the posting disappeared, which says nothing about the application.
+    """
+    if job.status in ("Rejected", "Withdrawn", "Not Interested"):
+        return False
+    return bool(job.applied_at) or job.status in (
+        "Applied",
+        "Screening",
+        "Interview Scheduling",
+        "Interview",
+        "Offered",
     )
 
 
-def _match_job_for_email_event(db, comp_name: str, role: str = "", domain: str = ""):
-    """
-    Finds the best matching Job for an email event.
-    Prefers an explicit title match at the company (among jobs the user has shortlisted/applied
-    to), then a unique company match, then the most recent in-progress job at that company
-    (avoids cross-role mixups when a company has many tracked roles).
+def _candidate_brief(job) -> Dict[str, Any]:
+    return {
+        "job_id": job.id,
+        "title": job.title,
+        "company": job.company.name if job.company else None,
+        "status": job.status,
+        "applied_at": job.applied_at.isoformat() if job.applied_at else None,
+    }
 
-    When a sender ``domain`` is known, an exact ``Company.domain`` match is tried first, so a
-    cleaned ``acme.com`` domain matches the tracked ``acme.com`` company even when the parsed
-    company name differs slightly or carries trailing punctuation (issue #76).
+
+def _company_looks_like_a_sentence(name: str) -> bool:
+    """True for a company row created from a mangled subject fragment ("GitLab was submitted").
+
+    Such rows exist (the email parser can promote a whole subject to the company) and they widen a
+    name search for free, so they are skipped when resolving a company by name.
     """
-    pipeline_statuses = ["Applied", "Screening", "Interview", "Offered", "Shortlisted"]
+    n = (name or "").strip().lower()
+    if not n:
+        return True
+    return any(
+        marker in n
+        for marker in (
+            " was ",
+            " has ",
+            " is ",
+            " your ",
+            " was submitted",
+            " submitted",
+            " application",
+            " interview",
+            " update",
+        )
+    )
+
+
+def _company_names_match(candidate: str, wanted: str) -> bool:
+    """Word-boundary employer match.
+
+    ``Micron`` matches ``Micron Technology`` but ``Meta`` must not match ``Metabase``
+    (finding 64).
+    """
+    def norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+    a, b = norm(candidate), norm(wanted)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    shorter, longer = sorted((a, b), key=len)
+    return re.search(rf"(?<![a-z0-9]){re.escape(shorter)}(?![a-z0-9])", longer) is not None
+
+
+def _match_job_for_email_event(
+    db,
+    comp_name: str,
+    role: str = "",
+    domain: str = "",
+    requisition_id: str = "",
+    thread_id: str = "",
+):
+    """Finds the tracked application an email is about.
+
+    Returns ``(job, info)``. ``info`` describes HOW it matched and whether the evidence was
+    ambiguous, so the caller can stage the email for review instead of guessing:
+
+    - ``matched_by``: ``requisition`` | ``thread`` | ``exact_domain`` | ``exact_title``
+      | ``title_contains`` | ``title_overlap`` | ``ambiguous`` | ``no_company``
+      | ``no_candidate`` | ``no_title_evidence``
+    - ``ambiguous``: True when several applications fit equally well (or a live application fits
+      no title evidence at all) - the operator picks in that case.
+    - ``candidates``: brief rows for the review queue / log.
+
+    Identification runs strongest key first, and only falls through when a key is absent:
+
+    1. **requisition id** - names exactly one posting at one employer.
+    2. **thread** - a reply inherits the application its thread is already linked to.
+    3. company + title evidence (exact > contains > token overlap).
+
+    An **applied** application outranks a discovery row at the same title evidence; ``Job.id`` is
+    only a final tie-break.
+    """
     role = (role or "").strip()
     domain = (domain or "").strip().lower()
+    requisition_id = (requisition_id or "").strip()
+    thread_id = (thread_id or "").strip()
+    role_tokens = _title_tokens(role)
 
-    # Exact Company.domain match first (when a sender domain is known): this lets a cleaned
-    # `acme.com` domain find the tracked `acme.com` company even if the parsed name differs.
+    companies = []
     if domain:
-        comp_domain = (
-            db.query(Company).filter(Company.domain.ilike(domain)).first()
-        )
+        comp_domain = db.query(Company).filter(Company.domain.ilike(domain)).first()
         if comp_domain:
-            match = _match_within_company(db, comp_domain, role, pipeline_statuses)
-            if match:
-                return match
+            companies.append(comp_domain)
+    if not companies and comp_name:
+        wanted = comp_name.strip()
+        exact = db.query(Company).filter(Company.name.ilike(wanted)).first()
+        if exact:
+            companies = [exact]
+        else:
+            # Bounded widening, then a word-boundary check in Python: a raw `%name%` scan
+            # files a mail against a different employer ("Meta" -> "Metabase", finding 64).
+            candidates = (
+                db.query(Company).filter(Company.name.ilike(f"%{wanted}%")).all()
+            )
+            companies = [c for c in candidates if _company_names_match(c.name, wanted)]
 
-    comp_query = db.query(Job).filter(
-        Job.company.has(Company.name.ilike(f"%{comp_name}%"))
-    )
-    if role:
-        match = (
-            comp_query.filter(Job.title.ilike(f"%{role}%"))
-            .filter(Job.status.in_(pipeline_statuses))
-            .order_by(Job.id.desc())
+    if requisition_id:
+        by_req = [
+            j
+            for j in db.query(Job).filter(Job.requisition_id.ilike(requisition_id)).all()
+            if j.status not in ("Rejected", "Not Interested")
+        ]
+        if len(by_req) > 1 and companies:
+            # A generic id shape can collide across employers; prefer the resolved company.
+            scoped = [j for j in by_req if j.company_id in {c.id for c in companies}]
+            if scoped:
+                by_req = scoped
+        if len(by_req) == 1:
+            return by_req[0], {
+                "matched_by": "requisition",
+                "ambiguous": False,
+                "candidates": [_candidate_brief(by_req[0])],
+            }
+        if len(by_req) > 1:
+            return None, {
+                "matched_by": "ambiguous",
+                "ambiguous": True,
+                "candidates": [_candidate_brief(j) for j in by_req[:5]],
+            }
+
+    if thread_id:
+        link = (
+            db.query(EmailApplicationLink)
+            .filter(EmailApplicationLink.thread_id == thread_id)
+            .order_by(EmailApplicationLink.id.desc())
             .first()
         )
-        if not match:
-            match = (
-                comp_query.filter(Job.title.ilike(f"%{role}%"))
-                .order_by(Job.id.desc())
-                .first()
-            )
-        if match:
-            return match
-    candidates = comp_query.order_by(Job.id.desc()).limit(2).all()
-    if len(candidates) == 1:
-        return candidates[0]
-    return (
-        comp_query.filter(Job.status.in_(pipeline_statuses))
+        if link is not None and link.job is not None and link.job.status not in (
+            "Rejected",
+            "Not Interested",
+        ):
+            return link.job, {
+                "matched_by": "thread",
+                "ambiguous": False,
+                "candidates": [_candidate_brief(link.job)],
+            }
+
+    if not companies:
+        return None, {"matched_by": "no_company", "ambiguous": False, "candidates": []}
+
+    jobs = (
+        db.query(Job)
+        .filter(Job.company_id.in_([c.id for c in companies]))
         .order_by(Job.id.desc())
-        .first()
+        .all()
     )
+    # Rows in a terminal state are out of play: an application that is already Rejected or marked
+    # Not Interested cannot absorb a new outcome email. Everything else stays eligible, including
+    # a discovery row — applications are often made outside the tracker, so a row with no
+    # ``applied_at`` can still be the one the email is about.
+    candidates = [j for j in jobs if j.status not in ("Rejected", "Not Interested")]
+    if not candidates:
+        return None, {"matched_by": "no_candidate", "ambiguous": False, "candidates": []}
+
+    def _title_tier(job) -> int:
+        title_tokens = _title_tokens(job.title)
+        if not role_tokens or not title_tokens:
+            return 4
+        if title_tokens == role_tokens:
+            return 1
+        # A role that is nothing but role nouns ("Software Engineer") is a subset of every
+        # sibling engineering title, so it must not win the subset tier by accident. It still
+        # matches its own title exactly (tier 1 above).
+        if role_tokens <= _GENERIC_ROLE_TOKENS:
+            return 4
+        if role_tokens <= title_tokens or title_tokens <= role_tokens:
+            return 2
+        shared = role_tokens & title_tokens
+        # A single shared word ("engineer") is not evidence: every engineering title shares one.
+        # Neither is a pair that only states seniority and the job family: "Staff Backend
+        # Engineer" and "Staff Software Engineer - NLP" share exactly {staff, engineer}, which at
+        # an employer with several applications is how an outcome lands on a sibling requisition.
+        # Overlap needs at least one token that actually names the specialisation.
+        distinguishing = shared - _GENERIC_ROLE_TOKENS
+        return 3 if len(shared) >= 2 and distinguishing else 4
+
+    def _rank(job):
+        # The role named in the email is the strongest signal; an application the operator has
+        # actually recorded breaks a tie at the same title evidence; newest row last.
+        return (_title_tier(job), 0 if _is_live_application(job) else 1, -job.id)
+
+    ranked = sorted(candidates, key=_rank)
+    best_rank = _rank(ranked[0])
+    best_tier = best_rank[0]
+    group = [j for j in ranked if _rank(j)[:2] == best_rank[:2]]
+
+    labels = {1: "exact_title", 2: "title_contains", 3: "title_overlap", 4: "no_title_evidence"}
+    label = labels[best_tier]
+
+    if len(group) > 1:
+        return None, {
+            "matched_by": "ambiguous",
+            "ambiguous": True,
+            "candidates": [_candidate_brief(j) for j in group[:5]],
+        }
+
+    if best_tier == 4:
+        # Not one shared token between the email's role and any tracked application: never guess,
+        # even when only one application exists at the company (a rejection for a different role
+        # would otherwise flip it).
+        return None, {
+            "matched_by": "no_title_evidence",
+            "ambiguous": False,
+            "candidates": [_candidate_brief(j) for j in candidates[:5]],
+        }
+
+    winner = group[0]
+    return winner, {
+        "matched_by": label,
+        "ambiguous": False,
+        "candidates": [_candidate_brief(winner)],
+    }
+
 
 
 def _ensure_tracked_job_for_email_event(db, ev):
@@ -6639,18 +4333,23 @@ def _ensure_tracked_job_for_email_event(db, ev):
     role = (ev.get("role") or "").strip() or "Open Role"
     if not comp_name:
         return None
-    comp = db.query(Company).filter(Company.name.ilike(comp_name)).first()
-    if not comp:
-        comp = Company(
-            name=comp_name, domain=f"{comp_name.lower().replace(' ', '')}.com"
-        )
-        db.add(comp)
-        db.flush()
+    if _company_looks_like_a_sentence(comp_name):
+        # A mangled subject fragment is not an employer; stage it for the operator instead of
+        # minting a company like "GitLab was submitted".
+        return None
+    comp_name = resolve_company_name(comp_name, known_company_names(db)) or comp_name
+    comp, _company_created = find_or_create_company(db, comp_name)
+    if comp is None:
+        # The employer is on the blocklist; never re-create it through mail either.
+        return None
     exists = (
-        db.query(Job).filter(Job.company_id == comp.id, Job.title.ilike(role)).first()
+        db.query(Job).filter(Job.company_id == comp.id, Job.title.ilike(role)).all()
     )
     if exists:
-        return exists
+        # The same title can exist twice (a discovery row and the real application): attach to the
+        # application the operator has actually recorded, not the oldest row.
+        exists.sort(key=lambda j: (0 if _is_live_application(j) else 1, -j.id))
+        return exists[0]
     job = Job(
         company_id=comp.id,
         title=role,
@@ -6687,6 +4386,43 @@ def _email_has_application_cue(ev) -> bool:
         "availability", "code challenge", "technical screen",
     )
     return any(cue in text for cue in cues)
+
+
+# A mail can report that the *posting* is gone without the employer rejecting the candidate
+# (requisition filled, expired, unlisted). That is "Closed", not "Rejected".
+_EMAIL_POSTING_CLOSURE_CUES = (
+    "position has been closed", "posting has been closed", "job posting has closed",
+    "position is closed", "position closed", "requisition has been closed",
+    "requisition closed", "this role has been closed", "role has been closed",
+    "no longer accepting applications", "posting is no longer available",
+    "position is no longer available", "job has been closed", "application closed",
+    "posting has closed", "has been filled and is no longer",
+)
+
+# Invitation-to-schedule wording. A confirmed "your interview is on <date>" mail is not here:
+# that is the interview stage, not the scheduling stage.
+_EMAIL_INTERVIEW_SCHEDULING_CUES = (
+    "schedule your interview", "schedule a time", "schedule time", "self-schedule",
+    "self schedule", "pick a time", "select a time", "book a time", "find a time",
+    "interview availability", "your availability", "invitation to interview",
+    "schedule your", "scheduling link", "choose a time slot", "select a slot",
+)
+
+
+def _email_text(ev) -> str:
+    return f"{ev.get('subject', '')} {ev.get('snippet', '')}".lower()
+
+
+def _email_reports_posting_closure(ev) -> bool:
+    """True when the mail says the posting closed, rather than the employer rejecting."""
+    text = _email_text(ev)
+    return any(cue in text for cue in _EMAIL_POSTING_CLOSURE_CUES)
+
+
+def _email_is_interview_invite(ev) -> bool:
+    """True when the mail invites the candidate to schedule an interview."""
+    text = _email_text(ev)
+    return any(cue in text for cue in _EMAIL_INTERVIEW_SCHEDULING_CUES)
 
 
 def _email_auto_create_eligible(ev) -> bool:
@@ -6766,10 +4502,14 @@ def _stage_email_application(db, ev) -> bool:
     if pending:
         pending.last_seen = now_utc
         pending.email_count = (pending.email_count or 0) + 1
+        if ev.get("message_id"):
+            pending.message_id = ev["message_id"]
+        if ev.get("thread_id"):
+            pending.thread_id = ev["thread_id"]
         if ev.get("event_type"):
             pending.event_type = ev["event_type"]
         if ev.get("snippet"):
-            pending.snippet = (ev["snippet"] or "")[:400]
+            pending.snippet = (ev["snippet"] or "")[:SNIPPET_CHARS]
         return True
     db.add(
         PendingEmailApplication(
@@ -6782,13 +4522,163 @@ def _stage_email_application(db, ev) -> bool:
             last_seen=now_utc,
             email_count=1,
             state="pending",
-            snippet=(ev.get("snippet") or "")[:400],
+            snippet=(ev.get("snippet") or "")[:SNIPPET_CHARS],
+            message_id=ev.get("message_id") or None,
+            thread_id=ev.get("thread_id") or None,
         )
     )
     return True
 
 
-def _apply_email_events_to_db(db, email_events) -> int:
+_RELAY_EMPLOYER_PATTERNS = (
+    re.compile(r"application successful:\s*([^-\u2013\u2014]{2,40})\s*[-\u2013\u2014]", re.I),
+    re.compile(r"thank you for applying to\s+([^!.,\n]{2,40})", re.I),
+    re.compile(r"applying to\s+([^.,\n]{2,40}?)\s+for the role", re.I),
+    re.compile(r"application (?:to|for)\s+([^.,\n]{2,40}?)\s+(?:-|for|position)", re.I),
+    # Screening vendors ("Schedule Your <Employer> - US Interview!", "<Employer> - Karat Interview")
+    re.compile(r"schedule your\s+([^-\u2013\u2014!\n]{2,40})\s*[-\u2013\u2014]", re.I),
+    re.compile(r"^\s*([^-\u2013\u2014!\n]{2,40})\s*[-\u2013\u2014]\s*(?:karat|hackerrank|codility)", re.I),
+    re.compile(r"(?:karat|hackerrank|codility)[^.!?\n]{0,20}\b(?:with|for|at)\s+([^.,!\n]{2,40})", re.I),
+    # Scheduling vendors (GoodTime/ModernLoop): "Please Confirm: Your <Employer> Virtual
+    # Interview", "Reminder - <Employer> Virtual Interview - <candidate> for <role>".
+    re.compile(
+        r"\byour\s+([^.!?\n]{2,40}?)\s+(?:virtual|phone|technical|video|on-?site)\s+interview",
+        re.I,
+    ),
+    re.compile(
+        r"^\s*(?:reminder\s*[-\u2013\u2014]\s*)?([^-\u2013\u2014!\n]{2,40}?)\s+"
+        r"(?:virtual|phone|technical|video|on-?site)\s+interview",
+        re.I,
+    ),
+    # Career-portal digests relayed by an ATS ("MyGreenhouse: New Jobs at Airbnb").
+    re.compile(r"new\s+jobs?\s+at\s+([^-\u2013\u2014!\n.,]{2,40})", re.I),
+)
+
+
+def _is_relay_sender(ev) -> bool:
+    """True when the parsed employer is really an ATS/relay, never the hiring company.
+
+    Relays (`myworkday.com`, `hirist.tech`, `karat.com`, `greenhouse-mail.io`, ...) hide the
+    employer in their sender domain, so using them as the company key files every application from
+    that vendor under one bogus row (one row ended up holding three unrelated applications).
+    """
+    company = (ev.get("company") or "").strip()
+    domain = (ev.get("domain") or "").strip()
+    if company and _is_aggregator_company(company):
+        return True
+    return bool(domain) and _is_ats_or_freemail_domain(domain)
+
+
+_RELAY_CANDIDATE_TAIL = re.compile(
+    r"\s+(?:is|are|was|has|have|will|would|interview|interviews|screening|invitation|confirmed|"
+    r"scheduled|assessment|test)\b.*$",
+    re.I,
+)
+
+
+def _clean_relay_candidate(candidate: str) -> str:
+    """Trims sentence residue from a subject-derived employer ("Initech is confirmed" -> "Initech")."""
+    text = _RELAY_CANDIDATE_TAIL.sub("", candidate or "").strip(" .,-\u2013\u2014:;'’")
+    return text
+
+
+def _employer_from_relay_email(db, ev) -> Optional[str]:
+    """Best-effort recovery of the hiring company from a relay-sent email.
+
+    Order: explicit subject patterns ("Application Successful: F5 - ..."), the relay's per-employer
+    local part (`salesforce@myworkday.com`), then any tracked company name mentioned in the email.
+    """
+    subject = ev.get("subject") or ""
+    for pattern in _RELAY_EMPLOYER_PATTERNS:
+        match = pattern.search(subject)
+        if match:
+            candidate = _clean_relay_candidate(match.group(1))
+            if candidate and len(candidate) <= 40 and not _is_aggregator_company(candidate):
+                return candidate
+
+    from sqlalchemy import func
+
+    sender = ev.get("sender") or ""
+    if "@" in sender:
+        local = sender.split("@", 1)[0].split("+")[0].strip()
+        if len(local) >= 4 and not _is_aggregator_company(local):
+            # Exact name first, then the tenant prefix: "walmart@myworkday.com" is
+            # "Walmart Global Tech", and "salesforce@myworkday.com" is "Salesforce".
+            hit = (
+                db.query(Company)
+                .filter(Company.name.ilike(local))
+                .first()
+                or db.query(Company)
+                .filter(Company.name.ilike(f"{local}%"))
+                .order_by(func.length(Company.name))
+                .first()
+            )
+            if hit:
+                return hit.name
+
+    best = None
+    haystack = f"{subject}\n{ev.get('snippet') or ''}"
+    for comp in db.query(Company).all():
+        name = (comp.name or "").strip()
+        if len(name) < 4 or _is_aggregator_company(name):
+            continue
+        if re.search(rf"\b{re.escape(name)}\b", haystack, re.I):
+            if best is None or len(name) > len(best):
+                best = name
+    return best
+
+
+# Match methods strong enough to teach a job its own requisition id. A weak/ambiguous match must
+# never bind an id to a row: the next mail carrying that id would follow the same mistake.
+_STRONG_MATCH_METHODS = frozenset(
+    {"requisition", "exact_title", "title_contains", "accepted_pending", "auto_created"}
+)
+
+
+def _record_email_application_link(db, ev, job, info, requisition_id: str = "") -> None:
+    """Persist which message was attributed to which application (upsert by ``message_id``)."""
+    if job is None:
+        return
+    if requisition_id and not job.requisition_id and (info or {}).get("matched_by") in _STRONG_MATCH_METHODS:
+        job.requisition_id = requisition_id
+        job.requisition_source = _req_source_of(ev)
+    message_id = (ev.get("message_id") or "").strip()
+    if not message_id:
+        return
+    link = (
+        db.query(EmailApplicationLink)
+        .filter(EmailApplicationLink.message_id == message_id)
+        .first()
+    )
+    if link is None:
+        link = EmailApplicationLink(message_id=message_id, job_id=job.id)
+        db.add(link)
+    elif link.job_id != job.id:
+        logger.info(
+            "Email %s re-pointed from job %s to %s (%s)",
+            message_id,
+            link.job_id,
+            job.id,
+            (info or {}).get("matched_by") or "?",
+        )
+        link.job_id = job.id
+    link.thread_id = ev.get("thread_id") or link.thread_id
+    link.method = (info or {}).get("matched_by") or link.method or ""
+    link.confidence = float(ev.get("confidence", 0.0) or 0.0)
+    link.sender = (ev.get("sender") or "")[:255]
+    link.subject = (ev.get("subject") or "")[:2000]
+    link.received_at = (ev.get("date") or "")[:64]
+
+
+def _req_source_of(ev) -> str:
+    from backend.requisition import extract_requisition_id
+
+    return extract_requisition_id(ev.get("subject") or "", ev.get("snippet") or "")[1]
+
+
+def _apply_email_events_to_db(
+    db, email_events, out_changes: Optional[List[Dict[str, Any]]] = None
+) -> int:
     """
     Maps classified email events to Job status updates and ApplicationEvents:
       application_received -> Applied, screening -> Screening, interview -> Interview,
@@ -6804,6 +4694,10 @@ def _apply_email_events_to_db(db, email_events) -> int:
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     status_updates = 0
     skipped_low_confidence = 0
+    ambiguous_staged = 0
+    relay_staged = 0
+    weak_staged = 0
+    changes = out_changes if out_changes is not None else []
     for ev in email_events or []:
         ev_type = ev.get("event_type", "")
         if ev_type == "opportunity":
@@ -6811,6 +4705,20 @@ def _apply_email_events_to_db(db, email_events) -> int:
         comp_name = ev.get("company", "")
         role = ev.get("role", "")
         subj = ev.get("subject", "")
+        if _is_relay_sender(ev):
+            # A relay is not an employer: resolve the hiring company, or stage the email so it is
+            # never filed as its own application.
+            recovered = _employer_from_relay_email(db, ev)
+            if not recovered:
+                if _stage_email_application(db, ev):
+                    relay_staged += 1
+                logger.info(
+                    "Gmail status email came via a relay with no recoverable employer "
+                    "(%s): staged for review.",
+                    (ev.get("domain") or ev.get("company") or "?"),
+                )
+                continue
+            comp_name = recovered
         if not comp_name:
             continue
         confidence = float(ev.get("confidence", 1.0) or 0.0)
@@ -6821,10 +4729,47 @@ def _apply_email_events_to_db(db, email_events) -> int:
                 f"{EMAIL_STATUS_MIN_CONFIDENCE}): '{subj[:60]}'"
             )
             continue
-        matched_job = _match_job_for_email_event(
-            db, comp_name, role, ev.get("domain", "")
+        # The strongest keys first: a requisition id names exactly one posting, and a reply
+        # inherits its thread's application. Both are absent for most legacy mails, in which
+        # case the company + title tiers decide.
+        requisition_id, _req_source = extract_requisition_id(
+            subj, ev.get("snippet") or ""
+        )
+        matched_job, match_info = _match_job_for_email_event(
+            db,
+            comp_name,
+            role,
+            ev.get("domain", ""),
+            requisition_id=requisition_id,
+            thread_id=ev.get("thread_id", ""),
         )
         if not matched_job:
+            # Ambiguous: several applications fit the email equally well, or the only fitting rows
+            # are ones the operator never applied to. Guessing here flips the wrong application, so
+            # the email goes to the review queue with its candidates instead (issue: GitLab
+            # "Staff Backend Engineer" rejection landing on a discovered posting).
+            if match_info.get("ambiguous"):
+                if _stage_email_application(db, ev):
+                    ambiguous_staged += 1
+                logger.info(
+                    "Gmail email event is ambiguous (%s): %s candidates at '%s' — staged for review.",
+                    match_info.get("matched_by"),
+                    len(match_info.get("candidates") or []),
+                    comp_name,
+                )
+                continue
+            # The company already has tracked applications, but none of them shares a usable
+            # title with the mail: auto-creating another row here is how a generic role minted a
+            # phantom application beside the real one. Stage it and let the operator choose.
+            if match_info.get("matched_by") == "no_title_evidence" and match_info.get("candidates"):
+                if _stage_email_application(db, ev):
+                    weak_staged += 1
+                logger.info(
+                    "Gmail email event has no title evidence (%s candidates at '%s') — staged.",
+                    len(match_info.get("candidates") or []),
+                    comp_name,
+                )
+                continue
             # Capture applications/outcomes for roles never discovered by a scan — but ONLY
             # for the unambiguous case (issue #76). Otherwise stage it for the operator so a
             # real application is never silently dropped or auto-created as a phantom job.
@@ -6835,35 +4780,75 @@ def _apply_email_events_to_db(db, email_events) -> int:
                 continue
             if not matched_job:
                 continue
+            match_info = {"matched_by": "auto_created", "ambiguous": False}
 
         new_status = None
+        previous_status = matched_job.status
         desc = ""
-        if ev_type == "rejection":
-            if matched_job.status != "Rejected":
+        note = ""
+        if ev_type in ("interview", "screening") and not _is_live_application(matched_job):
+            # A scheduling/interview mail proves an *application*, not that an interview happened
+            # for this requisition. Asserting "Interview" here is how rows the operator never
+            # applied to ended up in the interview stage (2026-11-16 cleanup: Microsoft, FIRY,
+            # Amazon, InfoVision, Meazure, DeepMind). Mark the application, leave the stage alone.
+            #
+            # Only with a strong attribution: a title-overlap guess must not *create* an
+            # application, which is how a sibling row was poisoned by someone else's invite.
+            if match_info.get("matched_by") not in _STRONG_MATCH_SOURCES:
+                if _stage_email_application(db, ev):
+                    weak_staged += 1
+                logger.info(
+                    "Gmail scheduling mail matched only by '%s' at '%s' — staged.",
+                    match_info.get("matched_by"),
+                    comp_name,
+                )
+                continue
+            new_status = "Applied"
+            note = "a scheduling email proves an application, not an interview"
+            if not matched_job.applied_at:
+                matched_job.applied_at = now_utc
+        elif ev_type == "rejection":
+            if _email_reports_posting_closure(ev):
+                # The posting is gone, the candidate was not turned down: keep those apart so a
+                # closure count never reads as a rejection count.
+                if matched_job.status != "Closed":
+                    new_status = "Closed"
+                    note = "the mail reports the posting closed, not an employer rejection"
+            elif matched_job.status != "Rejected":
                 new_status = "Rejected"
                 matched_job.rejected_at = now_utc
-                desc = f"Decision email received: '{subj}'."
         elif ev_type == "offer":
             if matched_job.status != "Offered":
                 new_status = "Offered"
-                desc = f"Offer email received: '{subj}'."
         elif ev_type == "interview":
-            if matched_job.status not in ("Interview", "Offered"):
-                new_status = "Interview"
-                matched_job.interview_scheduled_at = now_utc
-                desc = f"Interview invite email received: '{subj}'."
+            if matched_job.status not in ("Interview Scheduling", "Interview", "Offered"):
+                if _email_is_interview_invite(ev):
+                    new_status = "Interview Scheduling"
+                    note = "an invitation to schedule, not a confirmed interview"
+                else:
+                    new_status = "Interview"
+                    matched_job.interview_scheduled_at = now_utc
         elif ev_type == "screening":
             if matched_job.status in ("To Apply", "Shortlisted", "Applied"):
                 new_status = "Screening"
-                desc = f"Screening email received: '{subj}'."
         elif ev_type == "application_received":
             if matched_job.status in ("To Apply", "Shortlisted", "Not Interested"):
                 new_status = "Applied"
                 matched_job.applied_at = now_utc
-                desc = f"Application confirmation email received: '{subj}'."
 
         if new_status:
             matched_job.status = new_status
+            # The event is the evidence trail: say WHEN the mail arrived, WHAT moved, and WHICH
+            # message caused it, so the dossier explains the status instead of asserting it.
+            received = (ev.get("received_at") or "").strip()
+            when = received[:10] if received else now_utc.strftime("%Y-%m-%d")
+            source = (ev.get("sender") or ev.get("domain") or "email").strip()
+            desc = (
+                f"Mail {when} from {source}: {previous_status or 'unknown'} → {new_status} "
+                f"— '{subj}'"
+            )
+            if note:
+                desc = f"{desc} ({note})"
             db.add(
                 ApplicationEvent(
                     job_id=matched_job.id,
@@ -6872,10 +4857,43 @@ def _apply_email_events_to_db(db, email_events) -> int:
                 )
             )
             status_updates += 1
+            # The operator must be able to tell WHICH application moved, not just how many.
+            changes.append(
+                {
+                    "job_id": matched_job.id,
+                    "title": matched_job.title,
+                    "company": (
+                        matched_job.company.name
+                        if matched_job.company
+                        else comp_name
+                    ),
+                    "from": previous_status,
+                    "to": new_status,
+                    "event": ev_type,
+                    "subject": (subj or "")[:200],
+                    "matched_by": match_info.get("matched_by") or "email",
+                }
+            )
+
+        # Attribution is a record, not a sentence: one row per message (unique), so the same mail
+        # can never be attached to two applications and a correction is an update.
+        _record_email_application_link(db, ev, matched_job, match_info, requisition_id)
 
     if skipped_low_confidence:
         logger.info(
             f"Gmail sync: {skipped_low_confidence} low-confidence status event(s) skipped."
+        )
+    if ambiguous_staged:
+        logger.info(
+            f"Gmail sync: {ambiguous_staged} ambiguous status event(s) staged for review."
+        )
+    if relay_staged:
+        logger.info(
+            f"Gmail sync: {relay_staged} relay-sent status event(s) staged (no employer resolved)."
+        )
+    if weak_staged:
+        logger.info(
+            f"Gmail sync: {weak_staged} weakly-matched status event(s) staged for review."
         )
     db.commit()
     return status_updates
@@ -6901,6 +4919,25 @@ _AGGREGATOR_COMPANY_NAMES = {
     "builtin",
     "hirist",
     "foundit",
+    "myworkday",
+    "workday",
+    "kekamail",
+    # Interview scheduling / assessment vendors (they mail on behalf of the employer).
+    "goodtime",
+    "goodtime.io",
+    "modernloop",
+    "calendly",
+    "hirevue",
+    "sparkhire",
+    "vidcruiter",
+    "paradox",
+    "karat",
+    "recruiterflow",
+    "recruiterflowmail",
+    "jobgether",
+    "greenhouse",
+    "lever",
+    "ashby",
     "discovered employer",
     "discovered via google alert",
     "direct",
@@ -6913,12 +4950,15 @@ _AGGREGATOR_COMPANY_NAMES = {
 _JOB_STATUS_RANK = {
     "Not Interested": -1,
     "Rejected": 0,
+    "Closed": 0,
+    "Withdrawn": 0,
     "To Apply": 0,
     "Shortlisted": 1,
     "Applied": 2,
     "Screening": 3,
-    "Interview": 4,
-    "Offered": 5,
+    "Interview Scheduling": 4,
+    "Interview": 5,
+    "Offered": 6,
 }
 
 
@@ -7003,7 +5043,9 @@ def _opportunity_identity_key(job):
     return ("title", job.company_id, (job.title or "").strip().lower())
 
 
-def _ingest_email_opportunities_to_db(db, email_events) -> int:
+def _ingest_email_opportunities_to_db(
+    db, email_events, out_records: Optional[List[Dict[str, Any]]] = None
+) -> int:
     """
     Ingests opportunities discovered in Gmail (job alerts / recruiter outreach) as
     'To Apply' jobs, so roles surfaced by email are tracked even without an application.
@@ -7015,6 +5057,7 @@ def _ingest_email_opportunities_to_db(db, email_events) -> int:
     """
     added = 0
     seen = set()
+    added_records = out_records if out_records is not None else []
     pref_filter = PreferenceFilter.from_db(db)
     filtered_out = 0
     for ev in email_events or []:
@@ -7075,13 +5118,10 @@ def _ingest_email_opportunities_to_db(db, email_events) -> int:
         if batch_key in seen:
             continue
 
-        comp = db.query(Company).filter(Company.name.ilike(comp_name)).first()
-        if not comp:
-            comp = Company(
-                name=comp_name, domain=f"{comp_name.lower().replace(' ', '')}.com"
-            )
-            db.add(comp)
-            db.flush()
+        comp_name = resolve_company_name(comp_name, known_company_names(db)) or comp_name
+        comp, _company_created = find_or_create_company(db, comp_name)
+        if comp is None:
+            continue
 
         if _find_existing_opportunity_job(db, comp.id, role, url):
             seen.add(batch_key)
@@ -7102,13 +5142,25 @@ def _ingest_email_opportunities_to_db(db, email_events) -> int:
                 source=source,
                 source_type="Email",
                 status="To Apply",
-                match_score=55.0,
+                # No scorer ran on this opportunity: leave the score unset so the UI does
+                # not band it "Moderate" on a constant (finding 85). The analysis records
+                # provenance only.
+                match_score=None,
                 match_analysis=f"Opportunity detected in Gmail: '{ev.get('subject', '')}'.",
             )
         )
         db.flush()
         seen.add(batch_key)
         added += 1
+        added_records.append(
+            {
+                "title": role,
+                "company": comp_name,
+                "url": url,
+                "subject": (subject or "")[:200],
+                "source": source,
+            }
+        )
     dedupe_gmail_opportunity_jobs(db)
     db.commit()
     if filtered_out:
@@ -7203,10 +5255,17 @@ def accept_pending_email_application(pending_id: int, db: Session = Depends(get_
         "snippet": pending.snippet or "",
         "subject": f"{pending.company} {pending.role}",
         "confidence": pending.confidence,
+        # The staged card keeps the message identity, so accepting it records the link and the
+        # next mail in that thread inherits this application.
+        "message_id": pending.message_id or "",
+        "thread_id": pending.thread_id or "",
     }
     job = _ensure_tracked_job_for_email_event(db, ev)
     if not job:
         return {"ok": False, "detail": "Could not create a tracked job."}
+    # Tracking an application is not just "make a row": the email's outcome (interview, rejection,
+    # offer) has to land on the application as evidence, otherwise the dossier says nothing.
+    _apply_email_events_to_db(db, [ev], [])
     pending.state = "accepted"
     db.commit()
     return {"ok": True, "job_id": job.id, "company": pending.company, "role": pending.role}
@@ -7277,18 +5336,26 @@ def _execute_external_sync(
     - SmartRecruiters (`jobs.smartrecruiters.com`): Requisition availability probe via the public Posting API.
     - Gmail (`mail.google.com`): Interview invites and rejection status synchronization.
     """
+    # One pacer for the whole status sync: the liveness probes run once per Applied/Shortlisted
+    # row, so an unpaced loop is hundreds of requests to a single host in one run (finding 40).
+    from backend.ats.pacing import build_pacer
+
+    probe_pacer = build_pacer()
+
     hirist_checked = 0
     hirist_updated = 0
     hirist_ingested = 0
     emails_checked = 0
     status_updates = 0
     opportunities_added = 0
+    email_changes: List[Dict[str, Any]] = []
+    email_opportunities: List[Dict[str, Any]] = []
     details = []
     # Per-channel outcomes so the run status can be honest (see backend.channel_status).
     outcomes = []
 
     def _source_enabled(source: str, flag: str) -> bool:
-        """Probing runs only when the source is requested AND its portal flag is enabled."""
+        """Probing runs only when requested, the flag is on, and any required consent is current."""
         if source not in payload.sources and "all" not in payload.sources:
             return False
         if not is_feature_enabled(db, flag):
@@ -7297,6 +5364,16 @@ def _execute_external_sync(
             )
             channel_status.record(
                 outcomes, source, channel_status.SKIPPED_FLAG, f"'{flag}' disabled"
+            )
+            return False
+        if flag in CONSENT_REQUIRED_FEATURES and not has_consent(db, flag):
+            # The flag stays true across a CONSENT_VERSION bump, so consent has to be re-checked
+            # here or a scheduled run keeps scraping a portal the operator did not re-approve.
+            details.append(
+                f"{source} probing skipped: consent for '{flag}' is missing or outdated."
+            )
+            channel_status.record(
+                outcomes, source, channel_status.SKIPPED_FLAG, f"consent for '{flag}' not current"
             )
             return False
         return True
@@ -7388,18 +5465,15 @@ def _execute_external_sync(
                             )
                     else:
                         # New application on Hirist -> Ingest into DB
-                        comp = (
-                            db.query(Company)
-                            .filter(Company.name.ilike(comp_name))
-                            .first()
+                        comp_name = (
+                            resolve_company_name(comp_name, known_company_names(db))
+                            or comp_name
                         )
-                        if not comp:
-                            comp = Company(
-                                name=comp_name,
-                                domain=f"{comp_name.lower().replace(' ', '')}.com",
-                            )
-                            db.add(comp)
-                            db.flush()
+                        comp, _company_created = find_or_create_company(
+                            db, comp_name
+                        )
+                        if comp is None:
+                            continue
 
                         (
                             match_score,
@@ -7499,11 +5573,20 @@ def _execute_external_sync(
         fallback_error = None
         # API-first when connected; otherwise restricted browser fallback.
         if is_gmail_configured():
+            api_stats: Dict[str, Any] = {}
             try:
                 from backend.gmail_client import run_gmail_sync
 
-                email_events = run_gmail_sync(db)
+                email_events = run_gmail_sync(db, stats=api_stats)
                 used_api = True
+                # A *first* alert pass that matches nothing means the query or the granted
+                # scope is wrong — not that the mailbox is quiet — so fall back once.
+                if (
+                    int(api_stats.get("alert_messages_matched") or 0) == 0
+                    and not api_stats.get("alerts_had_watermark")
+                ):
+                    api_error = "Gmail API matched no alert mail on a first run"
+                    used_api = False
             except Exception as api_err:
                 api_error = str(api_err)
                 logger.warning(
@@ -7527,11 +5610,20 @@ def _execute_external_sync(
                 details.append(f"Email sync notice: {str(e)}")
 
         emails_checked = len(email_events)
-        status_updates += _apply_email_events_to_db(db, email_events)
-        opportunities_added = _ingest_email_opportunities_to_db(db, email_events)
-        if opportunities_added:
+        status_updates += _apply_email_events_to_db(
+            db, email_events, email_changes
+        )
+        for change in email_changes:
             details.append(
-                f"Gmail opportunities tracked: {opportunities_added} new role(s)."
+                f"Email status change: '{change['title']}' at {change['company']} — "
+                f"{change['from'] or 'unknown'} → {change['to']} (subject: '{change['subject'][:80]}')."
+            )
+        opportunities_added += _ingest_email_opportunities_to_db(
+            db, email_events, email_opportunities
+        )
+        for opp in email_opportunities:
+            details.append(
+                f"Gmail opportunity tracked: '{opp['title']}' at {opp['company']}."
             )
 
         # Honest channel outcome: "0 emails" is only meaningful when the API path ran.
@@ -7582,10 +5674,10 @@ def _execute_external_sync(
             )
 
             for gh_job in greenhouse_jobs:
-                is_active = probe_greenhouse_job_active(gh_job.url)
-                if not is_active and gh_job.status != "Rejected":
-                    gh_job.status = "Rejected"
-                    gh_job.rejected_at = datetime.datetime.now(datetime.timezone.utc)
+                is_active = probe_greenhouse_job_active(gh_job.url, pacer=probe_pacer)
+                if not is_active and gh_job.status not in ("Rejected", "Closed"):
+                    # A vanished requisition is a closure, not an employer rejection.
+                    gh_job.status = "Closed"
                     db.add(
                         ApplicationEvent(
                             job_id=gh_job.id,
@@ -7624,11 +5716,10 @@ def _execute_external_sync(
 
             for lv_job in lever_jobs:
                 if (
-                    not probe_lever_job_active(lv_job.url)
-                    and lv_job.status != "Rejected"
+                    not probe_lever_job_active(lv_job.url, pacer=probe_pacer)
+                    and lv_job.status not in ("Rejected", "Closed")
                 ):
-                    lv_job.status = "Rejected"
-                    lv_job.rejected_at = datetime.datetime.now(datetime.timezone.utc)
+                    lv_job.status = "Closed"
                     db.add(
                         ApplicationEvent(
                             job_id=lv_job.id,
@@ -7665,11 +5756,10 @@ def _execute_external_sync(
 
             for sr_job in sr_jobs:
                 if (
-                    not probe_smartrecruiters_job_active(sr_job.url)
-                    and sr_job.status != "Rejected"
+                    not probe_smartrecruiters_job_active(sr_job.url, pacer=probe_pacer)
+                    and sr_job.status not in ("Rejected", "Closed")
                 ):
-                    sr_job.status = "Rejected"
-                    sr_job.rejected_at = datetime.datetime.now(datetime.timezone.utc)
+                    sr_job.status = "Closed"
                     db.add(
                         ApplicationEvent(
                             job_id=sr_job.id,
@@ -7708,7 +5798,12 @@ def _execute_external_sync(
             status=run_status,
             summary=summary,
             details_json=sanitize_log_details(
-                {"details": details, "channels": outcomes}
+                {
+                    "details": details,
+                    "channels": outcomes,
+                    "status_changes": email_changes,
+                    "opportunities": email_opportunities,
+                }
             ),
             jobs_count=hirist_checked + emails_checked,
             prompt_tokens=0,
@@ -7751,701 +5846,26 @@ def _execute_external_sync(
 
 # Preference-derived Google Jobs queries fan out one-per-location; both caps keep a scheduled
 # run bounded (requests are paced and Google rate-limits aggressively).
-_GOOGLE_JOBS_MAX_LOCATIONS = 3
-_GOOGLE_JOBS_MAX_PREF_QUERIES = 6
-
-
-def _run_google_jobs_task_runner(
-    queries: Optional[List[str]] = None,
-    location: str = "India",
-    use_playwright: bool = False,
+def _run_gmail_sync_task_runner(
     cancel_token: Optional[CancellationToken] = None,
     progress_cb: Optional[Callable] = None,
 ) -> Dict[str, Any]:
-    """Background runner for Google for Jobs multi-query discovery scan."""
+    """Background Gmail sync runner (issue #84): fetch → classify → apply → OperationLog."""
     db_gen = get_db()
     db = next(db_gen)
-    total_discovered = 0
-    errors_count = 0
-    # How many queries actually returned raw postings. Zero across all queries means the
-    # fetcher produced nothing, which is NOT the same as "no new roles to add".
-    queries_with_results = 0
-    blocked_count = 0
-    # Per-query outcome: fetched | browser_busy | dom_changed | robots_blocked | zero_results.
-    per_query_outcomes: List[Dict[str, Any]] = []
-    # Route Google Jobs browser navigation through the shared HostPacer (delay + jitter + ceiling).
-    from backend.ats.pacing import build_pacer
-
-    google_pacer = build_pacer()
-
     try:
-        from backend import google_jobs_state
-
-        cooldown = google_jobs_state.cooldown_reason()
-        if cooldown:
-            gjo_outcomes = []
-            channel_status.record(
-                gjo_outcomes, "google_jobs", channel_status.COOLING_DOWN, cooldown
-            )
-            gjo_status = channel_status.aggregate_status(gjo_outcomes)
-            if progress_cb:
-                progress_cb(
-                    step=1,
-                    label=f"Skipped: {cooldown}",
-                    items_found=0,
-                    total_steps=1,
-                )
-            db.add(
-                OperationLog(
-                    operation_type="google_jobs_background_scan",
-                    status=gjo_status,
-                    summary=f"Google Jobs Scan: skipped — {cooldown}",
-                    details_json=sanitize_log_details(
-                        {"channels": gjo_outcomes, "cooldown_reason": cooldown}
-                    ),
-                    jobs_count=0,
-                    prompt_tokens=0,
-                    completion_tokens=0,
-                )
-            )
-            db.commit()
-            return {
-                "queries_scanned": 0,
-                "jobs_found": 0,
-                "filtered_out_of_preference": 0,
-                "errors_count": 0,
-                "status": gjo_status,
-                "skipped": "cooling_down",
-            }
-
-        if not queries or len(queries) == 0:
-            # Derive queries from persisted user preferences first, then followed queries.
-            pref = get_user_preferences(db)
-            titles = [
-                t.strip() for t in (pref.target_titles or "").split(",") if t.strip()
-            ]
-            # One query per title x location. Concatenating every city into a single phrase
-            # ("jobs in A, B, C, ..., Z") is not a searchable query, so Google answers nothing.
-            locs = [
-                c.strip() for c in (pref.target_cities or "").split(",") if c.strip()
-            ]
-            if not locs and (pref.target_country or "").strip():
-                locs = [pref.target_country.strip()]
-            locs = list(dict.fromkeys(locs))[:_GOOGLE_JOBS_MAX_LOCATIONS]
-            remote_suffix = (
-                " remote" if (pref.work_mode or "").lower() == "remote" else ""
-            )
-            pref_queries: List[str] = []
-            for title in titles:
-                for loc in locs or [""]:
-                    phrase = f" in {loc}" if loc else ""
-                    pref_queries.append(
-                        normalize_google_query(f"{title} jobs{phrase}{remote_suffix}")
-                    )
-                    if len(pref_queries) >= _GOOGLE_JOBS_MAX_PREF_QUERIES:
-                        break
-                if len(pref_queries) >= _GOOGLE_JOBS_MAX_PREF_QUERIES:
-                    break
-            queries = _normalize_google_queries(pref_queries) or load_google_searches()
-
-        if not queries:
-            queries = [
-                "Senior Software Engineer jobs in India",
-                "Staff Software Engineer remote",
-            ]
-
-        queries = _normalize_google_queries(queries)
-        queries, total_queries = google_jobs_state.select_queries(queries)
-        total_steps = len(queries)
-        active_resume = db.query(Resume).filter(Resume.is_active == True).first()
-        resume_text = (
-            decrypt_data(active_resume.content_encrypted) if active_resume else ""
-        )
-        # Shared preference gate: never ingest roles/locations outside the user's criteria.
-        pref_filter = PreferenceFilter.from_db(db)
-        filtered_count = 0
-
-        for idx, q_str in enumerate(queries):
-            if cancel_token:
-                cancel_token.check()
-
-            if progress_cb:
-                progress_cb(
-                    step=idx + 1,
-                    label=f"Query {idx + 1}/{total_steps}: '{q_str[:40]}'",
-                    items_found=total_discovered,
-                    errors=errors_count,
-                    total_steps=total_steps,
-                )
-
-            try:
-                raw_jobs = []
-                q_outcome_info: Dict[str, Any] = {}
-                try:
-                    with sync_playwright() as p:
-                        raw_jobs = fetch_google_jobs_playwright(
-                            p, query=q_str, location=location, headless=True,
-                            max_results=15, pacer=google_pacer, outcome=q_outcome_info,
-                        )
-                except Exception as p_err:
-                    q_outcome = q_outcome_info.get("outcome") or (
-                        "browser_busy"
-                        if "BrowserProfileBusy" in type(p_err).__name__
-                        else "error"
-                    )
-                    logger.warning(
-                        f"[Google Jobs] Playwright fetch failed for '{q_str}' "
-                        f"({q_outcome}): {p_err}"
-                    )
-                    per_query_outcomes.append(
-                        {"query": q_str[:80], "outcome": q_outcome, "error": str(p_err)[:200]}
-                    )
-                    errors_count += 1
-                else:
-                    q_outcome = q_outcome_info.get("outcome") or (
-                        "fetched" if raw_jobs else "zero_results"
-                    )
-                    if q_outcome in ("blocked", "not_jobs_mode"):
-                        blocked_count += 1
-                    per_query_outcomes.append(
-                        {
-                            "query": q_str[:80],
-                            "outcome": q_outcome,
-                            "count": len(raw_jobs),
-                            "url": q_outcome_info.get("url"),
-                            "browser_mode": q_outcome_info.get("browser_mode"),
-                            "body_signature": q_outcome_info.get("body_signature"),
-                        }
-                    )
-                    if q_outcome == "blocked":
-                        logger.warning(
-                            f"[Google Jobs] Blocked by Google for '{q_str}' "
-                            "(consent wall or unusual-traffic interstitial)."
-                        )
-                        google_jobs_state.record_block(f"blocked on query '{q_str[:60]}'")
-                        break
-                    elif q_outcome == "not_jobs_mode":
-                        logger.warning(
-                            f"[Google Jobs] Redirect dropped the jobs mode for '{q_str}'; "
-                            "landed on a plain web SERP."
-                        )
-                    elif q_outcome == "dom_changed":
-                        logger.warning(
-                            f"[Google Jobs] DOM selector miss for '{q_str}' (dom_changed); "
-                            "Google may have changed the jobs panel markup."
-                        )
-
-                if raw_jobs:
-                    queries_with_results += 1
-
-                for rj in raw_jobs:
-                    if cancel_token:
-                        cancel_token.check()
-
-                    comp_name = (rj.get("company_name") or "").strip()
-                    j_title = (rj.get("title") or "").strip()
-                    j_url = (rj.get("apply_url") or rj.get("url") or "").strip()
-
-                    if not comp_name or not j_title or not j_url:
-                        continue
-
-                    # Preference gate (title / location / work-mode) before ingestion.
-                    if pref_filter.rejection_reason(
-                        j_title, rj.get("location") or location, rj.get("description", "")
-                    ):
-                        filtered_count += 1
-                        continue
-
-                    # Check for duplicate
-                    exists = (
-                        db.query(Job)
-                        .filter(
-                            (Job.url == j_url)
-                            | (
-                                (Job.title == j_title)
-                                & (Job.location == rj.get("location"))
-                            )
-                        )
-                        .first()
-                    )
-                    if exists:
-                        continue
-
-                    # Upsert company
-                    comp_rec = (
-                        db.query(Company).filter(Company.name.ilike(comp_name)).first()
-                    )
-                    if not comp_rec:
-                        comp_rec = Company(
-                            name=comp_name,
-                            domain=comp_name.lower().replace(" ", "") + ".com",
-                        )
-                        db.add(comp_rec)
-                        db.flush()
-
-                    new_job = Job(
-                        company_id=comp_rec.id,
-                        title=j_title,
-                        description=rj.get("description")
-                        or f"Google for Jobs posting for {j_title} at {comp_name}.",
-                        url=j_url,
-                        location=rj.get("location") or location,
-                        source="google_jobs",
-                        source_type="Direct",
-                        status="To Apply",
-                        match_score=75.0,
-                    )
-                    db.add(new_job)
-                    db.flush()
-                    total_discovered += 1
-
-                db.commit()
-            except InterruptedError:
-                raise
-            except Exception as q_err:
-                errors_count += 1
-                logger.warning(f"Error scanning query '{q_str}': {q_err}")
-
-        if progress_cb:
-            progress_cb(
-                step=total_steps,
-                label=f"Completed {total_steps} queries. Discovered {total_discovered} roles ({filtered_count} filtered out).",
-                items_found=total_discovered,
-                errors=errors_count,
-                total_steps=total_steps,
-            )
-
-        if not blocked_count:
-            google_jobs_state.record_run(len(queries), total_queries)
-
-        gjo_outcomes = []
-        if errors_count >= total_steps:
-            channel_status.record(
-                gjo_outcomes, "google_jobs", channel_status.ERROR,
-                f"all {total_steps} queries raised",
-            )
-        elif blocked_count:
-            until = google_jobs_state.cooling_down_until()
-            deadline = (
-                f"; cooling down until {until.strftime('%Y-%m-%d %H:%M UTC')}"
-                if until
-                else ""
-            )
-            channel_status.record(
-                gjo_outcomes, "google_jobs", channel_status.ERROR,
-                f"{blocked_count}/{total_steps} queries blocked by Google "
-                f"(consent wall or unusual-traffic interstitial){deadline}",
-            )
-        elif queries_with_results == 0:
-            channel_status.record(
-                gjo_outcomes, "google_jobs", channel_status.DEGRADED_ZERO,
-                f"0 of {total_steps} queries returned any posting",
-            )
-        else:
-            channel_status.record(
-                gjo_outcomes, "google_jobs", channel_status.OK,
-                f"{queries_with_results}/{total_steps} queries returned postings",
-            )
-        gjo_status = channel_status.aggregate_status(gjo_outcomes)
-        gjo_summary = (
-            f"Google Jobs Scan: {total_steps} queries scanned, "
-            f"{total_discovered} new roles discovered, {filtered_count} filtered by preferences."
-        )
-        gjo_note = channel_status.describe(gjo_outcomes)
-        if gjo_note:
-            gjo_summary = f"{gjo_summary} Degraded — {gjo_note}"
-        db.add(
-            OperationLog(
-                operation_type="google_jobs_background_scan",
-                status=gjo_status,
-                summary=gjo_summary,
-                details_json=sanitize_log_details(
-                    {
-                        "filtered_out_of_preference": filtered_count,
-                        "queries_with_results": queries_with_results,
-                        "queries_failed": errors_count,
-                        "queries_available": total_queries,
-                        "per_query_outcomes": per_query_outcomes,
-                        "channels": gjo_outcomes,
-                    }
-                ),
-                jobs_count=total_discovered,
-                prompt_tokens=0,
-                completion_tokens=0,
-            )
-        )
-        db.commit()
-
-        return {
-            "queries_scanned": total_steps,
-            "jobs_found": total_discovered,
-            "filtered_out_of_preference": filtered_count,
-            "errors_count": errors_count,
-            "status": gjo_status,
-        }
-    finally:
-        db.close()
-
-
-def _run_linkedin_sync_task_runner(
-    cancel_token: Optional[CancellationToken] = None,
-    progress_cb: Optional[Callable] = None,
-) -> Dict[str, Any]:
-    """Background runner for LinkedIn Saved Jobs and Job Alerts synchronization."""
-    db_gen = get_db()
-    db = next(db_gen)
-    total_found = 0
-    scan_lock_held = False
-    # Saved jobs are explicit user intent and bypass the preference gate; alerts/recommendations do not.
-    pref_filter = PreferenceFilter.from_db(db)
-    alerts_filtered = 0
-
-    try:
-        # Defense in depth: the runner gates itself, so no caller (including a forced "Run now")
-        # can dispatch authenticated LinkedIn automation without an explicit acknowledgment.
-        if not is_feature_enabled(db, "linkedin_sync") or not has_consent(
-            db, "linkedin_sync"
-        ):
-            if progress_cb:
-                progress_cb(
-                    step=1,
-                    label="Skipped: LinkedIn automation disabled or consent not given.",
-                    items_found=0,
-                    total_steps=3,
-                )
-            return {"jobs_found": 0, "skipped": "consent_required"}
-
-        _log_linkedin_automation_warning()
-
-        if progress_cb:
-            progress_cb(
-                step=1,
-                label="Scanning LinkedIn Saved Jobs in persistent browser...",
-                items_found=0,
-                total_steps=3,
-            )
-
         if cancel_token:
             cancel_token.check()
-
-        # Yield to an active interactive/assisted browser session (single-owner profile).
-        from backend.playwright_app import is_profile_in_use
-
-        if is_profile_in_use():
-            if progress_cb:
-                progress_cb(
-                    step=3,
-                    label="Skipped: browser profile in use by another session.",
-                    total_steps=3,
-                )
-            return {"jobs_found": 0, "skipped": "browser_profile_busy"}
-
-        # Mutual exclusion with a manual POST /api/linkedin/sync: both scans drive the same
-        # single-owner browser profile (issue #114). The stage skips rather than queues so a
-        # Sync All run never blocks for minutes behind a manual scan.
-        if not _LINKEDIN_SCAN_GATE.try_acquire():
-            if progress_cb:
-                progress_cb(
-                    step=3,
-                    label="Skipped: a LinkedIn scan is already running.",
-                    total_steps=3,
-                )
-            return {"jobs_found": 0, "skipped": "linkedin_sync_in_progress"}
-        scan_lock_held = True
-
-        saved_count = 0
-        # Review batch id for this background sync run: every job newly ingested is tagged so the
-        # UI can show a "new from sync" review queue until the user acts on each job.
-        sync_batch_id = f"li-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S')}"
-
-        # Active resume drives match scoring for newly ingested saved jobs (same inputs the manual
-        # sync path uses).
-        active_resume = (
-            db.query(Resume)
-            .filter(Resume.is_active == True)
-            .order_by(Resume.created_at.desc())
-            .first()
-        )
-        resume_text = (
-            decrypt_data(active_resume.content_encrypted) if active_resume else ""
-        )
-        parsed_resume = _parsed_resume_of(active_resume)
-        saved_jd_fetches = 0
-
-        try:
-            with sync_playwright() as p:
-                # The saved-jobs scan manages its own browser context. Enrichment (detail-page
-                # fetches) reuses the scan's page when available; otherwise we lazily open a
-                # context only if there is actually a new job to enrich, so a no-op sync never
-                # spawns a browser.
-                enrichment_page = None
-                enrichment_context = None
-
-                def _get_enrichment_page():
-                    nonlocal enrichment_page, enrichment_context
-                    if enrichment_page is None:
-                        enrichment_context = get_persistent_browser_context(p, headless=True)
-                        enrichment_page = (
-                            enrichment_context.pages[0]
-                            if (hasattr(enrichment_context, "pages") and isinstance(enrichment_context.pages, list) and len(enrichment_context.pages) > 0)
-                            else enrichment_context.new_page()
-                        )
-                    return enrichment_page
-
-                try:
-                    saved_jobs = scan_and_sync_linkedin_saved_jobs(
-                        p, headless=True, auto_unsave_closed=True, max_pages=3
-                    )
-                    for item in saved_jobs or []:
-                        if item.get("is_closed"):
-                            matched_job = (
-                                db.query(Job)
-                                .filter(
-                                    (Job.title.ilike(item.get("title", "")))
-                                    | (Job.url == item.get("url", "___"))
-                                )
-                                .first()
-                            )
-                            if matched_job and matched_job.status in (
-                                "To Apply",
-                                "Shortlisted",
-                                "Not Interested",
-                            ):
-                                matched_job.status = "Rejected"
-                                matched_job.rejected_at = datetime.datetime.now(
-                                    datetime.timezone.utc
-                                )
-                                event = ApplicationEvent(
-                                    job_id=matched_job.id,
-                                    event_type="status_change",
-                                    description="Closed on LinkedIn: position expired or no longer accepting applications (automatically unsaved).",
-                                )
-                                db.add(event)
-                        else:
-                            existing = _linkedin_find_existing_job(
-                                db, item.get("title", ""), item.get("url", "___")
-                            )
-                            if existing:
-                                # Respect the user's explicit save: promote anything not yet actioned.
-                                # Back-catalog repair of rows ingested before the card parser was fixed
-                                # is handled by backend/scripts/repair_linkedin_saved_jobs.py.
-                                if existing.status in ("To Apply", "Not Interested"):
-                                    existing.status = "Shortlisted"
-                            else:
-                                # Enrich from the detail page first so a merged card title /
-                                # placeholder employer is repaired and the scorer gets real JD text.
-                                saved_jd = (item.get("description") or "").strip()
-                                if saved_jd_fetches < LINKEDIN_SAVED_JOB_DESC_FETCH_LIMIT:
-                                    saved_jd_fetches += 1
-                                    saved_jd = _linkedin_enrich_saved_job(_get_enrichment_page(), item) or saved_jd
-
-                                comp = _linkedin_upsert_company(db, item.get("company"))
-
-                                resolved_url, _portal_info = _linkedin_resolve_portal(
-                                    comp, item.get("url", ""), comp.name
-                                )
-                                item["url"] = resolved_url
-
-                                dd = evaluate_job_due_diligence(
-                                    job_title=item.get("title", ""),
-                                    source_type="LinkedIn",
-                                    portal_jobs=[],
-                                )
-
-                                (
-                                    match_score,
-                                    match_analysis,
-                                    match_scored,
-                                    score_method,
-                                    match_scored_at,
-                                    match_band,
-                                    apply_recommendation,
-                                    strengths,
-                                    gaps,
-                                    partials,
-                                ) = _score_job_with_engine(
-                                    db,
-                                    resume_text,
-                                    saved_jd or "",
-                                    parsed_resume=parsed_resume,
-                                    job_title=item.get("title") or "",
-                                )
-                                if not match_analysis:
-                                    match_analysis = "Saved on LinkedIn (High user interest)."
-
-                                job_emb = generate_embeddings(
-                                    f"{item.get('title', '')} {clean_job_description(saved_jd or item.get('title', ''))}"
-                                )
-                                new_job = Job(
-                                    company_id=comp.id,
-                                    title=item.get("title", ""),
-                                    description=saved_jd
-                                    or f"LinkedIn Saved Job opening for {item.get('title', '')} at {comp.name}.",
-                                    url=item.get("url", ""),
-                                    location=item.get("location", "Remote / Various"),
-                                    source="LinkedIn Saved Jobs",
-                                    source_type="LinkedIn",
-                                    status="Shortlisted",
-                                    sync_batch_id=sync_batch_id,
-                                    match_score=match_score,
-                                    match_analysis=match_analysis,
-                                    match_scored=match_scored,
-                                    score_method=score_method,
-                                    match_scored_at=match_scored_at,
-                                    **(_score_provenance(db) if match_scored else {}),
-                                    match_band=match_band,
-                                    apply_recommendation=apply_recommendation,
-                                    match_strengths_json=json.dumps(strengths) if match_scored else None,
-                                    match_gaps_json=json.dumps(gaps) if match_scored else None,
-                                    match_partials_json=json.dumps(partials) if match_scored else None,
-                                    is_ghost_job=dd.get("is_ghost_job", False),
-                                    embedding=job_emb,
-                                )
-                                db.add(new_job)
-                                saved_count += 1
-                    db.commit()
-                    total_found += saved_count
-                finally:
-                    if enrichment_context is not None:
-                        try:
-                            enrichment_context.close()
-                        except Exception:
-                            pass
-        except Exception as s_err:
-            logger.warning(f"LinkedIn saved jobs scan notice: {s_err}")
-
-        if cancel_token:
-            cancel_token.check()
-
-        if progress_cb:
-            progress_cb(
-                step=2,
-                label="Scanning LinkedIn Job Alerts & Recommendation feeds...",
-                items_found=total_found,
-                total_steps=3,
-            )
-
-        alerts_count = 0
-        try:
-            with sync_playwright() as p:
-                alerts_items = scan_linkedin_job_alerts(
-                    p, headless=True, max_alerts=10, max_jobs_per_alert=10
-                )
-                for rec in alerts_items or []:
-                    # Preference gate: alert/recommendation feeds are discovery, not explicit intent.
-                    if pref_filter.rejection_reason(
-                        rec.get("title", ""), rec.get("location") or "", rec.get("description", "")
-                    ):
-                        alerts_filtered += 1
-                        continue
-                    comp = _linkedin_upsert_company(db, rec.get("company"))
-
-                    resolved_url, portal_info = _linkedin_resolve_portal(
-                        comp, rec.get("url", ""), comp.name
-                    )
-                    if portal_info and resolved_url != rec.get("url", ""):
-                        rec["url"] = resolved_url
-                        rec["source_type"] = "Direct"
-                        rec["source"] = (
-                            f"{portal_info.get('portal_type', 'Direct')} Portal"
-                        )
-
-                    existing = _linkedin_find_existing_job(
-                        db, rec.get("title", ""), rec.get("url", ""), comp.id
-                    )
-                    if not existing:
-                        dismissal_match = check_semantic_dismissal(
-                            rec.get("title", ""),
-                            rec.get("description", ""),
-                            db,
-                            company_name=comp.name,
-                        )
-                        job_status = "Not Interested" if dismissal_match else "To Apply"
-                        match_score = 0
-                        match_analysis = (
-                            f"Auto-filtered by semantic ignore rule"
-                            if dismissal_match
-                            else "Direct LinkedIn Job Alert match."
-                        )
-
-                        dd = evaluate_job_due_diligence(
-                            job_title=rec.get("title", ""),
-                            source_type=rec.get("source_type", "LinkedIn"),
-                            portal_jobs=[],
-                        )
-                        job_emb = generate_embeddings(
-                            f"{rec.get('title', '')} {clean_job_description(rec.get('description', '') or rec.get('title', ''))}"
-                        )
-                        new_job = Job(
-                            company_id=comp.id,
-                            title=rec.get("title", ""),
-                            description=rec.get("description", ""),
-                            url=rec.get("url", ""),
-                            location=rec.get("location", "Remote / Various"),
-                            source=rec.get("source", "LinkedIn Job Alert"),
-                            source_type=rec.get("source_type", "LinkedIn"),
-                            status=job_status,
-                            sync_batch_id=sync_batch_id,
-                            match_score=match_score,
-                            match_analysis=match_analysis,
-                            is_ghost_job=dd.get("is_ghost_job", False),
-                            embedding=job_emb,
-                        )
-                        db.add(new_job)
-                        alerts_count += 1
-                db.commit()
-                total_found += alerts_count
-        except Exception as a_err:
-            logger.warning(f"LinkedIn alerts scan notice: {a_err}")
-
-        if progress_cb:
-            progress_cb(
-                step=3,
-                label=f"Sync completed. Ingested {total_found} postings ({alerts_filtered} filtered out).",
-                items_found=total_found,
-                total_steps=3,
-            )
-
-        # Record a linkedin_sync OperationLog so the "N new from sync" review banner (which reads
-        # the latest linkedin_sync log) reflects background/Sync-All runs, not just manual syncs.
-        try:
-            db.add(OperationLog(
-                operation_type="linkedin_sync",
-                status="Completed",
-                summary=(
-                    f"LinkedIn sync complete (background): {total_found} new added "
-                    f"({saved_count} saved, {alerts_count} alerts/recommendations, "
-                    f"{alerts_filtered} filtered)."
-                ),
-                details_json=sanitize_log_details(
-                    {
-                        "total_processed": total_found,
-                        "recommendations_found": alerts_count,
-                        "recommendations_added": alerts_count,
-                        "saved_jobs_checked": saved_count,
-                        "saved_jobs_added": saved_count,
-                        "already_existing": 0,
-                        "dismissed_filtered": alerts_filtered,
-                        "closed_jobs_pruned": 0,
-                        "sync_batch_id": sync_batch_id,
-                        "total_added": total_found,
-                    }
-                ),
-                jobs_count=total_found,
-            ))
-            db.commit()
-        except Exception as log_err:
-            logger.warning(f"Failed to persist background LinkedIn sync log: {log_err}")
-
+        result = _execute_gmail_sync(db, progress_cb=progress_cb)
         return {
-            "saved_jobs_ingested": saved_count,
-            "alerts_ingested": alerts_count,
-            "alerts_filtered_out_of_preference": alerts_filtered,
-            "jobs_found": total_found,
+            "status": result["status"],
+            "emails_scanned": result["emails_scanned"],
+            "status_updates": result["status_updates"],
+            "jobs_found": result["opportunities_added"],
+            "pending_email_applications": result["pending_email_applications"],
+            "error": result["error"],
         }
     finally:
-        if scan_lock_held:
-            _LINKEDIN_SCAN_GATE.release()
         db.close()
 
 
@@ -8566,10 +5986,24 @@ def _run_sync_all_task_runner(
                 progress_cb(step=i, label=f"Starting: {label}", total_steps=total)
             try:
                 result = fn(_make_adapter(i, label))
-                summary.append(
-                    {"stage": key, "status": "completed", "detail": str(result)[:300]}
-                )
-                logger.info(f"[SyncAll] Stage '{key}' completed: {str(result)[:200]}")
+                # Runners report "I did not run" through a `skipped` key rather than by raising
+                # (consent missing, cooldown active, profile busy, scan already in progress).
+                # Counting those as completed made a green run out of channels that never ran.
+                skipped_reason = result.get("skipped") if isinstance(result, dict) else None
+                if skipped_reason:
+                    summary.append(
+                        {
+                            "stage": key,
+                            "status": "skipped",
+                            "detail": f"skipped: {skipped_reason}",
+                        }
+                    )
+                    logger.info(f"[SyncAll] Stage '{key}' skipped: {skipped_reason}")
+                else:
+                    summary.append(
+                        {"stage": key, "status": "completed", "detail": str(result)[:300]}
+                    )
+                    logger.info(f"[SyncAll] Stage '{key}' completed: {str(result)[:200]}")
             except BrowserProfileBusy as bpb:
                 summary.append(
                     {
@@ -8662,20 +6096,6 @@ class RescoreRequest(BaseModel):
     # Scope (issue #57): only rows scored against a different resume version, or exactly these ids.
     stale_only: bool = False
     job_ids: Optional[List[int]] = None
-
-
-def _match_analysis_text(assessment, match) -> str:
-    strengths, gaps, partials = _derive_strengths_gaps(assessment, match)
-    parts = []
-    if strengths:
-        parts.append(f"Strengths: {', '.join(strengths)}")
-    if partials:
-        parts.append(f"Partial coverage: {', '.join(partials)}")
-    if gaps:
-        parts.append(f"Gaps: {', '.join(gaps)}")
-    if parts:
-        return ". ".join(parts)
-    return assessment.summary or ""
 
 
 class ScoreAuditRequest(BaseModel):
@@ -9278,6 +6698,36 @@ def dispatch_linkedin_sync_task(db: Session = Depends(get_db)):
 
 
 @app.post(
+    "/api/tasks/sync/gmail",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=TaskResponse,
+)
+def dispatch_gmail_sync_task(db: Session = Depends(get_db)):
+    """Dispatches a non-blocking Gmail sync so it shows up in the task queue and SSE feed."""
+    if not is_feature_enabled(db, "gmail_sync"):
+        raise HTTPException(
+            status_code=403,
+            detail="Gmail sync is disabled. Enable it under Settings → Discovery Features.",
+        )
+    if not is_gmail_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="Gmail is not connected. Connect it in Settings first.",
+        )
+    task_id = task_engine.submit_task(
+        task_type="gmail_sync",
+        task_name="Gmail Sync",
+        fn=_run_gmail_sync_task_runner,
+        total_steps=4,
+    )
+    return TaskResponse(
+        task_id=task_id,
+        status="QUEUED",
+        message="Gmail sync task dispatched in background.",
+    )
+
+
+@app.post(
     "/api/tasks/sync/all",
     status_code=status.HTTP_202_ACCEPTED,
     response_model=TaskResponse,
@@ -9314,310 +6764,9 @@ def dispatch_sync_all_task(db: Session = Depends(get_db)):
     )
 
 
-@app.get("/api/tasks", response_model=List[TaskProgress])
-def list_all_background_tasks(limit: int = 50):
-    """Returns list of recent and active background tasks."""
-    return task_engine.get_all_tasks(limit=limit)
-
-
-@app.get("/api/tasks/active", response_model=List[TaskProgress])
-def list_active_background_tasks():
-    """Returns all currently running or queued background tasks."""
-    return task_engine.get_active_tasks()
-
-
-@app.get("/api/tasks/events")
-async def task_events_sse(request: Request):
-    """
-    Server-Sent Events (SSE) stream for real-time background task progress updates.
-    """
-    # Bind the running loop so worker threads broadcast thread-safely.
-    task_engine.set_event_loop(asyncio.get_running_loop())
-    q = asyncio.Queue()
-    task_engine.register_subscriber(q)
-
-    async def event_generator():
-        try:
-            # Yield initial state of active tasks
-            for task_prog in task_engine.get_active_tasks():
-                yield f"data: {task_prog.model_dump_json()}\n\n"
-
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    # Wait for next event or heartbeat
-                    event_data = await asyncio.wait_for(q.get(), timeout=15.0)
-                    yield f"data: {event_data}\n\n"
-                except asyncio.TimeoutError:
-                    yield ": ping\n\n"
-        finally:
-            task_engine.unregister_subscriber(q)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@app.get("/api/tasks/{task_id}", response_model=TaskProgress)
-def get_task_status(task_id: str):
-    """Retrieves status and progress of a specific background task."""
-    progress = task_engine.get_task(task_id)
-    if not progress:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return progress
-
-
-@app.post("/api/tasks/{task_id}/cancel")
-def cancel_background_task(task_id: str):
-    """Cooperatively cancels a running or queued background task."""
-    success = task_engine.cancel_task(task_id)
-    if not success:
-        raise HTTPException(
-            status_code=400,
-            detail="Task could not be cancelled or has already completed.",
-        )
-    return {"status": "ok", "message": f"Cancellation requested for task {task_id}."}
-
-
-@app.delete("/api/tasks/completed")
-def clear_completed_tasks_endpoint():
-    """Clears completed and cancelled background tasks from memory."""
-    cleared = task_engine.clear_completed_tasks()
-    return {"status": "ok", "cleared_count": cleared}
-
-
-@app.get("/api/system/unified-status")
-def get_unified_system_status():
-    """
-    Returns unified status across Background Scraping Tasks, LLM Inference Queue, and Token Cache.
-    """
-    llm_status = llm_queue.get_status()
-    active_tasks = task_engine.get_active_tasks()
-    all_tasks = task_engine.get_all_tasks(limit=10)
-
-    return {
-        "active_background_tasks_count": len(active_tasks),
-        "active_background_tasks": active_tasks,
-        "recent_background_tasks": all_tasks,
-        "llm_queue": llm_status,
-        "server_time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    }
-
-
 # -------------------------------------------------------------
 # Automation Scheduler Endpoints
 # -------------------------------------------------------------
-
-
-class UpdateScheduleRequest(BaseModel):
-    is_enabled: Optional[bool] = None
-    interval_hours: Optional[float] = None
-
-
-@app.get("/api/scheduler/jobs", response_model=List[ScheduledJobConfig])
-def list_scheduled_jobs():
-    """Returns all configured periodic automation jobs and their next scheduled run times."""
-    return scheduler.get_all_jobs()
-
-
-@app.patch("/api/scheduler/jobs/{job_id}", response_model=ScheduledJobConfig)
-def update_scheduled_job(job_id: str, req: UpdateScheduleRequest):
-    """Updates a periodic job schedule (e.g. enable/disable, change interval)."""
-    updated = scheduler.update_job(
-        job_id, is_enabled=req.is_enabled, interval_hours=req.interval_hours
-    )
-    if not updated:
-        raise HTTPException(status_code=404, detail="Scheduled job not found")
-    return updated
-
-
-@app.post("/api/scheduler/jobs/{job_id}/run")
-def trigger_scheduled_job_now(job_id: str):
-    """Triggers immediate on-demand background execution of a scheduled job."""
-    task_id = scheduler.run_job_now(job_id, force=True)
-    if not task_id:
-        reason = scheduler.last_skip_reason()
-        if reason:
-            # Policy skip (e.g. consent not given) — the job exists but is intentionally blocked.
-            raise HTTPException(
-                status_code=403,
-                detail=f"Cannot run '{job_id}': {reason}.",
-            )
-        raise HTTPException(
-            status_code=404, detail="Scheduled job not found or cannot be triggered."
-        )
-    return {
-        "status": "ok",
-        "job_id": job_id,
-        "task_id": task_id,
-        "message": f"Triggered scheduled job {job_id} as background task {task_id}.",
-    }
-
-
-def _deterministic_match(
-    db,
-    resume_text: str,
-    description: str,
-    parsed_resume: dict | None = None,
-    job_title: str = "",
-    location: str = "",
-) -> dict | None:
-    """Deterministic requirement+classifier match. None when no usable requirements."""
-    # FAST PATH: deterministic requirement extraction + ML/heuristic classifier.
-    # Runs in milliseconds with no LLM call, so bulk ATS scoring does not saturate
-    # the LLM queue. Falls through to the LLM extractor only if it cannot produce
-    # a usable assessment.
-    from backend.match_classifier import (
-        build_deterministic_assessment,
-        build_jd_hints,
-        extract_match_features,
-        get_classifier,
-    )
-    from backend.match_scoring import band_and_recommendation
-
-    try:
-        # Deterministic requirements so must/nice coverage is real (no LLM).
-        assessment = build_deterministic_assessment(
-            description,
-            parsed_resume,
-            resume_text=resume_text,
-            job_title=job_title or "",
-        )
-        if not assessment.requirements:
-            return None
-
-        known = [r for r in assessment.requirements if r.status in ("met", "partial", "missing")]
-        if not known:
-            return None
-
-        jd_hints = build_jd_hints(description, job_title or "")
-        features = extract_match_features(
-            parsed_resume, jd_hints, assessment=assessment
-        )
-        classifier = get_classifier()
-        score = classifier.predict(features)
-
-        scoring_config = ScoringConfig.from_mapping(get_scoring_config(db))
-        # Same must-have floor as compute_match: a posting the candidate only half-qualifies
-        # for must not present as a high score off the secondary components (issue #108).
-        gated = (
-            features.must_count > 0
-            and features.must_coverage < scoring_config.must_floor
-        )
-        if gated:
-            score = min(score, scoring_config.cap_when_below_floor)
-        over_qualified = features.over_qualified_flag > 0.5
-        band, recommendation = band_and_recommendation(
-            score, scoring_config, gated=gated, over_qualified=over_qualified
-        )
-
-        eligible, ineligibility_reason = _check_eligibility(db, job_title, location, description)
-
-        # Surface the requirement breakdown so the score is transparent, not a black box.
-        strengths, gaps, partials = _derive_strengths_gaps(assessment)
-        known_reqs = [
-            r
-            for r in assessment.requirements
-            if r.status in ("met", "partial", "missing")
-        ]
-        met_count = sum(1 for r in known_reqs if r.status == "met")
-        unverified = [
-            r.text
-            for r in assessment.requirements
-            if r.status not in ("met", "partial", "missing") and r.text
-        ]
-        # An empty nice-to-have set means the JD states none (issue #70); reporting it as
-        # "0%" reads as "you met none of them", which is the opposite of what happened.
-        coverage_bits = [f"must-have coverage {round(features.must_coverage * 100)}%"]
-        if features.nice_count > 0:
-            coverage_bits.append(f"nice-to-have {round(features.nice_coverage * 100)}%")
-        else:
-            coverage_bits.append("no nice-to-have requirements")
-        feedback = (
-            f"Matched {met_count} of {len(known_reqs)} requirements "
-            f"({', '.join(coverage_bits)})."
-        )
-        # No partial-coverage sentence here: the count would have to match the panel's
-        # `partials` list (must-have only, capped, minus entries padded into strengths), and
-        # any "see below" wording is wrong in at least one of the two renderers.
-        # Surface technology-tenure comparisons so the user can judge borderline cases.
-        tenure_notes = []
-        for r in assessment.requirements:
-            if (
-                r.kind != "experience_years"
-                or r.scope != "technology"
-                or not r.technology
-            ):
-                continue
-            need = (
-                f"{r.min_years:g}+ yrs"
-                if r.min_years is not None
-                else "the required experience"
-            )
-            if r.evidence == "unconfirmed":
-                tenure_notes.append(
-                    f"{r.technology}: requires {need}, but the resume does not state the tenure "
-                    f"— not enough information to confirm; please decide"
-                )
-            elif r.evidence == "not found":
-                tenure_notes.append(
-                    f"{r.technology}: requires {need}, but no evidence was found in the resume"
-                )
-            else:
-                tenure_notes.append(
-                    f"{r.technology}: requires {need}, resume {r.evidence} ({r.status})"
-                )
-        if tenure_notes:
-            feedback += " Tenure check — " + "; ".join(tenure_notes) + "."
-        return {
-            "assessment": assessment,
-            "features": features,
-            "score": score,
-            "band": band,
-            "recommendation": recommendation,
-            "must_coverage": features.must_coverage,
-            "nice_coverage": features.nice_coverage,
-            "over_qualified": over_qualified,
-            "strengths": strengths,
-            "gaps": gaps,
-            "partials": partials,
-            "unverified": unverified,
-            "feedback": feedback,
-            "eligible": eligible,
-            "ineligibility_reason": ineligibility_reason,
-            "method": "classifier_v1",
-            "score_method": "classifier_v1",
-        }
-
-    except Exception as classifier_err:
-        logger.warning(
-            f"Classifier-based scoring failed: {classifier_err}; falling back to LLM"
-        )
-        return None
-
-
-def _check_eligibility(db, job_title: str, location: str, description: str) -> tuple[bool, Optional[str]]:
-    """Checks if the job is eligible based on user preferences."""
-    try:
-        # Check location eligibility if provided
-        if (location or "").strip():
-            from backend.preference_filter import PreferenceFilter
-
-            reason = PreferenceFilter.from_db(db).rejection_reason(
-                job_title, location, description
-            )
-            if reason:
-                return False, reason
-    except Exception as e:
-        logger.debug(f"Eligibility check skipped: {e}")
-    return True, None
 
 
 # -------------------------------------------------------------

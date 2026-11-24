@@ -1,0 +1,504 @@
+{
+  "all": {
+    "name": "All Countries (Global)",
+    "flag": "🌍",
+    "hubs": [
+      "Bengaluru",
+      "San Francisco",
+      "London",
+      "New York",
+      "Berlin",
+      "Singapore",
+      "Toronto",
+      "Sydney",
+      "Amsterdam",
+      "Seattle",
+      "Dublin",
+      "Paris",
+      "Zurich",
+      "Tokyo",
+      "Dubai"
+    ]
+  },
+  "India": {
+    "name": "India",
+    "flag": "🇮🇳",
+    "hubs": [
+      "Bengaluru",
+      "Hyderabad",
+      "Pune",
+      "Delhi NCR",
+      "Mumbai",
+      "Chennai",
+      "Noida",
+      "Gurgaon",
+      "Kolkata",
+      "Ahmedabad"
+    ]
+  },
+  "United States": {
+    "name": "United States",
+    "flag": "🇺🇸",
+    "hubs": [
+      "San Francisco",
+      "Seattle",
+      "New York",
+      "Austin",
+      "Boston",
+      "Los Angeles",
+      "Chicago",
+      "Denver",
+      "San Diego",
+      "Atlanta",
+      "Dallas"
+    ]
+  },
+  "United Kingdom": {
+    "name": "United Kingdom",
+    "flag": "🇬🇧",
+    "hubs": [
+      "London",
+      "Manchester",
+      "Cambridge",
+      "Oxford",
+      "Edinburgh",
+      "Bristol",
+      "Birmingham",
+      "Belfast"
+    ]
+  },
+  "Germany": {
+    "name": "Germany",
+    "flag": "🇩🇪",
+    "hubs": [
+      "Berlin",
+      "Munich",
+      "Frankfurt",
+      "Hamburg",
+      "Cologne",
+      "Stuttgart",
+      "Düsseldorf"
+    ]
+  },
+  "Canada": {
+    "name": "Canada",
+    "flag": "🇨🇦",
+    "hubs": [
+      "Toronto",
+      "Vancouver",
+      "Montreal",
+      "Ottawa",
+      "Waterloo",
+      "Calgary",
+      "Edmonton"
+    ]
+  },
+  "Singapore": {
+    "name": "Singapore",
+    "flag": "🇸🇬",
+    "hubs": [
+      "Singapore"
+    ]
+  },
+  "Australia": {
+    "name": "Australia",
+    "flag": "🇦🇺",
+    "hubs": [
+      "Sydney",
+      "Melbourne",
+      "Brisbane",
+      "Perth",
+      "Adelaide",
+      "Canberra"
+    ]
+  },
+  "Netherlands": {
+    "name": "Netherlands",
+    "flag": "🇳🇱",
+    "hubs": [
+      "Amsterdam",
+      "Rotterdam",
+      "Utrecht",
+      "Eindhoven",
+      "The Hague"
+    ]
+  },
+  "Ireland": {
+    "name": "Ireland",
+    "flag": "🇮🇪",
+    "hubs": [
+      "Dublin",
+      "Cork",
+      "Galway",
+      "Limerick"
+    ]
+  },
+  "France": {
+    "name": "France",
+    "flag": "🇫🇷",
+    "hubs": [
+      "Paris",
+      "Lyon",
+      "Toulouse",
+      "Nantes",
+      "Bordeaux",
+      "Lille"
+    ]
+  },
+  "Switzerland": {
+    "name": "Switzerland",
+    "flag": "🇨🇭",
+    "hubs": [
+      "Zurich",
+      "Geneva",
+      "Lausanne",
+      "Basel",
+      "Bern"
+    ]
+  },
+  "United Arab Emirates": {
+    "name": "United Arab Emirates",
+    "flag": "🇦🇪",
+    "hubs": [
+      "Dubai",
+      "Abu Dhabi"
+    ]
+  },
+  "Japan": {
+    "name": "Japan",
+    "flag": "🇯🇵",
+    "hubs": [
+      "Tokyo",
+      "Osaka",
+      "Fukuoka",
+      "Kyoto",
+      "Yokohama"
+    ]
+  },
+  "Sweden": {
+    "name": "Sweden",
+    "flag": "🇸🇪",
+    "hubs": [
+      "Stockholm",
+      "Gothenburg",
+      "Malmo",
+      "Uppsala"
+    ]
+  },
+  "Poland": {
+    "name": "Poland",
+    "flag": "🇵🇱",
+    "hubs": [
+      "Warsaw",
+      "Krakow",
+      "Wroclaw",
+      "Gdansk",
+      "Poznan"
+    ]
+  },
+  "Spain": {
+    "name": "Spain",
+    "flag": "🇪🇸",
+    "hubs": [
+      "Madrid",
+      "Barcelona",
+      "Valencia",
+      "Malaga",
+      "Seville"
+    ]
+  },
+  "Israel": {
+    "name": "Israel",
+    "flag": "🇮🇱",
+    "hubs": [
+      "Tel Aviv",
+      "Jerusalem",
+      "Haifa",
+      "Herzliya"
+    ]
+  },
+  "Brazil": {
+    "name": "Brazil",
+    "flag": "🇧🇷",
+    "hubs": [
+      "Sao Paulo",
+      "Rio de Janeiro",
+      "Curitiba",
+      "Belo Horizonte",
+      "Florianopolis"
+    ]
+  },
+  "Estonia": {
+    "name": "Estonia",
+    "flag": "🇪🇪",
+    "hubs": [
+      "Tallinn",
+      "Tartu"
+    ]
+  },
+  "Denmark": {
+    "name": "Denmark",
+    "flag": "🇩🇰",
+    "hubs": [
+      "Copenhagen",
+      "Aarhus"
+    ]
+  },
+  "Norway": {
+    "name": "Norway",
+    "flag": "🇳🇴",
+    "hubs": [
+      "Oslo",
+      "Bergen",
+      "Trondheim"
+    ]
+  },
+  "Finland": {
+    "name": "Finland",
+    "flag": "🇫🇮",
+    "hubs": [
+      "Helsinki",
+      "Espoo",
+      "Tampere"
+    ]
+  },
+  "Austria": {
+    "name": "Austria",
+    "flag": "🇦🇹",
+    "hubs": [
+      "Vienna",
+      "Graz",
+      "Linz",
+      "Salzburg"
+    ]
+  },
+  "Belgium": {
+    "name": "Belgium",
+    "flag": "🇧🇪",
+    "hubs": [
+      "Brussels",
+      "Antwerp",
+      "Ghent",
+      "Leuven"
+    ]
+  },
+  "Portugal": {
+    "name": "Portugal",
+    "flag": "🇵🇹",
+    "hubs": [
+      "Lisbon",
+      "Porto",
+      "Braga"
+    ]
+  },
+  "Italy": {
+    "name": "Italy",
+    "flag": "🇮🇹",
+    "hubs": [
+      "Milan",
+      "Rome",
+      "Turin",
+      "Bologna"
+    ]
+  },
+  "New Zealand": {
+    "name": "New Zealand",
+    "flag": "🇳🇿",
+    "hubs": [
+      "Auckland",
+      "Wellington",
+      "Christchurch"
+    ]
+  },
+  "South Africa": {
+    "name": "South Africa",
+    "flag": "🇿🇦",
+    "hubs": [
+      "Cape Town",
+      "Johannesburg",
+      "Pretoria",
+      "Durban"
+    ]
+  },
+  "Mexico": {
+    "name": "Mexico",
+    "flag": "🇲🇽",
+    "hubs": [
+      "Mexico City",
+      "Guadalajara",
+      "Monterrey"
+    ]
+  },
+  "Argentina": {
+    "name": "Argentina",
+    "flag": "🇦🇷",
+    "hubs": [
+      "Buenos Aires",
+      "Cordoba",
+      "Rosario"
+    ]
+  },
+  "Chile": {
+    "name": "Chile",
+    "flag": "🇨🇱",
+    "hubs": [
+      "Santiago",
+      "Valparaiso"
+    ]
+  },
+  "Colombia": {
+    "name": "Colombia",
+    "flag": "🇨🇴",
+    "hubs": [
+      "Bogota",
+      "Medellin",
+      "Cali"
+    ]
+  },
+  "South Korea": {
+    "name": "South Korea",
+    "flag": "🇰🇷",
+    "hubs": [
+      "Seoul",
+      "Pangyo",
+      "Busan"
+    ]
+  },
+  "Taiwan": {
+    "name": "Taiwan",
+    "flag": "🇹🇼",
+    "hubs": [
+      "Taipei",
+      "Hsinchu",
+      "Taichung"
+    ]
+  },
+  "Hong Kong": {
+    "name": "Hong Kong",
+    "flag": "🇭🇰",
+    "hubs": [
+      "Hong Kong"
+    ]
+  },
+  "Malaysia": {
+    "name": "Malaysia",
+    "flag": "🇲🇾",
+    "hubs": [
+      "Kuala Lumpur",
+      "Penang",
+      "Cyberjaya"
+    ]
+  },
+  "Indonesia": {
+    "name": "Indonesia",
+    "flag": "🇮🇩",
+    "hubs": [
+      "Jakarta",
+      "Bandung",
+      "Bali"
+    ]
+  },
+  "Philippines": {
+    "name": "Philippines",
+    "flag": "🇵🇭",
+    "hubs": [
+      "Manila",
+      "Cebu",
+      "Taguig"
+    ]
+  },
+  "Thailand": {
+    "name": "Thailand",
+    "flag": "🇹🇭",
+    "hubs": [
+      "Bangkok",
+      "Chiang Mai"
+    ]
+  },
+  "Vietnam": {
+    "name": "Vietnam",
+    "flag": "🇻🇳",
+    "hubs": [
+      "Ho Chi Minh City",
+      "Hanoi",
+      "Da Nang"
+    ]
+  },
+  "Saudi Arabia": {
+    "name": "Saudi Arabia",
+    "flag": "🇸🇦",
+    "hubs": [
+      "Riyadh",
+      "Jeddah",
+      "Dammam"
+    ]
+  },
+  "Egypt": {
+    "name": "Egypt",
+    "flag": "🇪🇬",
+    "hubs": [
+      "Cairo",
+      "Alexandria",
+      "Giza"
+    ]
+  },
+  "Nigeria": {
+    "name": "Nigeria",
+    "flag": "🇳🇬",
+    "hubs": [
+      "Lagos",
+      "Abuja"
+    ]
+  },
+  "Kenya": {
+    "name": "Kenya",
+    "flag": "🇰🇪",
+    "hubs": [
+      "Nairobi",
+      "Mombasa"
+    ]
+  },
+  "Czech Republic": {
+    "name": "Czech Republic",
+    "flag": "🇨🇿",
+    "hubs": [
+      "Prague",
+      "Brno"
+    ]
+  },
+  "Romania": {
+    "name": "Romania",
+    "flag": "🇷🇴",
+    "hubs": [
+      "Bucharest",
+      "Cluj-Napoca",
+      "Timisoara",
+      "Iasi"
+    ]
+  },
+  "Hungary": {
+    "name": "Hungary",
+    "flag": "🇭🇺",
+    "hubs": [
+      "Budapest",
+      "Debrecen"
+    ]
+  },
+  "Greece": {
+    "name": "Greece",
+    "flag": "🇬🇷",
+    "hubs": [
+      "Athens",
+      "Thessaloniki"
+    ]
+  },
+  "Turkey": {
+    "name": "Turkey",
+    "flag": "🇹🇷",
+    "hubs": [
+      "Istanbul",
+      "Ankara",
+      "Izmir"
+    ]
+  }
+}

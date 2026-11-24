@@ -4,7 +4,7 @@ import logging
 import threading
 import uuid
 from enum import IntEnum
-from typing import Callable, Any, Optional, Dict, List
+from typing import Callable, Any, Optional, Dict
 from concurrent.futures import Future
 
 logger = logging.getLogger("llm_queue")
@@ -66,23 +66,32 @@ class LLMQueueManager:
         self._total_processed: int = 0
         self._total_duration_ms: float = 0.0
         self._running = True
-        self._workers: List[threading.Thread] = []
+        self._workers: Dict[int, threading.Thread] = {}
 
         self._ensure_workers()
         logger.info(f"LLM Priority Queue Manager initialized (Workers: {self._max_workers}, Mode: {self._mode}).")
 
     def _ensure_workers(self):
-        """Spawns worker threads up to _max_workers."""
+        """Spawns worker threads until every concurrency slot is occupied.
+
+        The pool is keyed by slot, and a worker releases its slot when it retires. Retired
+        threads used to be left in the list instead, so a scale-down looked like a full pool
+        to this method: scaling 8 -> 1 -> 8 spawned nothing the second time and the queue ran
+        single-threaded for the rest of the process's life, with no signal that it had.
+        """
         with self._lock:
-            while len(self._workers) < self._max_workers:
-                worker_id = len(self._workers)
+            live = {slot: t for slot, t in self._workers.items() if t.is_alive()}
+            self._workers = live
+            for slot in range(self._max_workers):
+                if slot in live:
+                    continue
                 t = threading.Thread(
                     target=self._worker_loop,
-                    args=(worker_id,),
+                    args=(slot,),
                     daemon=True,
-                    name=f"LLM-Queue-Worker-{worker_id}"
+                    name=f"LLM-Queue-Worker-{slot}"
                 )
-                self._workers.append(t)
+                self._workers[slot] = t
                 t.start()
 
     def set_concurrency(
@@ -146,6 +155,10 @@ class LLMQueueManager:
         Submits an inference task to the priority queue and blocks until complete or timed out.
         """
         task = LLMTask(fn, args, kwargs, priority=priority, task_name=task_name)
+        if not self._running:
+            # A stopped queue will never dispatch this task; fail it now instead of blocking the
+            # caller for the full timeout.
+            raise RuntimeError("LLM queue is stopped; task was not queued.")
         self._queue.put(task)
         logger.debug(f"Queued LLM task [{task.task_name}] (ID: {task.task_id}, Priority: {priority.name}, Queue Depth: {self._queue.qsize()})")
 
@@ -156,25 +169,52 @@ class LLMQueueManager:
             raise
 
     def stop(self) -> None:
-        """Stop dispatching new work; workers exit on their next poll iteration.
+        """Stop dispatching new work and resolve everything still queued.
 
         Used by graceful shutdown. Already-running provider calls are not interrupted
         (they are external HTTP requests); this only prevents *new* dispatch so the
         process can drain instead of firing requests it will never read.
 
-        Workers already poll with a bounded timeout, so flipping the running flag is
-        sufficient — no queue sentinel is injected. (A sentinel would be unsafe here:
-        ``PriorityQueue`` compares entries on pop, and ``None`` is not orderable.)
+        Workers poll with a bounded timeout, so flipping the running flag is enough to retire
+        them. Queued tasks, however, would never be dispatched again — their blocked
+        ``submit()`` callers used to wait out the full 180 s default while the drain's 10 s
+        deadline expired. Each pending future is failed here instead.
         """
         with self._lock:
             self._running = False
+
+        drained = 0
+        while True:
+            try:
+                task = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if task is None:
+                self._queue.task_done()
+                continue
+            if not task.future.done():
+                try:
+                    task.future.set_exception(
+                        RuntimeError("LLM queue stopped before this task ran.")
+                    )
+                except Exception:
+                    pass
+            self._queue.task_done()
+            drained += 1
+        if drained:
+            logger.warning(
+                f"LLM queue stopped with {drained} queued task(s); their futures were failed."
+            )
 
     def _worker_loop(self, worker_id: int):
         """Worker loop that pulls prioritized tasks."""
         while self._running:
             with self._lock:
                 if worker_id >= self._max_workers:
-                    # Clean retirement of excess worker thread when scaled down
+                    # Clean retirement of excess worker thread when scaled down. The slot has to
+                    # be released here, not on thread death, or a scale-up that lands in between
+                    # finds no free slot and silently keeps the smaller pool.
+                    self._workers.pop(worker_id, None)
                     break
 
             try:
@@ -186,6 +226,17 @@ class LLMQueueManager:
                 # Shutdown sentinel. Break immediately so the worker exits.
                 self._queue.task_done()
                 break
+
+            if not self._running:
+                # stop() flipped the flag while this worker was blocked in get(); the task it
+                # just picked up must not be dispatched, and its caller must not wait out the
+                # timeout. (The check at the top of the loop already passed.)
+                if not task.future.done():
+                    task.future.set_exception(
+                        RuntimeError("LLM queue stopped before this task ran.")
+                    )
+                self._queue.task_done()
+                continue
 
             if task.future.cancelled():
                 self._queue.task_done()

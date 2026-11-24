@@ -4,6 +4,10 @@
 **Focus:** Decision-making, architectural trade-offs, AI/ML innovations, and lessons learned  
 **Format:** Narrative + code examples + performance data
 
+> **Status note (2026-11):** this is a dated narrative of decisions as they were made. The JobSpy
+> aggregator named below was removed; Google for Jobs is Playwright-only today. See
+> [`ATS_PORTALS.md`](ATS_PORTALS.md) for the current channel list.
+
 ---
 
 ## Table of Contents
@@ -605,7 +609,7 @@ trainable outcomes with ≥15 per class**. Check first with `--status` or
 >
 > Current floors: `MIN_TRAINING_SAMPLES = 50`, `MIN_PER_CLASS_SAMPLES = 15`
 > (`backend/match_classifier.py`). See [`LESSONS_LEARNED.md`](LESSONS_LEARNED.md) for the
-> "don't train on your own output" lesson and `AGENTS.md` §10.2 for the pipeline.
+> "don't train on your own output" lesson and `DESIGN.md` §10.2 for the pipeline.
 
 **Why logistic regression?**
 

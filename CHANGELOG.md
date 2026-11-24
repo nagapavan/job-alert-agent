@@ -66,6 +66,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Source filter in the SPA now covers every real source type**: LinkedIn / Google / Email /
   Hirist / Direct (previously only LinkedIn / Email / Direct).
 
+### Removed
+- **Per-user trained match classifier — removed.** The optional logistic-regression model
+  (`data/match_classifier.pkl`), its offline trainer (`scripts/train_match_classifier.py`), the
+  implicit-label pipeline (`backend/learning_signals.py`) and `GET /api/learning/readiness` are gone.
+  - Scoring is one deterministic scorer (`DeterministicClassifier`, formerly
+    `SimpleHeuristicClassifier`) over requirement coverage, seniority, education and tenure, so the
+    same JD and resume always produce the same score and the stored score can be re-derived.
+  - The fitted model could only ever exist on the machine that trained it (the artifact is personal
+    data and was never committable), and it required `scikit-learn`, which was not installed by
+    default — the path was inert on a fresh install. `requirements.txt` no longer mentions it.
+  - `get_classifier()` / `load_classifier()` / the `TrainedClassifier` wrapper and the
+    `MIN_TRAINING_SAMPLES` / `MIN_PER_CLASS_SAMPLES` floors were deleted with it; call sites now use
+    the module-level `match_classifier.CLASSIFIER`.
+  - No UI ever exposed the trainer, so nothing changes for a dashboard or extension user.
+
 ### Technical Details
 - 524 tests passing, 13 skipped (live-marker excluded), 0 regressions
 - New files: `backend/llm_resilience.py`, `backend/prompts.py`, `tests/test_llm_resilience.py`,

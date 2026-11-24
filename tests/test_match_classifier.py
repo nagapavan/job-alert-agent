@@ -5,19 +5,19 @@ Tests for the fast ML-based match classifier.
 import pytest
 from backend.match_classifier import (
     MatchFeatures,
-    SimpleHeuristicClassifier,
+    DeterministicClassifier,
     extract_match_features,
     build_deterministic_assessment,
     build_jd_hints,
 )
 
 
-class TestSimpleHeuristicClassifier:
+class TestDeterministicClassifier:
     """Test fallback heuristic classifier (always available, no sklearn required)."""
 
     def test_strong_match(self):
         """Strong must-have + seniority + experience coverage."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = MatchFeatures(
             must_coverage=1.0,
             nice_coverage=0.8,
@@ -33,7 +33,7 @@ class TestSimpleHeuristicClassifier:
 
     def test_moderate_match(self):
         """Partial must-haves, good nice-to-haves."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = MatchFeatures(
             must_coverage=0.6,
             nice_coverage=0.9,
@@ -49,7 +49,7 @@ class TestSimpleHeuristicClassifier:
 
     def test_weak_match(self):
         """Low must-have coverage, experience mismatch."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = MatchFeatures(
             must_coverage=0.2,
             nice_coverage=0.3,
@@ -65,7 +65,7 @@ class TestSimpleHeuristicClassifier:
 
     def test_score_bounds(self):
         """Scores are always 0-100."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         for must_cov in [0.0, 0.5, 1.0]:
             for nice_cov in [0.0, 0.5, 1.0]:
                 features = MatchFeatures(
@@ -499,27 +499,27 @@ class TestEmptyNiceToHaveSet:
         )
 
     def test_no_nice_section_is_scored_over_the_remaining_eighty_points(self):
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = self._features(0.5, 0.0, must_count=8, nice_count=0)
         # (0.5*60 + 1.0*15 + 1.0*5) / 80 * 100 == 62.5, not the legacy 45.0.
         assert classifier.predict(features) == pytest.approx(62.5)
 
     def test_a_perfect_fit_without_a_preferred_section_can_reach_one_hundred(self):
         """The old formula capped such a JD at 80 no matter how well the candidate matched."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = self._features(1.0, 0.0, must_count=8, nice_count=0)
         assert classifier.predict(features) == pytest.approx(100.0)
 
     def test_a_jd_with_nice_to_haves_keeps_its_legacy_score(self):
         """The renormalisation must be inert when the set is present."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = self._features(0.6, 0.75, must_count=5, nice_count=4)
         legacy = 0.6 * 60 + 0.75 * 20 + 1.0 * 15 + 1.0 * 5
         assert classifier.predict(features) == pytest.approx(legacy)
 
     def test_partial_nice_coverage_still_costs_points(self):
         """An empty set is free; a present-but-unmet set is not."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         unmet = self._features(0.6, 0.0, must_count=5, nice_count=4)
         met = self._features(0.6, 1.0, must_count=5, nice_count=4)
         absent = self._features(0.6, 0.0, must_count=5, nice_count=0)
@@ -527,7 +527,7 @@ class TestEmptyNiceToHaveSet:
 
     def test_no_requirements_at_all_keeps_the_legacy_full_scale(self):
         """With nothing to verify, the score stays low instead of renormalising over 20 points."""
-        classifier = SimpleHeuristicClassifier()
+        classifier = DeterministicClassifier()
         features = self._features(0.0, 0.0, must_count=0, nice_count=0)
         assert classifier.predict(features) == pytest.approx(20.0)
 
@@ -544,3 +544,156 @@ class TestEmptyNiceToHaveSet:
         )
         assert features.nice_count == 0
         assert features.must_count > 0
+
+
+class TestAtsHeaderChromeIsNotScored:
+    """Issue #98: an ATS page's metadata block and inline preferences must not be scored.
+
+    Synthetic posting shaped like an ADP career-centre page: the metadata block sits before
+    the first heading, and two requirements are marked nice-to-have inline.
+    """
+
+    JD = (
+        "Principal Software Engineer\n"
+        "Development\n"
+        "Remote India, IN\n"
+        "Full Time\n"
+        "Professional\n"
+        "24 days ago\n"
+        "Requisition ID: 1427\n"
+        "Apply\n"
+        "Save\n"
+        "\n"
+        "The Desired Attributes:\n"
+        "\n"
+        "Bachelor's degree in computer science, Engineering, or a related field.\n"
+        "10+ years of professional software development disciplines\n"
+        "1+ year in Principal Software Engineering role\n"
+        "Strong expertise in service-oriented architecture\n"
+        "Strong expertise in Ruby on Rails\n"
+        "Strong leadership and mentorship skills\n"
+        "Experience with NATS.IO, Jetstream, or Kafka preferred\n"
+        "Experience with GOlang preferred\n"
+    )
+    RESUME = "Principal engineer. Built services with Kafka and Go. 12 years of experience."
+
+    def _assessment(self):
+        return build_deterministic_assessment(
+            self.JD, {"skills": ["Kafka", "Go"]}, resume_text=self.RESUME,
+            job_title="Principal Software Engineer",
+        )
+
+    def test_portal_chrome_never_becomes_a_requirement(self):
+        texts = {r.text.lower() for r in self._assessment().requirements}
+        for chrome in (
+            "full time", "professional", "development", "apply", "save",
+            "24 days ago", "requisition id: 1427", "remote india, in",
+        ):
+            assert chrome not in texts, chrome
+
+    def test_seniority_word_is_not_a_technology_requirement(self):
+        texts = [r.text.lower() for r in self._assessment().requirements]
+        assert not any("years principal" in t for t in texts)
+        assert not any(t == "principal" for t in texts)
+
+    def test_inline_preferred_skills_are_nice_to_have(self):
+        by_text = {r.text: r.category for r in self._assessment().requirements}
+        assert by_text.get("Kafka") == "nice_to_have"
+        assert by_text.get("Go") == "nice_to_have"
+
+    def test_the_real_must_haves_survive(self):
+        by_text = {r.text: r.category for r in self._assessment().requirements}
+        assert by_text.get("Ruby on Rails") in (None, "must_have")
+
+
+def test_unknown_candidate_seniority_is_unknown_not_met():
+    """A resume with no parseable roles must not pass a senior requirement by default
+    (`_SENIORITY_RANK.get(..., 3)` used to make it MET — finding 80)."""
+    jd = "We require a senior engineer with Python and 5+ years of experience."
+    assessment = build_deterministic_assessment(
+        jd, None, resume_text="", job_title="Senior Engineer"
+    )
+    seniority = [r for r in assessment.requirements if r.kind == "seniority"]
+    assert seniority, "the posting states a seniority level"
+    assert seniority[0].status == "unknown"
+
+
+def test_unknown_must_haves_do_not_trip_the_must_floor():
+    """A posting whose only must-haves are unjudgeable is not a zero-coverage posting
+    (finding 87)."""
+    from backend.match_scoring import RequirementAssessment, RequirementItem
+
+    assessment = RequirementAssessment(
+        requirements=[
+            RequirementItem(text="Rust", status="unknown", category="must_have"),
+            RequirementItem(text="Go", status="unknown", category="must_have"),
+        ]
+    )
+    features = extract_match_features(None, {}, assessment=assessment)
+    assert features.must_count == 0
+    assert features.must_coverage == 0.0
+
+
+def test_weighted_coverage_uses_the_shared_implementation():
+    """Classifier features and compute_match must weight requirements identically (finding 88)."""
+    from backend.match_scoring import (
+        RequirementAssessment,
+        RequirementItem,
+        ScoringConfig,
+        _coverage,
+    )
+
+    reqs = [
+        RequirementItem(text="A", status="met", category="must_have", weight=3),
+        RequirementItem(text="B", status="missing", category="must_have", weight=1),
+    ]
+    features = extract_match_features(
+        None, {}, assessment=RequirementAssessment(requirements=reqs)
+    )
+    assert features.must_coverage == _coverage(reqs, ScoringConfig())
+
+
+def test_taxonomy_reload_reaches_the_scanner(monkeypatch):
+    """The scanner must read the module attribute, so a reload is visible without a restart
+    (finding 93)."""
+    from backend import match_classifier as mc
+    from backend import skill_taxonomy as tax
+
+    monkeypatch.setattr(tax, "DISPLAY_SKILLS", ["Zebrafish"])
+    assert "zebrafish" in mc._resume_skill_scan("zebrafish pipelines")
+
+
+def test_fully_supported_residual_is_met_not_partial(monkeypatch):
+    """Residual evidence at full token overlap is MET; weaker support stays PARTIAL (finding 96)."""
+    from backend import requirements_extractor
+
+    monkeypatch.setattr(
+        requirements_extractor,
+        "extract_residual_requirements",
+        lambda *a, **k: [
+            {"text": "event sourcing", "category": "must_have", "evidence": "resume:token_overlap", "score": 1.0},
+            {"text": "cqrs", "category": "must_have", "evidence": "resume:embedding", "score": 0.6},
+        ],
+    )
+    assessment = build_deterministic_assessment(
+        "Requirements: we need event sourcing and cqrs experience. " * 3,
+        {"skills": []},
+        job_title="Engineer",
+    )
+    by_text = {r.text: r.status for r in assessment.requirements}
+    assert by_text.get("event sourcing") == "met"
+    assert by_text.get("cqrs") == "partial"
+
+
+def test_eligibility_is_evaluated_without_a_location():
+    """A blank location must not exempt a posting from title/topic filters (finding 95)."""
+    from unittest.mock import patch
+
+    from backend.job_scoring import _check_eligibility
+
+    class _Filter:
+        def rejection_reason(self, *a):
+            return "title"
+
+    with patch("backend.preference_filter.PreferenceFilter.from_db", return_value=_Filter()):
+        assert _check_eligibility(None, "Sales", "", "desc") == (False, "title")

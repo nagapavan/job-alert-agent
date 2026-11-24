@@ -162,3 +162,23 @@ class TestReparse:
         from conftest import test_client as client
 
         assert client.post("/api/resume/999999/reparse").status_code == 404
+
+
+def test_parser_matches_symbol_skills():
+    """`C++`, `C#` and `.NET` survive the skill scan (finding 100)."""
+    parsed = parse_open_source_resume(
+        "Skills\nC++\nC#\n.NET\nPython\n\nExperience\nEngineer | Acme | 2020 - 2021\n- Built things."
+    )
+    skills = {s.lower() for s in parsed["skills"]}
+    assert {"c++", "c#", ".net", "python"} <= skills
+
+
+def test_parser_does_not_fabricate_a_title_or_employer():
+    """An unsplittable header must not invent `Software Engineer` / `Direct Employer`
+    (finding 101)."""
+    parsed = parse_open_source_resume(
+        "Experience\n2020 - 2021\n- Built things without a header line."
+    )
+    for entry in parsed["experience"]:
+        assert entry["title"] != "Software Engineer"
+        assert entry["company"] not in ("Direct Employer", "Organization")

@@ -286,3 +286,50 @@ def test_execute_generate_text_non_transient_not_retried():
         assert calls["n"] == 1
     finally:
         monkeypatch.undo()
+
+
+class _SdkError(Exception):
+    """Mimics openai.APIStatusError: the status lives on the exception itself."""
+
+    def __init__(self, status_code):
+        super().__init__(f"status {status_code}")
+        self.status_code = status_code
+
+
+def test_sdk_status_errors_are_classified_by_their_status_code():
+    """httpx/SDK errors do not subclass requests.HTTPError, so duck-type the status (finding 21)."""
+    assert is_retryable(_SdkError(429))
+    assert is_retryable(_SdkError(503))
+    assert not is_retryable(_SdkError(400))
+
+
+def test_sdk_timeout_and_connection_classes_are_retryable():
+    class APITimeoutError(Exception):
+        pass
+
+    class APIConnectionError(Exception):
+        pass
+
+    assert is_retryable(APITimeoutError())
+    assert is_retryable(APIConnectionError())
+    assert is_retryable(__import__("concurrent.futures", fromlist=["TimeoutError"]).TimeoutError())
+
+
+def test_with_retry_stops_when_the_cancellation_token_is_set(monkeypatch):
+    class Token:
+        is_cancelled = True
+
+    sleeps = []
+    monkeypatch.setattr(llm_resilience.time, "sleep", lambda s: sleeps.append(s))
+
+    calls = []
+
+    def failing():
+        calls.append(1)
+        raise requests.exceptions.ConnectionError("reset")
+
+    with pytest.raises(InterruptedError):
+        with_retry("step", failing, task_type=None, max_retries=5, cancel_token=Token())
+
+    assert len(calls) == 1
+    assert sleeps == []

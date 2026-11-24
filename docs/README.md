@@ -8,7 +8,9 @@ Quick map of the project's documentation and what each covers.
 | :--- | :--- | :--- |
 | Master System Design & DFDs | [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) | 20 sections & 9 Data Flow Diagrams (DFD 1–9): system topology, dynamic model routing, LLM priority queue, background task engine, hiring radar, multi-platform sync, PDF parsing, tech-stack matrix, C4 architectural models, plus **text-mode architecture, deployment & module dependency maps** (§19). |
 | Agentic AI Architecture | [`AGENTIC_ARCHITECTURE.md`](../AGENTIC_ARCHITECTURE.md) | The 5 core pillars of the agentic execution harness, autonomy spectrum, sandboxing, safety guardrails, the **AI/ML/LLM architecture stack** (model topology, task tiering, the deterministic+LLM+verifier reasoning model, RAG/vector memory) and **prompt-engineering details** (§5–6). |
-| Developer & Agent Guidelines | [`AGENTS.md`](../AGENTS.md) | 5-phase engineering lifecycle, canonical SQLAlchemy schema references, zero-token optimization rules, testing standards, plus **package inventory** (§8), **detailed database schema** (§9), **performance strategies** (§10), **security implementation** (§11), and a **developer onboarding guide** (§12). |
+| Developer & Agent Guidelines | [`AGENTS.md`](../AGENTS.md) | The behavioural rulebook: 5-phase engineering lifecycle, work tracking, memory protocol, code-editing rules, testing standards, subagent delegation, and the no-personal-data rule (§7.9). |
+| Project structure & reference | [`PROJECT_STRUCTURE.md`](../PROJECT_STRUCTURE.md) | Module map (§1), schema & migration conventions (§5), **package inventory** (§8), **detailed database schema** (§9), and the **developer onboarding guide** (§12: setup, configuration, tests, file map, troubleshooting). |
+| Design & policies | [`DESIGN.md`](../DESIGN.md) | Token/LLM conventions (§3), **privacy & opt-in guardrails** (§7), **performance strategies** (§10), **security implementation** (§11), the graceful-shutdown drain (§12.11), and per-channel reliability policies (§13). |
 | Project Overview & Quickstart | [`README.md`](../README.md) | Feature directory, tech stack, setup commands, environment configuration, Gmail API setup, responsible-use notes. |
 | Project File Index | [`PROJECT_INDEX.md`](../PROJECT_INDEX.md) | File-by-file responsibilities for locating where changes belong, plus **real code examples for every major component** (generation, queue, DB, scraper, Playwright, tasks, scheduler, observability, SPA, extension). |
 | Chrome Extension Docs | [`extension/README.md`](../extension/README.md) | Manifest V3 architecture (side panel, content-script DOM telemetry, safe-mode autofill). |
@@ -26,12 +28,12 @@ Where to look for the deep-dive topics:
 | **Bulk match scoring (deterministic-first)** | [`BULK_MATCH_SCORING.md`](BULK_MATCH_SCORING.md) (implementation: two-tier routing, artifact guard, counters, testing, performance expectations) |
 | Architecture diagrams (Mermaid + text/ASCII) | [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §1–20 (text topology in §19) |
 | Code examples for every major component | [`PROJECT_INDEX.md`](../PROJECT_INDEX.md) → "Code Examples — Major Components" |
-| Database schema + explanations | [`AGENTS.md`](../AGENTS.md) §5 & §9 |
+| Database schema + explanations | [`PROJECT_STRUCTURE.md`](../PROJECT_STRUCTURE.md) §5 & §9 |
 | AI / ML / LLM architectures | [`AGENTIC_ARCHITECTURE.md`](../AGENTIC_ARCHITECTURE.md) §5 (model topology, tiering, reasoning model, RAG) |
 | AI prompt engineering details | [`AGENTIC_ARCHITECTURE.md`](../AGENTIC_ARCHITECTURE.md) §6 |
-| Packages / dependencies used | [`AGENTS.md`](../AGENTS.md) §8; [`requirements.txt`](../requirements.txt) |
-| Performance optimization strategies | [`AGENTS.md`](../AGENTS.md) §10 |
-| Security implementation details | [`AGENTS.md`](../AGENTS.md) §11; [`SECURITY_IMPLEMENTATION.md`](SECURITY_IMPLEMENTATION.md); [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §14 & DFD 5 |
+| Packages / dependencies used | [`PROJECT_STRUCTURE.md`](../PROJECT_STRUCTURE.md) §8; [`requirements.txt`](../requirements.txt) |
+| Performance optimization strategies | [`DESIGN.md`](../DESIGN.md) §10 |
+| Security implementation details | [`DESIGN.md`](../DESIGN.md) §11; [`SECURITY_IMPLEMENTATION.md`](SECURITY_IMPLEMENTATION.md); [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §14 & DFD 5 |
 | Developer onboarding & code editing rules | [`README.md`](../README.md) Quick Start; [`CONTRIBUTING.md`](../CONTRIBUTING.md); [`EngineeringAgentRules.md`](../EngineeringAgentRules.md) |
 | Agentic reasoning / autonomy / harness | [`AGENTIC_ARCHITECTURE.md`](../AGENTIC_ARCHITECTURE.md) §1–5 |
 | ATS portals, filters & requisition probing | [`ATS_PORTALS.md`](ATS_PORTALS.md) |
@@ -41,12 +43,13 @@ Where to look for the deep-dive topics:
 | Extension execution-mode fallback (API vs on-device) | [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §9.1; [`extension/README.md`](../extension/README.md) |
 | Structured match analysis & interview prep | [`PROJECT_INDEX.md`](../PROJECT_INDEX.md); [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §20 |
 | One-shot "Sync All" orchestration | [`SYNC_ALL_PLAN.md`](SYNC_ALL_PLAN.md) |
+| SPA section routing & dossier dock | [`PROJECT_INDEX.md`](../PROJECT_INDEX.md) → `frontend/`; [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §17.8 |
+| Email ingestion from career portals & relays | [`GMAIL_API.md`](GMAIL_API.md) §4 & §6 |
 | Log rotation & operation-log retention | [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §1; [`README.md`](../README.md) §Observability |
 | No-fabrication guarantees / "not AI-scored" | [`AGENTIC_ARCHITECTURE.md`](../AGENTIC_ARCHITECTURE.md) §5.5 |
 | Embedding backends (pluggable, 384-d) | [`docs/README.md`](README.md) §Scoring & matching internals; `backend/embeddings.py` |
 | Section-intent / skill taxonomy / residual requirements | [`docs/README.md`](README.md) §Scoring & matching internals; `backend/section_intent.py` |
-| Self-learning labels & training readiness | [`docs/README.md`](README.md) §Scoring & matching internals; `GET /api/learning/readiness` |
-| Graceful shutdown / drain order | [`AGENTS.md`](../AGENTS.md) §12.11; [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §19.3 |
+| Graceful shutdown / drain order | [`DESIGN.md`](../DESIGN.md) §12.11; [`DESIGN_DIAGRAMS.md`](../DESIGN_DIAGRAMS.md) §19.3 |
 | Security implementation & encryption | [`SECURITY_IMPLEMENTATION.md`](SECURITY_IMPLEMENTATION.md) (CORS, auth, secrets, encryption, browser isolation, prompt injection, opt-in guardrails, Gmail privacy) |
 
 ## Feature / design plans (`docs/`)
@@ -60,17 +63,18 @@ Where to look for the deep-dive topics:
 ## Scoring & matching internals (deterministic path)
 
 The bulk scorer is split across several modules that are not obvious from the endpoint names. This
-table says which file owns which concern; `AGENTS.md` §1 and §10.2 describe the surrounding design.
+table says which file owns which concern; `PROJECT_STRUCTURE.md` §1 and `DESIGN.md` §10.2 describe the
+surrounding design.
 
 | Module | Responsibility |
 | :--- | :--- |
 | [`backend/embeddings.py`](../backend/embeddings.py) | Pluggable embedding backends behind one 384-d contract: in-process ONNX `standalone` → OpenAI-compatible `external` server → deterministic `hash` last resort. `resolve_backends` / `embed_texts` / `active_backend_name` / `local_model_cached`. |
-| [`backend/section_intent.py`](../backend/section_intent.py) | Single heading/section classifier. `classify_heading(line, domain=jd\|resume\|must_have)`, `jd_section_spans` / `label_at` / `mask_spans`, `is_must_have_heading`, `starts_with_preference_cue`. Replaced three duplicated detectors. |
+| [`backend/section_intent.py`](../backend/section_intent.py) | Single heading/section classifier. `classify_heading(line, domain=jd\|resume\|must_have)`, `jd_section_spans` / `label_at` / `mask_spans`, `is_must_have_heading`, `starts_with_preference_cue`. Also owns the two guards that keep non-requirements out of the score: `leading_header_chrome_end` (ATS metadata block) and `ends_with_preference_cue` (inline "… preferred"). Replaced three duplicated detectors. |
 | [`backend/skill_taxonomy.py`](../backend/skill_taxonomy.py) + [`data/skill_taxonomy.json`](../data/skill_taxonomy.json) | Data-driven skill taxonomy: canonical name → aliases + concepts. `normalize_skill` / `alias_surfaces` / `concepts_for`; unmatched phrases land in `data/skill_taxonomy_candidates.json` via `record_skill_candidate`. |
 | [`backend/requirements_extractor.py`](../backend/requirements_extractor.py) | Mines residual JD requirement units the taxonomy did not cover and credits the ones the resume evidences (`extract_residual_requirements`). Unsupported residuals go to the review queue, never into a score. |
 | [`backend/resume_index.py`](../backend/resume_index.py) | RAG-lite resume chunking. `chunk_resume` splits parsed JSON into skills/role/project chunks; `index_resume_chunks` persists them into `resume_chunks`; `top_evidence` returns the chunks most similar to a query. |
-| [`backend/learning_signals.py`](../backend/learning_signals.py) | Implicit-signal labelling for classifier training. `derive_decision` maps tracked outcomes to `positive`/`strong_positive`/`negative`/`negative_outcome` with `user_initiated` vs `system_generated` provenance; `learning_readiness` reports the trainable counts. |
-| [`backend/shutdown.py`](../backend/shutdown.py) | Bounded graceful drain (`run_shutdown`, `is_shutting_down`) invoked from the ASGI shutdown lifecycle. Order: scheduler → task engine → LLM queue → browser-profile locks. See `AGENTS.md` §12.11. |
+| [`backend/shutdown.py`](../backend/shutdown.py) | Bounded graceful drain (`run_shutdown`, `is_shutting_down`) invoked from the ASGI shutdown lifecycle. Order: scheduler → task engine → LLM queue → browser-profile locks. See `DESIGN.md` §12.11. |
+| [`backend/title_parser.py`](../backend/title_parser.py) + [`data/company_synonyms.json`](../data/company_synonyms.json) | Merged LinkedIn card text → real title + employer (`parse_merged_title`, confidence `high`/`medium`/`low`/`none`) and employer canonicalisation (`resolve_company_name`: synonym aliases → longest known prefix → legal-suffix strip; `is_bucket_company` protects placeholder buckets). Shared by the live scanner and the repair scripts. |
 | [`backend/channel_status.py`](../backend/channel_status.py) | Per-channel discovery outcomes (`ok`, `skipped_flag`, `not_connected`, `dependency_missing`, `degraded_zero`, `error`) plus `aggregate_status`/`describe`. Runners record outcomes so `OperationLog.status` can be `Partial`/`Failed` instead of a misleading `success` when a channel never executed. |
 
 Supporting data/config:

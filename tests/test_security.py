@@ -117,6 +117,10 @@ def test_init_db_does_not_seed_personal_answers(tmp_path):
     from backend import database as db_module
 
     db_file = tmp_path / "seed_check.db"
+    # init_db() rebinds the module globals; snapshot them so the test restores what it found
+    # instead of re-initialising against whatever DATABASE_URL points at (which used to be the
+    # operator's live database).
+    saved_engine, saved_session = db_module.engine, db_module.SessionLocal
     engine = db_module.init_db(custom_url=f"sqlite:///{db_file}")
     Session = sessionmaker(bind=engine)
     session = Session()
@@ -124,5 +128,4 @@ def test_init_db_does_not_seed_personal_answers(tmp_path):
         assert session.query(db_module.ApplicationQuestionAnswer).count() == 0
     finally:
         session.close()
-        # Restore the module's global session factory to the real database
-        db_module.init_db()
+        db_module.engine, db_module.SessionLocal = saved_engine, saved_session

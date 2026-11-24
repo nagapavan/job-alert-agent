@@ -7,11 +7,19 @@ const API_BASE = window.location.origin;
 // Application Tracker stage filter: one multi-select chip per canonical status. The list mirrors
 // backend JOB_STATUSES (backend/main.py); a new status only needs to be added here.
 const TRACKER_STATUSES = [
-    "To Apply", "Shortlisted", "Applied", "Screening", "Interview", "Offered", "Rejected", "Not Interested"
+    "To Apply", "Shortlisted", "Applied", "Screening", "Interview Scheduling", "Interview",
+    "Offered", "Rejected", "Closed", "Withdrawn", "Not Interested"
 ];
-const TRACKER_DEFAULT_STATUSES = ["Applied", "Screening", "Interview"];
-const TRACKER_STATUS_ALIASES = { "Saved": "Shortlisted", "Ignored": "Not Interested" };
+const TRACKER_DEFAULT_STATUSES = ["Applied", "Screening", "Interview Scheduling", "Interview"];
+const TRACKER_STATUS_ALIASES = {
+    "Saved": "Shortlisted",
+    "Ignored": "Not Interested",
+    "Interviewing": "Interview",
+    "Expired": "Closed",
+    "Filled": "Closed",
+};
 const TRACKER_STATUSES_STORAGE_KEY = "job_agent_tracker_statuses";
+const DOCK_PIN_KEY = "job_agent_dock_pinned";
 
 function normalizeTrackerStatus(status) {
     const value = (status || "To Apply").trim();
@@ -29,6 +37,8 @@ function loadTrackerStatuses() {
 }
 
 let state = {
+    activeSection: "dashboard",
+    dockPinned: loadDockPinned(),
     companies: [],
     catalog: [],
     jobs: [],
@@ -61,6 +71,7 @@ document.addEventListener("DOMContentLoaded", () => {
     initNavigation();
     initEventListeners();
     initModal();
+    initCardActivation();
     initTargetPreferences();
     initConsentGate();
     loadPreferencesFromServer();
@@ -74,49 +85,74 @@ document.addEventListener("DOMContentLoaded", () => {
 // -------------------------------------------------------------
 // Navigation & Section Toggling
 // -------------------------------------------------------------
+const NAV_TITLES = {
+    dashboard: { title: "Job Feed & Discovery", sub: "Real-time alerts, ATS match scores, due diligence checks, and assisted applications." },
+    tracker: { title: "Application Lifecycle Tracker", sub: "Track application statuses, interview schedules, and regret responses." },
+    companies: { title: "Target Companies & Portals", sub: "Configure and manage organizations monitored for opportunities." },
+    resume: { title: "Applicant Resume & Profile", sub: "Encrypted profile storage and AI ATS extraction breakdown." },
+    tasks: { title: "Background Tasks, Queue & Scheduled Automations", sub: "Track asynchronous discovery scans, LLM queue depth, and hands-free cron schedules." },
+    settings: { title: "Settings", sub: "Discovery preferences, opt-in features, BYOK cloud models, and Gmail API." }
+};
+const NAV_SECTIONS = new Set(Object.keys(NAV_TITLES));
+
+// Hash router: "#/tracker" survives a refresh and Back/Forward, so the app no longer
+// drops the operator back on the job feed every reload.
+function sectionFromHash() {
+    const raw = (window.location.hash || "").replace(/^#\/?/, "").trim().toLowerCase();
+    return NAV_SECTIONS.has(raw) ? raw : null;
+}
+
+function activateSection(name, { updateHash = true } = {}) {
+    const target = NAV_SECTIONS.has(name) ? name : "dashboard";
+
+    document.querySelectorAll(".nav-item").forEach(item => {
+        item.classList.toggle("active", item.getAttribute("data-section") === target);
+    });
+    document.querySelectorAll(".content-section").forEach(sec => {
+        sec.classList.toggle("hidden", sec.id !== `${target}-section`);
+    });
+
+    const meta = NAV_TITLES[target];
+    if (meta) {
+        document.getElementById("page-title").innerText = meta.title;
+        document.getElementById("page-subtitle").innerText = meta.sub;
+    }
+
+    // The dossier dock only belongs beside a job list.
+    state.activeSection = target;
+    if (!DOCK_SECTIONS.has(target) && state.activeJobModal) closeJobDetails();
+    updateDockMode();
+
+    if (target === "tracker") {
+        renderTrackerList();
+    } else if (target === "companies") {
+        fetchCompanyCatalog();
+        fetchCompanies();
+    } else if (target === "tasks") {
+        fetchTasksStatus(true);
+    } else if (target === "settings") {
+        populateSettingsPanel();
+    }
+
+    if (updateHash && sectionFromHash() !== target) {
+        window.location.hash = `#/${target}`;
+    }
+}
+
 function initNavigation() {
-    const navItems = document.querySelectorAll(".nav-item");
-    const sections = document.querySelectorAll(".content-section");
-    const titles = {
-        dashboard: { title: "Job Feed & Discovery", sub: "Real-time alerts, ATS match scores, due diligence checks, and assisted applications." },
-        tracker: { title: "Application Lifecycle Tracker", sub: "Track application statuses, interview schedules, and regret responses." },
-        companies: { title: "Target Companies & Portals", sub: "Configure and manage organizations monitored for opportunities." },
-        resume: { title: "Applicant Resume & Profile", sub: "Encrypted profile storage and AI ATS extraction breakdown." },
-        tasks: { title: "Background Tasks, Queue & Scheduled Automations", sub: "Track asynchronous discovery scans, LLM queue depth, and hands-free cron schedules." },
-        settings: { title: "Settings", sub: "Discovery preferences, opt-in features, BYOK cloud models, and Gmail API." }
-    };
-
-    navItems.forEach(item => {
+    document.querySelectorAll(".nav-item").forEach(item => {
         item.addEventListener("click", () => {
-            navItems.forEach(n => n.classList.remove("active"));
-            item.classList.add("active");
-
-            const targetSection = item.getAttribute("data-section");
-            sections.forEach(sec => {
-                if (sec.id === `${targetSection}-section`) {
-                    sec.classList.remove("hidden");
-                } else {
-                    sec.classList.add("hidden");
-                }
-            });
-
-            if (titles[targetSection]) {
-                document.getElementById("page-title").innerText = titles[targetSection].title;
-                document.getElementById("page-subtitle").innerText = titles[targetSection].sub;
-            }
-
-            if (targetSection === "tracker") {
-                renderTrackerList();
-            } else if (targetSection === "companies") {
-                fetchCompanyCatalog();
-                fetchCompanies();
-            } else if (targetSection === "tasks") {
-                fetchTasksStatus(true);
-            } else if (targetSection === "settings") {
-                populateSettingsPanel();
-            }
+            const target = item.getAttribute("data-section");
+            // Setting the hash drives the same path as Back/Forward (hashchange).
+            if (sectionFromHash() === target) activateSection(target, { updateHash: false });
+            else window.location.hash = `#/${target}`;
         });
     });
+    window.addEventListener("hashchange", () => {
+        activateSection(sectionFromHash() || "dashboard", { updateHash: false });
+    });
+    // The URL wins over the default section, so a refresh restores the current page.
+    activateSection(sectionFromHash() || "dashboard", { updateHash: false });
 }
 
 // -------------------------------------------------------------
@@ -275,6 +311,84 @@ function initEventListeners() {
 // -------------------------------------------------------------
 // Modal & Slide-Over Drawer
 // -------------------------------------------------------------
+// -------------------------------------------------------------
+// Job dossier dock: pinned on wide screens, slide-over on narrow ones
+// -------------------------------------------------------------
+const DOCK_MIN_WIDTH = 1500;
+const DOCK_SECTIONS = new Set(["dashboard", "tracker"]);
+
+function loadDockPinned() {
+    try {
+        return localStorage.getItem(DOCK_PIN_KEY) === "1";
+    } catch (e) {
+        return false;
+    }
+}
+
+function dockIsWide() {
+    return window.innerWidth >= DOCK_MIN_WIDTH && DOCK_SECTIONS.has(state.activeSection || "dashboard");
+}
+
+function updateDockMode() {
+    const modal = document.getElementById("details-modal");
+    if (!modal) return;
+    const wide = dockIsWide();
+    // Gmail-style: collapsed by default, expanded only while a job is open — or always when
+    // pinned. Collapsed means no column at all, so a fresh load keeps the full-width feed.
+    const expanded = wide && (!!state.activeJobModal || state.dockPinned);
+    document.body.classList.toggle("dock-wide", expanded);
+    if (expanded || (!wide && state.activeJobModal)) modal.classList.remove("hidden");
+    else modal.classList.add("hidden");
+
+    const pinBtn = document.getElementById("modal-pin-btn");
+    if (pinBtn) {
+        pinBtn.style.display = wide ? "" : "none";
+        pinBtn.setAttribute("aria-pressed", state.dockPinned ? "true" : "false");
+        pinBtn.classList.toggle("is-pinned", !!state.dockPinned);
+    }
+}
+
+function closeJobDetails() {
+    const modal = document.getElementById("details-modal");
+    const drawer = modal ? modal.querySelector(".modal-drawer") : null;
+    state.activeJobModal = null;
+    if (drawer) drawer.classList.remove("dock-filled");
+    markActiveCard(null);
+    const titleEl = document.getElementById("modal-job-title");
+    if (titleEl) titleEl.innerText = "No job selected";
+    updateDockMode();
+}
+
+function markActiveCard(jobId) {
+    document.querySelectorAll(".job-card.is-active").forEach(card => card.classList.remove("is-active"));
+    if (jobId == null) return;
+    const card = document.querySelector(`.job-card[data-job-id="${jobId}"]`);
+    if (card) card.classList.add("is-active");
+}
+
+// A row is the thing you select, not its "Intel & Prep" button: clicking anywhere on a card
+// (outside its own controls) opens the dossier. Enter does the same for keyboard users.
+function initCardActivation() {
+    ["job-feed", "tracker-list"].forEach(containerId => {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        const interactive = (target) => target.closest("button, a, select, input, textarea, label");
+        container.addEventListener("click", (event) => {
+            if (interactive(event.target)) return;
+            const card = event.target.closest(".job-card[data-job-id]");
+            if (card) openJobDetailsModal(Number(card.dataset.jobId));
+        });
+        container.addEventListener("keydown", (event) => {
+            if (event.key !== "Enter" || interactive(event.target)) return;
+            const card = event.target.closest(".job-card[data-job-id]");
+            if (card) {
+                event.preventDefault();
+                openJobDetailsModal(Number(card.dataset.jobId));
+            }
+        });
+    });
+}
+
 function initModal() {
     const modal = document.getElementById("details-modal");
     const closeBtn = document.getElementById("modal-close-btn");
@@ -282,13 +396,35 @@ function initModal() {
     const tabContents = document.querySelectorAll(".modal-tab-content");
 
     if (closeBtn && modal) {
-        closeBtn.addEventListener("click", () => modal.classList.add("hidden"));
+        closeBtn.addEventListener("click", closeJobDetails);
+    }
+    const pinBtn = document.getElementById("modal-pin-btn");
+    if (pinBtn) {
+        pinBtn.addEventListener("click", () => {
+            state.dockPinned = !state.dockPinned;
+            try {
+                localStorage.setItem(DOCK_PIN_KEY, state.dockPinned ? "1" : "0");
+            } catch (e) {
+                // Storage unavailable: the pin still holds for this session.
+            }
+            updateDockMode();
+        });
     }
     if (modal) {
         modal.addEventListener("click", (e) => {
-            if (e.target === modal) modal.classList.add("hidden");
+            // Only the slide-over has a backdrop to click; the dock has no overlay element.
+            if (e.target === modal && !dockIsWide()) closeJobDetails();
         });
     }
+    document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && state.activeJobModal) closeJobDetails();
+    });
+    let dockResizeTimer = null;
+    window.addEventListener("resize", () => {
+        clearTimeout(dockResizeTimer);
+        dockResizeTimer = setTimeout(updateDockMode, 150);
+    });
+    updateDockMode();
 
     const editModal = document.getElementById("edit-company-modal");
     if (editModal) {
@@ -338,258 +474,18 @@ async function fetchInitialData() {
 // -------------------------------------------------------------
 // Global Countries & Tech Hubs Catalog (Deterministic, Zero-Token)
 // -------------------------------------------------------------
-const COUNTRIES_HUBS_DATA = {
-    "all": {
-        name: "All Countries (Global)",
-        flag: "🌍",
-        hubs: ["Bengaluru", "San Francisco", "London", "New York", "Berlin", "Singapore", "Toronto", "Sydney", "Amsterdam", "Seattle", "Dublin", "Paris", "Zurich", "Tokyo", "Dubai"]
-    },
-    "India": {
-        name: "India",
-        flag: "🇮🇳",
-        hubs: ["Bengaluru", "Hyderabad", "Pune", "Delhi NCR", "Mumbai", "Chennai", "Noida", "Gurgaon", "Kolkata", "Ahmedabad"]
-    },
-    "United States": {
-        name: "United States",
-        flag: "🇺🇸",
-        hubs: ["San Francisco", "Seattle", "New York", "Austin", "Boston", "Los Angeles", "Chicago", "Denver", "San Diego", "Atlanta", "Dallas"]
-    },
-    "United Kingdom": {
-        name: "United Kingdom",
-        flag: "🇬🇧",
-        hubs: ["London", "Manchester", "Cambridge", "Oxford", "Edinburgh", "Bristol", "Birmingham", "Belfast"]
-    },
-    "Germany": {
-        name: "Germany",
-        flag: "🇩🇪",
-        hubs: ["Berlin", "Munich", "Frankfurt", "Hamburg", "Cologne", "Stuttgart", "Düsseldorf"]
-    },
-    "Canada": {
-        name: "Canada",
-        flag: "🇨🇦",
-        hubs: ["Toronto", "Vancouver", "Montreal", "Ottawa", "Waterloo", "Calgary", "Edmonton"]
-    },
-    "Singapore": {
-        name: "Singapore",
-        flag: "🇸🇬",
-        hubs: ["Singapore"]
-    },
-    "Australia": {
-        name: "Australia",
-        flag: "🇦🇺",
-        hubs: ["Sydney", "Melbourne", "Brisbane", "Perth", "Adelaide", "Canberra"]
-    },
-    "Netherlands": {
-        name: "Netherlands",
-        flag: "🇳🇱",
-        hubs: ["Amsterdam", "Rotterdam", "Utrecht", "Eindhoven", "The Hague"]
-    },
-    "Ireland": {
-        name: "Ireland",
-        flag: "🇮🇪",
-        hubs: ["Dublin", "Cork", "Galway", "Limerick"]
-    },
-    "France": {
-        name: "France",
-        flag: "🇫🇷",
-        hubs: ["Paris", "Lyon", "Toulouse", "Nantes", "Bordeaux", "Lille"]
-    },
-    "Switzerland": {
-        name: "Switzerland",
-        flag: "🇨🇭",
-        hubs: ["Zurich", "Geneva", "Lausanne", "Basel", "Bern"]
-    },
-    "United Arab Emirates": {
-        name: "United Arab Emirates",
-        flag: "🇦🇪",
-        hubs: ["Dubai", "Abu Dhabi"]
-    },
-    "Japan": {
-        name: "Japan",
-        flag: "🇯🇵",
-        hubs: ["Tokyo", "Osaka", "Fukuoka", "Kyoto", "Yokohama"]
-    },
-    "Sweden": {
-        name: "Sweden",
-        flag: "🇸🇪",
-        hubs: ["Stockholm", "Gothenburg", "Malmo", "Uppsala"]
-    },
-    "Poland": {
-        name: "Poland",
-        flag: "🇵🇱",
-        hubs: ["Warsaw", "Krakow", "Wroclaw", "Gdansk", "Poznan"]
-    },
-    "Spain": {
-        name: "Spain",
-        flag: "🇪🇸",
-        hubs: ["Madrid", "Barcelona", "Valencia", "Malaga", "Seville"]
-    },
-    "Israel": {
-        name: "Israel",
-        flag: "🇮🇱",
-        hubs: ["Tel Aviv", "Jerusalem", "Haifa", "Herzliya"]
-    },
-    "Brazil": {
-        name: "Brazil",
-        flag: "🇧🇷",
-        hubs: ["Sao Paulo", "Rio de Janeiro", "Curitiba", "Belo Horizonte", "Florianopolis"]
-    },
-    "Estonia": {
-        name: "Estonia",
-        flag: "🇪🇪",
-        hubs: ["Tallinn", "Tartu"]
-    },
-    "Denmark": {
-        name: "Denmark",
-        flag: "🇩🇰",
-        hubs: ["Copenhagen", "Aarhus"]
-    },
-    "Norway": {
-        name: "Norway",
-        flag: "🇳🇴",
-        hubs: ["Oslo", "Bergen", "Trondheim"]
-    },
-    "Finland": {
-        name: "Finland",
-        flag: "🇫🇮",
-        hubs: ["Helsinki", "Espoo", "Tampere"]
-    },
-    "Austria": {
-        name: "Austria",
-        flag: "🇦🇹",
-        hubs: ["Vienna", "Graz", "Linz", "Salzburg"]
-    },
-    "Belgium": {
-        name: "Belgium",
-        flag: "🇧🇪",
-        hubs: ["Brussels", "Antwerp", "Ghent", "Leuven"]
-    },
-    "Portugal": {
-        name: "Portugal",
-        flag: "🇵🇹",
-        hubs: ["Lisbon", "Porto", "Braga"]
-    },
-    "Italy": {
-        name: "Italy",
-        flag: "🇮🇹",
-        hubs: ["Milan", "Rome", "Turin", "Bologna"]
-    },
-    "New Zealand": {
-        name: "New Zealand",
-        flag: "🇳🇿",
-        hubs: ["Auckland", "Wellington", "Christchurch"]
-    },
-    "South Africa": {
-        name: "South Africa",
-        flag: "🇿🇦",
-        hubs: ["Cape Town", "Johannesburg", "Pretoria", "Durban"]
-    },
-    "Mexico": {
-        name: "Mexico",
-        flag: "🇲🇽",
-        hubs: ["Mexico City", "Guadalajara", "Monterrey"]
-    },
-    "Argentina": {
-        name: "Argentina",
-        flag: "🇦🇷",
-        hubs: ["Buenos Aires", "Cordoba", "Rosario"]
-    },
-    "Chile": {
-        name: "Chile",
-        flag: "🇨🇱",
-        hubs: ["Santiago", "Valparaiso"]
-    },
-    "Colombia": {
-        name: "Colombia",
-        flag: "🇨🇴",
-        hubs: ["Bogota", "Medellin", "Cali"]
-    },
-    "South Korea": {
-        name: "South Korea",
-        flag: "🇰🇷",
-        hubs: ["Seoul", "Pangyo", "Busan"]
-    },
-    "Taiwan": {
-        name: "Taiwan",
-        flag: "🇹🇼",
-        hubs: ["Taipei", "Hsinchu", "Taichung"]
-    },
-    "Hong Kong": {
-        name: "Hong Kong",
-        flag: "🇭🇰",
-        hubs: ["Hong Kong"]
-    },
-    "Malaysia": {
-        name: "Malaysia",
-        flag: "🇲🇾",
-        hubs: ["Kuala Lumpur", "Penang", "Cyberjaya"]
-    },
-    "Indonesia": {
-        name: "Indonesia",
-        flag: "🇮🇩",
-        hubs: ["Jakarta", "Bandung", "Bali"]
-    },
-    "Philippines": {
-        name: "Philippines",
-        flag: "🇵🇭",
-        hubs: ["Manila", "Cebu", "Taguig"]
-    },
-    "Thailand": {
-        name: "Thailand",
-        flag: "🇹🇭",
-        hubs: ["Bangkok", "Chiang Mai"]
-    },
-    "Vietnam": {
-        name: "Vietnam",
-        flag: "🇻🇳",
-        hubs: ["Ho Chi Minh City", "Hanoi", "Da Nang"]
-    },
-    "Saudi Arabia": {
-        name: "Saudi Arabia",
-        flag: "🇸🇦",
-        hubs: ["Riyadh", "Jeddah", "Dammam"]
-    },
-    "Egypt": {
-        name: "Egypt",
-        flag: "🇪🇬",
-        hubs: ["Cairo", "Alexandria", "Giza"]
-    },
-    "Nigeria": {
-        name: "Nigeria",
-        flag: "🇳🇬",
-        hubs: ["Lagos", "Abuja"]
-    },
-    "Kenya": {
-        name: "Kenya",
-        flag: "🇰🇪",
-        hubs: ["Nairobi", "Mombasa"]
-    },
-    "Czech Republic": {
-        name: "Czech Republic",
-        flag: "🇨🇿",
-        hubs: ["Prague", "Brno"]
-    },
-    "Romania": {
-        name: "Romania",
-        flag: "🇷🇴",
-        hubs: ["Bucharest", "Cluj-Napoca", "Timisoara", "Iasi"]
-    },
-    "Hungary": {
-        name: "Hungary",
-        flag: "🇭🇺",
-        hubs: ["Budapest", "Debrecen"]
-    },
-    "Greece": {
-        name: "Greece",
-        flag: "🇬🇷",
-        hubs: ["Athens", "Thessaloniki"]
-    },
-    "Turkey": {
-        name: "Turkey",
-        flag: "🇹🇷",
-        hubs: ["Istanbul", "Ankara", "Izmir"]
-    }
-};
+// Country -> {name, flag, hubs} suggestions, served with GET /api/preferences.
+// Empty until the preferences fetch lands; the renderers below no-op until then.
+let COUNTRIES_HUBS_DATA = {};
+
+// Safe lookup: the map is empty until GET /api/preferences lands, and a boot-time render runs
+// before that, so callers must never dereference a missing entry.
+const EMPTY_COUNTRY_ENTRY = { flag: "🌍", name: "Global", hubs: [] };
+
+function countryHubEntry(key) {
+    return COUNTRIES_HUBS_DATA[key] || COUNTRIES_HUBS_DATA.all || EMPTY_COUNTRY_ENTRY;
+}
+
 
 // -------------------------------------------------------------
 // Target Location Helpers (country scoping & legacy remote cleanup)
@@ -634,6 +530,7 @@ function foreignSelectedCities(countryKey) {
 // Target Preference & Role Keywords Multi-Select Handlers
 // -------------------------------------------------------------
 function populateCountrySelects() {
+    if (!Object.keys(COUNTRIES_HUBS_DATA).length) return;
     const countryEl = document.getElementById("target-country-select");
     const obCountryEl = document.getElementById("onboarding-target-country");
 
@@ -647,11 +544,12 @@ function populateCountrySelects() {
 }
 
 function renderDynamicCityPills(countryKey) {
+    if (!Object.keys(COUNTRIES_HUBS_DATA).length) return;
     const mainPills = document.getElementById("quick-cities-pills");
     const obPills = document.getElementById("onboarding-quick-cities-pills");
 
-    const selectedData = COUNTRIES_HUBS_DATA[countryKey] || COUNTRIES_HUBS_DATA["all"];
-    const hubs = selectedData.hubs || [];
+    const selectedData = countryHubEntry(countryKey);
+    const hubs = selectedData.hubs;
     const selected = new Set(state.targetCities.map(c => c.toLowerCase()));
 
     const pillsHtml = `
@@ -660,7 +558,7 @@ function renderDynamicCityPills(countryKey) {
             const active = selected.has(hub.toLowerCase());
             const cls = active ? "city-pill active" : "city-pill";
             const label = active ? `✓ ${escapeHTML(hub)}` : `+ ${escapeHTML(hub)}`;
-            return `<button type="button" class="${cls}" onclick="addCityKeyword('${escapeHTML(hub)}')"${active ? ' title="Already selected"' : ''}>${label}</button>`;
+            return `<button type="button" class="${cls}" data-action="add-city" data-city="${escapeHTML(hub)}"${active ? ' title="Already selected"' : ''}>${label}</button>`;
         }).join(" ")}
     `;
 
@@ -672,8 +570,7 @@ function updateCityDatalist(countryKey) {
     const datalist = document.getElementById("city-suggestions-list");
     if (!datalist) return;
 
-    const selectedData = COUNTRIES_HUBS_DATA[countryKey] || COUNTRIES_HUBS_DATA["all"];
-    const hubs = selectedData.hubs || [];
+    const hubs = countryHubEntry(countryKey).hubs;
 
     datalist.innerHTML = hubs.map(hub => `<option value="${escapeHTML(hub)}">${escapeHTML(hub)}</option>`).join("");
 }
@@ -737,7 +634,7 @@ function updateCriteriaSummaryBar() {
         ? state.targetRoles.slice(0, 3).join(", ") + (state.targetRoles.length > 3 ? ` +${state.targetRoles.length - 3}` : '')
         : "All Roles";
         
-    const countryData = COUNTRIES_HUBS_DATA[state.targetCountry] || { flag: "🌍", name: "Global" };
+    const countryData = countryHubEntry(state.targetCountry);
     const citiesStr = state.targetCities.length > 0
         ? state.targetCities.slice(0, 2).join(", ") + (state.targetCities.length > 2 ? ` +${state.targetCities.length - 2}` : '')
         : (state.targetCountry === "all" || !state.targetCountry ? "Global" : `${countryData.flag} ${countryData.name}`);
@@ -1024,6 +921,9 @@ let onboardingState = {
 };
 
 function activateOnboardingWizard() {
+    state.activeSection = "onboarding";
+    if (state.activeJobModal) closeJobDetails();
+    updateDockMode();
     document.querySelectorAll(".content-section").forEach(sec => sec.classList.add("hidden"));
     const obSec = document.getElementById("onboarding-section");
     if (obSec) obSec.classList.remove("hidden");
@@ -1419,15 +1319,24 @@ async function fetchHealthAndLLMStatus() {
     try {
         const res = await fetch(`${API_BASE}/api/health`);
         const data = await res.json();
-        if (data.active_llm) {
-            state.activeLLM = data.active_llm;
+        // /api/health is a liveness check and deliberately never probes LLM providers, so the
+        // badge asks the diagnostics route (memoised 30s) for the live answer instead.
+        let llm = data.active_llm;
+        try {
+            const llmRes = await fetch(`${API_BASE}/api/llm/status`);
+            if (llmRes.ok) llm = await llmRes.json();
+        } catch (e) {
+            console.warn("Could not retrieve LLM status", e);
+        }
+        if (llm) {
+            state.activeLLM = llm;
             const badge = document.getElementById("llm-status-badge");
             if (badge) {
-                if (data.active_llm.status === "online") {
-                    badge.innerText = `AI: ${data.active_llm.provider} (${data.active_llm.model})`;
+                if (llm.status === "online") {
+                    badge.innerText = `AI: ${llm.provider} (${llm.model})`;
                     badge.className = "badge active";
-                } else if (data.active_llm.status === "configured") {
-                    badge.innerText = `AI: ${data.active_llm.provider}`;
+                } else if (llm.status === "configured") {
+                    badge.innerText = `AI: ${llm.provider}`;
                     badge.className = "badge verified";
                 } else {
                     badge.innerText = `AI: Offline / Heuristics`;
@@ -1631,7 +1540,7 @@ function viewSyncBatch() {
         state.reviewBatchId = state.lastSync.sync_batch_id;
         applyJobFilters();
         const feed = document.getElementById("job-feed");
-        if (feed && feed.scrollIntoView) feed.scrollIntoView({ behavior: "smooth", block: "start" });
+        if (feed && feed.scrollIntoView) feed.scrollIntoView({ behavior: "smooth", block: "start", inline: "nearest" });
     }
 }
 
@@ -1692,7 +1601,7 @@ async function fetchResume() {
 // -------------------------------------------------------------
 function updateKPIStats(filteredJobs) {
     const list = Array.isArray(filteredJobs) ? filteredJobs : state.jobs;
-    const active = list.filter(j => ["To Apply", "Applied", "Screening", "Interview", "Offered"].includes(j.status)).length;
+    const active = list.filter(j => ["To Apply", "Applied", "Screening", "Interview Scheduling", "Interview", "Offered"].includes(j.status)).length;
     const highMatches = list.filter(j => (j.match_score || 0) >= 70).length;
     const ghost = list.filter(j => j.is_ghost_job).length;
     const genuine = list.filter(j => !j.is_ghost_job).length;
@@ -1879,7 +1788,7 @@ function updateFeedTabCounts() {
             } else if (s === "To Apply") {
                 cToApply++;
                 cAll++;
-            } else if (s === "Applied" || ["Screening", "Interview", "Offered"].includes(s)) {
+            } else if (s === "Applied" || ["Screening", "Interview Scheduling", "Interview", "Offered"].includes(s)) {
                 cApplied++;
                 cAll++;
             }
@@ -2047,7 +1956,7 @@ function applyJobFilters() {
         } else if (state.feedTab === "To Apply") {
             matchesTab = jStatus === "To Apply" && (statusVal === "all" || jStatus === statusVal);
         } else if (state.feedTab === "Applied") {
-            matchesTab = (jStatus === "Applied" || jStatus === "Screening" || jStatus === "Interview" || jStatus === "Offered") && (statusVal === "all" || jStatus === statusVal);
+            matchesTab = ["Applied", "Screening", "Interview Scheduling", "Interview", "Offered"].includes(jStatus) && (statusVal === "all" || jStatus === statusVal);
         } else if (state.feedTab === "Not Interested") {
             matchesTab = (jStatus === "Not Interested" || jStatus === "Ignored") && (statusVal === "all" || jStatus === statusVal);
         }
@@ -2138,10 +2047,10 @@ function renderJobFeed(jobs) {
         const statusSlug = (job.status || 'To Apply').toLowerCase().replace(/\s+/g, '-');
         const isShortlisted = job.status === "Shortlisted" || job.status === "Saved";
         const isDismissed = job.status === "Not Interested" || job.status === "Ignored";
-        const isApplied = ["Applied", "Screening", "Interview", "Offered", "Rejected"].includes(job.status);
+        const isApplied = ["Applied", "Screening", "Interview Scheduling", "Interview", "Offered", "Rejected", "Closed", "Withdrawn"].includes(job.status);
 
         return `
-            <div class="job-card ${isChecked ? 'selected' : ''} ${isShortlisted ? 'shortlisted' : ''} ${isDismissed ? 'not-interested' : ''}" data-job-id="${job.id}">
+            <div class="job-card ${isChecked ? 'selected' : ''} ${isShortlisted ? 'shortlisted' : ''} ${isDismissed ? 'not-interested' : ''}" data-job-id="${job.id}" tabindex="0">
                 <div class="job-card-select-wrapper">
                     <input type="checkbox" class="job-select-chk" ${isChecked ? 'checked' : ''} onchange="toggleJobSelection(${job.id}, this.checked)">
                 </div>
@@ -2174,9 +2083,12 @@ function renderJobFeed(jobs) {
                         <option value="To Apply" ${job.status === 'To Apply' ? 'selected' : ''}>⚪ To Apply</option>
                         <option value="Applied" ${job.status === 'Applied' ? 'selected' : ''}>🚀 Applied</option>
                         <option value="Screening" ${job.status === 'Screening' ? 'selected' : ''}>📋 Screening</option>
+                        <option value="Interview Scheduling" ${job.status === 'Interview Scheduling' ? 'selected' : ''}>🗓️ Interview Scheduling</option>
                         <option value="Interview" ${job.status === 'Interview' ? 'selected' : ''}>🎙️ Interview</option>
                         <option value="Offered" ${job.status === 'Offered' ? 'selected' : ''}>🎉 Offered</option>
                         <option value="Rejected" ${job.status === 'Rejected' ? 'selected' : ''}>📫 Rejected</option>
+                        <option value="Closed" ${job.status === 'Closed' ? 'selected' : ''}>📪 Closed</option>
+                        <option value="Withdrawn" ${job.status === 'Withdrawn' ? 'selected' : ''}>↩️ Withdrawn</option>
                         <option value="Not Interested" ${isDismissed ? 'selected' : ''}>🚫 Dismissed</option>
                     </select>
 
@@ -2505,7 +2417,7 @@ function renderTrackerList() {
         const isDismissed = jobStatus === "Not Interested";
 
         return `
-            <div class="job-card ${isShortlisted ? 'shortlisted' : ''} ${isDismissed ? 'not-interested' : ''}">
+            <div class="job-card ${isShortlisted ? 'shortlisted' : ''} ${isDismissed ? 'not-interested' : ''}" data-job-id="${job.id}" tabindex="0">
                 <div class="job-info-main">
                     <div class="job-title-row">
                         <h4>${escapeHTML(job.title)}</h4>
@@ -2517,7 +2429,10 @@ function renderTrackerList() {
                               jobStatus === 'Interview' ? '🎙️ Interview' : 
                               jobStatus === 'Screening' ? '📋 Screening' : 
                               jobStatus === 'Offered' ? '🎉 Offered' : 
+                              jobStatus === 'Interview Scheduling' ? '🗓️ Scheduling' :
                               jobStatus === 'Rejected' ? '📫 Regret' : 
+                              jobStatus === 'Closed' ? '📪 Closed' :
+                              jobStatus === 'Withdrawn' ? '↩️ Withdrawn' :
                               isDismissed ? '🚫 Dismissed' : '⚪ ' + jobStatus}
                         </span>
                     </div>
@@ -2535,9 +2450,12 @@ function renderTrackerList() {
                         <option value="To Apply" ${job.status === 'To Apply' ? 'selected' : ''}>⚪ To Apply</option>
                         <option value="Applied" ${job.status === 'Applied' ? 'selected' : ''}>🚀 Applied</option>
                         <option value="Screening" ${job.status === 'Screening' ? 'selected' : ''}>📋 Screening</option>
+                        <option value="Interview Scheduling" ${job.status === 'Interview Scheduling' ? 'selected' : ''}>🗓️ Interview Scheduling</option>
                         <option value="Interview" ${job.status === 'Interview' ? 'selected' : ''}>🎙️ Interview</option>
                         <option value="Offered" ${job.status === 'Offered' ? 'selected' : ''}>🎉 Offered</option>
                         <option value="Rejected" ${job.status === 'Rejected' ? 'selected' : ''}>📫 Rejected</option>
+                        <option value="Closed" ${job.status === 'Closed' ? 'selected' : ''}>📪 Closed</option>
+                        <option value="Withdrawn" ${job.status === 'Withdrawn' ? 'selected' : ''}>↩️ Withdrawn</option>
                         <option value="Not Interested" ${isDismissed ? 'selected' : ''}>🚫 Dismissed</option>
                     </select>
                     ${isDismissed ? `
@@ -2667,7 +2585,7 @@ function renderTrendingChips() {
         if (isTracked) {
             return `<button type="button" class="chip-btn tracked" disabled title="Currently monitored">✓ ${escapeHTML(item.name)}</button>`;
         } else {
-            return `<button type="button" class="chip-btn" onclick="quickAddCompany('${escapeHTML(item.name)}')">➕ ${escapeHTML(item.name)}</button>`;
+            return `<button type="button" class="chip-btn" data-action="quick-add-company" data-company="${escapeHTML(item.name)}">➕ ${escapeHTML(item.name)}</button>`;
         }
     }).join("");
 }
@@ -2900,7 +2818,7 @@ function renderCompanies() {
                 </div>
                 <div class="company-list-right">
                     <button class="btn btn-sm btn-primary" onclick="scrapeCompanyJobs(${c.id})" title="Scan this company's career portal for new jobs">⚡ Scan</button>
-                    <button class="btn btn-sm btn-outline" onclick="scanAndOpenCompanyRadar(${c.id}, '${escapeHTML(c.name)}', this)" title="Scan ${escapeHTML(c.name)} and open Opportunity Radar">🛰️ Radar</button>
+                    <button class="btn btn-sm btn-outline" data-action="scan-company-radar" data-company-id="${c.id}" data-company="${escapeHTML(c.name)}" title="Scan ${escapeHTML(c.name)} and open Opportunity Radar">🛰️ Radar</button>
                     <button class="btn btn-sm btn-outline" onclick="openEditCompanyModal(${c.id})" title="Edit Careers Portal URL / Domain">✏️ Edit</button>
                     <button class="btn btn-sm btn-outline" onclick="refreshCompanyIntel(${c.id})" title="Refresh Web Intelligence">🔄</button>
                     <button class="btn btn-sm btn-danger" onclick="deleteCompany(${c.id})" title="Remove Company">🗑️</button>
@@ -2931,7 +2849,7 @@ function renderCompanies() {
                     </div>
                     <div class="company-card-actions">
                         <button class="btn btn-sm btn-primary" onclick="scrapeCompanyJobs(${c.id})" title="Scan this company's career portal for new jobs">⚡ Scan</button>
-                        <button class="btn btn-sm btn-outline" onclick="scanAndOpenCompanyRadar(${c.id}, '${escapeHTML(c.name)}', this)" title="Scan ${escapeHTML(c.name)} and open Opportunity Radar">🛰️ Radar</button>
+                        <button class="btn btn-sm btn-outline" data-action="scan-company-radar" data-company-id="${c.id}" data-company="${escapeHTML(c.name)}" title="Scan ${escapeHTML(c.name)} and open Opportunity Radar">🛰️ Radar</button>
                         <button class="btn btn-sm btn-outline" onclick="openEditCompanyModal(${c.id})" title="Edit Careers Portal URL / Domain">✏️</button>
                         <button class="btn btn-sm btn-outline" onclick="refreshCompanyIntel(${c.id})" title="Refresh Web Intelligence">🔄</button>
                         <button class="btn btn-sm btn-danger" onclick="deleteCompany(${c.id})" title="Remove Company">🗑️</button>
@@ -3512,6 +3430,15 @@ function renderMatchPanel(job) {
     renderScoreProvenance(job);
     const rescoreBtn = document.getElementById("modal-rescore-btn");
     if (rescoreBtn) rescoreBtn.onclick = () => rescoreJob(job.id);
+    // A row tracked from an email often carries only a snippet. Say so before the operator
+    // clicks Re-score and gets a failure for a row that never had a posting text.
+    const descLen = (job.description || "").trim().length;
+    const summaryEl = document.getElementById("modal-match-summary");
+    if (summaryEl && !hasScore && descLen < 400) {
+        summaryEl.innerText =
+            "Only a short email snippet was captured for this row — scoring needs the posting text, " +
+            "so a re-score may not have enough to work with.";
+    }
 }
 
 function applyJobUpdate(updated) {
@@ -3543,7 +3470,8 @@ async function rescoreJob(jobId, { silent = false } = {}) {
         return updated;
     } catch (e) {
         state.rescoreErrors.set(jobId, e.message);
-        if (!silent) alert(e.message);
+        // The panel shows the reason inline; a native alert on top of it is noise.
+        if (!silent) showToast(`⚠️ ${e.message}`, 6000);
         if (state.activeJobModal && state.activeJobModal.id === jobId) {
             renderScoreProvenance(state.activeJobModal);
         }
@@ -3673,9 +3601,21 @@ function openJobDetailsModal(jobId) {
     if (!job) return;
 
     state.activeJobModal = job;
+    const modal = document.getElementById("details-modal");
+    const drawer = modal ? modal.querySelector(".modal-drawer") : null;
+    if (drawer) drawer.classList.add("dock-filled");
+    markActiveCard(job.id);
 
     document.getElementById("modal-job-title").innerText = job.title;
     document.getElementById("modal-company-name").innerText = `${job.company_name || 'Direct'} • ${job.location || 'Remote'}`;
+
+    const evidenceLine = document.getElementById("modal-job-evidence");
+    if (evidenceLine) {
+        evidenceLine.innerText = "Loading activity…";
+        delete evidenceLine.dataset.empty;
+    }
+    const activityTab = document.querySelector('.modal-tab-btn[data-tab="activity"]');
+    if (activityTab) activityTab.innerText = "🕑 Activity";
 
     const llmBadge = document.getElementById("modal-llm-badge");
     if (llmBadge) {
@@ -3712,22 +3652,23 @@ function openJobDetailsModal(jobId) {
     `;
 
     // Load Tech Stack Alignment Matrix & Hiring Team
-    loadJobSkillsAlignment(job.id);
-    loadJobHiringTeam(job.id);
-    loadJobActivity(job.id);
+    const seq = ++modalLoadSeq;
+    loadJobSkillsAlignment(job.id, seq);
+    loadJobHiringTeam(job.id, seq);
+    loadJobActivity(job.id, seq);
 
     // Reset active tab to Match
     const firstTabBtn = document.querySelector('.modal-tab-btn[data-tab="match"]');
     if (firstTabBtn) firstTabBtn.click();
 
-    document.getElementById("details-modal").classList.remove("hidden");
+    updateDockMode();
 
     // Lazy re-score (issue #57): a score from a different resume version is refreshed when the
     // user actually looks at the job. Runs once per job per session.
     maybeRescoreStaleJob(job);
 }
 
-async function loadJobSkillsAlignment(jobId) {
+async function loadJobSkillsAlignment(jobId, seq = null) {
     const matchedContainer = document.getElementById("modal-matched-skills-grid");
     const gapContainer = document.getElementById("modal-gap-skills-grid");
     const badge = document.getElementById("modal-stack-badge");
@@ -3744,6 +3685,7 @@ async function loadJobSkillsAlignment(jobId) {
         const res = await fetch(`${API_BASE}/api/jobs/${jobId}/skills-alignment`);
         if (!res.ok) throw new Error("Failed to load skills alignment");
         const data = await res.json();
+        if (seq !== null && seq !== modalLoadSeq) return;
 
         const hasStackScore = data.compatibility_pct !== null && data.compatibility_pct !== undefined;
         if (badge) badge.innerText = hasStackScore ? `${data.compatibility_pct}% Stack Match` : "Not analyzed";
@@ -3762,7 +3704,7 @@ async function loadJobSkillsAlignment(jobId) {
 
         if (data.gap_skills && data.gap_skills.length > 0) {
             gapContainer.innerHTML = data.gap_skills.map(s => `
-                <span class="skill-chip-gap" onclick="bridgeSkillGapInTailoring('${escapeHTML(s.name)}')" title="Click to include ${escapeHTML(s.name)} in resume tailoring tips">
+                <span class="skill-chip-gap" data-action="bridge-skill-gap" data-skill="${escapeHTML(s.name)}" title="Click to include this skill in resume tailoring tips">
                     ⚡ ${escapeHTML(s.name)} <span style="font-size:10px; opacity:0.7;">+ Tailor</span>
                 </span>
             `).join("");
@@ -3770,11 +3712,12 @@ async function loadJobSkillsAlignment(jobId) {
             gapContainer.innerHTML = '<span style="font-size:12px; color:#a6e3a1;">🎉 Full stack alignment! All detected key requirements exist in your profile.</span>';
         }
     } catch (e) {
+        if (seq !== null && seq !== modalLoadSeq) return;
         matchedContainer.innerHTML = '<span style="font-size:12px; color:var(--text-dim);">Could not compute stack alignment.</span>';
     }
 }
 
-async function loadJobActivity(jobId) {
+async function loadJobActivity(jobId, seq = null) {
     const container = document.getElementById("modal-activity-timeline");
     if (!container || !jobId) return;
     container.innerHTML = '<span style="font-size:12px; color:var(--text-dim);">Loading activity…</span>';
@@ -3783,40 +3726,88 @@ async function loadJobActivity(jobId) {
         const res = await fetch(`${API_BASE}/api/jobs/${jobId}/events`);
         if (!res.ok) throw new Error("Failed to load activity");
         const events = await res.json();
+        if (seq !== null && seq !== modalLoadSeq) return;
         if (!events.length) {
             container.innerHTML = '<span style="font-size:12px; color:var(--text-dim);">No recorded activity for this role yet.</span>';
+            renderJobEvidence(null);
             return;
         }
-        const icons = {
-            status_change: "🔀",
-            note: "📝",
-            interview: "🗓️",
-            email_received: "📧",
-            created: "🆕"
-        };
-        container.innerHTML = events.map(ev => {
-            const icon = icons[ev.event_type] || "•";
-            const when = ev.timestamp ? new Date(ev.timestamp).toLocaleString() : "";
-            const label = (ev.event_type || "").replace(/_/g, " ");
-            return `
-                <div class="activity-item">
-                    <div class="activity-icon">${icon}</div>
-                    <div class="activity-body">
-                        <div class="activity-meta">
-                            <span class="activity-type">${escapeHTML(label)}</span>
-                            <span class="activity-time">${escapeHTML(when)}</span>
-                        </div>
-                        <div class="activity-desc">${escapeHTML(ev.description || "")}</div>
-                    </div>
-                </div>
-            `;
-        }).join("");
+        // Newest first: the evidence line in the header and the top of the list agree.
+        const ordered = [...events].sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0));
+        renderJobEvidence(ordered[0], ordered.length);
+        renderActivityTimeline(container, ordered);
     } catch (e) {
+        if (seq !== null && seq !== modalLoadSeq) return;
         container.innerHTML = '<span style="font-size:12px; color:var(--text-dim);">Could not load activity history.</span>';
     }
 }
 
-async function loadJobHiringTeam(jobId) {
+function activityIcon(eventType) {
+    const icons = {
+        status_change: "🔀",
+        note: "📝",
+        interview: "🗓️",
+        email_received: "📧",
+        email_application_received: "📧",
+        email_screening: "📧",
+        email_interview: "📧",
+        email_offer: "📧",
+        email_rejection: "📧",
+        created: "🆕"
+    };
+    return icons[eventType] || (String(eventType || "").startsWith("email_") ? "📧" : "•");
+}
+
+function renderActivityItem(ev) {
+    const when = ev.timestamp ? new Date(ev.timestamp).toLocaleString() : "";
+    const label = (ev.event_type || "").replace(/_/g, " ");
+    return `
+        <div class="activity-item">
+            <div class="activity-icon">${activityIcon(ev.event_type)}</div>
+            <div class="activity-body">
+                <div class="activity-meta">
+                    <span class="activity-type">${escapeHTML(label)}</span>
+                    <span class="activity-time">${escapeHTML(when)}</span>
+                </div>
+                <div class="activity-desc">${escapeHTML(ev.description || "")}</div>
+            </div>
+        </div>
+    `;
+}
+
+function renderActivityTimeline(container, ordered) {
+    // The newest entry is always visible; the rest collapses so the panel stays readable.
+    const [latest, ...rest] = ordered;
+    const restHTML = rest.map(renderActivityItem).join("");
+    container.innerHTML = `
+        ${renderActivityItem(latest)}
+        ${rest.length ? `
+            <details class="activity-history">
+                <summary>Show ${rest.length} earlier update${rest.length === 1 ? "" : "s"}</summary>
+                <div class="activity-history-body">${restHTML}</div>
+            </details>
+        ` : ""}
+    `;
+}
+
+function renderJobEvidence(latestEvent, totalCount) {
+    const line = document.getElementById("modal-job-evidence");
+    if (!line) return;
+    if (!latestEvent) {
+        line.innerText = "No recorded activity yet — status changes and emails will appear here.";
+        line.dataset.empty = "1";
+        return;
+    }
+    const when = latestEvent.timestamp ? new Date(latestEvent.timestamp).toLocaleDateString() : "";
+    const desc = (latestEvent.description || "").trim();
+    line.innerText = desc ? `${when} • ${desc}` : `${when} • ${(latestEvent.event_type || "").replace(/_/g, " ")}`;
+    delete line.dataset.empty;
+
+    const tabBtn = document.querySelector('.modal-tab-btn[data-tab="activity"]');
+    if (tabBtn && totalCount) tabBtn.innerText = `🕑 Activity (${totalCount})`;
+}
+
+async function loadJobHiringTeam(jobId, seq = null) {
     const container = document.getElementById("modal-hiring-team-list");
     if (!container || !jobId) return;
     container.innerHTML = '<div style="padding:15px; text-align:center; color:var(--text-dim);"><div class="spinner" style="margin:0 auto 8px auto;"></div>Locating hiring team and recruiters...</div>';
@@ -3825,6 +3816,7 @@ async function loadJobHiringTeam(jobId) {
         const res = await fetch(`${API_BASE}/api/jobs/${jobId}/hiring-team`);
         if (!res.ok) throw new Error("Failed to load hiring team");
         const data = await res.json();
+        if (seq !== null && seq !== modalLoadSeq) return;
 
         if (!data.contacts || data.contacts.length === 0) {
             container.innerHTML = `
@@ -3853,7 +3845,7 @@ async function loadJobHiringTeam(jobId) {
                                 👤 Profile ↗
                             </a>
                         ` : ''}
-                        <button class="btn btn-sm btn-primary" style="font-size:11px; padding:4px 8px;" onclick="draftRecruiterOutreachFromContact('${escapeHTML(c.author_name)}', '${escapeHTML(state.activeJobModal?.title || '')}', '${escapeHTML(data.company_name)}')" title="Draft personalized recruiter outreach note">
+                        <button class="btn btn-sm btn-primary" style="font-size:11px; padding:4px 8px;" data-action="draft-outreach" data-name="${escapeHTML(c.author_name)}" data-title="${escapeHTML(state.activeJobModal?.title || '')}" data-company="${escapeHTML(data.company_name)}" title="Draft personalized recruiter outreach note">
                             💬 Draft Note
                         </button>
                     </div>
@@ -3861,6 +3853,7 @@ async function loadJobHiringTeam(jobId) {
             `;
         }).join("");
     } catch (e) {
+        if (seq !== null && seq !== modalLoadSeq) return;
         container.innerHTML = `<div style="color:var(--text-dim); padding:10px;">Could not load hiring contacts.</div>`;
     }
 }
@@ -4010,7 +4003,7 @@ let availableFeatures = {};
 const ALL_FEATURE_KEYS = [
     "ats_portals", "google_jobs", "linkedin_sync", "gmail_sync",
     "ats_greenhouse", "ats_lever", "ats_ashby", "ats_hirist",
-    "ats_smartrecruiters", "ats_workable", "ats_workday", "ats_uber", "ats_custom_html",
+    "ats_smartrecruiters", "ats_workable", "ats_workday", "ats_adp", "ats_uber", "ats_custom_html",
     "resume_gap_insights"
 ];
 
@@ -4070,7 +4063,7 @@ function applyFeatureFlags(flags) {
 // covers the first render before preferences load.
 const CONSENT_REQUIRED_KEYS_FALLBACK = [
     "linkedin_sync",
-    "ats_smartrecruiters", "ats_workable", "ats_workday", "ats_uber", "ats_custom_html"
+    "ats_smartrecruiters", "ats_workable", "ats_workday", "ats_adp", "ats_uber", "ats_custom_html"
 ];
 let consentRequiredKeys = CONSENT_REQUIRED_KEYS_FALLBACK.slice();
 let featureConsents = {};
@@ -4156,6 +4149,18 @@ async function confirmConsent() {
     }
 }
 
+/**
+ * Renders the server-owned similarity thresholds into the settings copy, so the SPA never quotes
+ * a percentage the backend does not use.
+ */
+function renderSimilarityThresholds(thresholds) {
+    const pct = Number(thresholds && thresholds.dismissal);
+    if (!Number.isFinite(pct)) return;
+    document.querySelectorAll("[data-similarity-threshold]").forEach(el => {
+        el.textContent = `${Math.round(pct * 100)}%`;
+    });
+}
+
 async function loadPreferencesFromServer() {
     try {
         const res = await fetch(`${API_BASE}/api/preferences`);
@@ -4191,6 +4196,10 @@ async function loadPreferencesFromServer() {
         if (Array.isArray(data.extra_skills)) {
             state.extraSkills = data.extra_skills;
         }
+        if (data.country_hubs && Object.keys(data.country_hubs).length) {
+            COUNTRIES_HUBS_DATA = data.country_hubs;
+        }
+        renderSimilarityThresholds(data.similarity_thresholds || {});
         applyFeatureFlags(data.features || {});
         initTargetPreferences();
     } catch (e) {
@@ -4335,22 +4344,17 @@ async function loadGmailSection() {
     }
 }
 
+// Queues the Gmail sync as a background task (issue #84): the run then shows up in the task
+// panel/SSE feed and leaves an OperationLog entry, instead of blocking the button with no trace.
 async function syncGmailNow() {
     const btn = document.getElementById("gmail-engine-sync-btn");
-    if (btn) { btn.disabled = true; btn.innerText = "Syncing…"; }
+    if (btn) { btn.disabled = true; btn.innerText = "Queueing…"; }
     try {
-        const res = await fetch(`${API_BASE}/api/gmail/sync`, { method: "POST" });
+        const res = await fetch(`${API_BASE}/api/tasks/sync/gmail`, { method: "POST" });
         const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Gmail sync failed");
-        if (data.status === "disabled") {
-            showToast("⚠️ " + data.message);
-        } else if (data.status === "not_connected") {
-            showToast("⚠️ " + data.message);
-        } else {
-            showToast(`📧 ${data.message}`);
-        }
-        loadGmailSection();
-        loadEmailReviewQueue();
+        if (!res.ok) throw new Error(data.detail || "Could not queue the Gmail sync");
+        showToast("📧 Gmail sync queued — track it in Background Jobs & Queue.");
+        fetchTasksStatus(true);
     } catch (e) {
         showToast("⚠️ " + e.message);
     } finally {
@@ -4456,23 +4460,46 @@ function renderEmailReviewBanner() {
     if (!banner) return;
     const items = (state.emailReview && state.emailReview.items) || [];
     if (!items.length) { banner.classList.add("hidden"); banner.innerHTML = ""; return; }
-    const first = items[0];
-    const extra = items.length - 1;
-    const domainLabel = first.domain || first.company;
+    const expanded = !!state.emailReviewExpanded;
+    const visible = expanded ? items : items.slice(0, 1);
+    const extra = items.length - visible.length;
+
+    const row = (item) => {
+        const domainLabel = item.domain || item.company;
+        return `
+            <div class="email-review-row">
+                <span class="sync-banner-icon">📥</span>
+                <span class="sync-banner-text">
+                    <strong>${escapeHTML(item.company)} · ${escapeHTML(item.role)}</strong>
+                    (${escapeHTML(item.event_type)}) — tracked application from an email awaiting
+                    your decision
+                </span>
+                <span class="sync-banner-actions">
+                    <button class="btn btn-sm btn-primary" onclick="emailReviewAccept(${item.id})">Track application</button>
+                    <button class="btn btn-sm btn-outline" onclick="emailReviewIgnore(${item.id})">Ignore</button>
+                    <button class="btn btn-sm btn-outline" onclick="emailReviewIgnoreDomain(${item.id})" title="Never show from ${escapeHTML(domainLabel)}">Ignore ${escapeHTML(domainLabel)}</button>
+                </span>
+            </div>
+        `;
+    };
+
     banner.classList.remove("hidden");
+    banner.classList.add("email-review-banner");
     banner.innerHTML = `
-        <span class="sync-banner-icon">📥</span>
-        <span class="sync-banner-text">
-            <strong>${escapeHTML(first.company)} · ${escapeHTML(first.role)}</strong> (${escapeHTML(first.event_type)})
-            — tracked application from an email awaiting your decision
-            ${extra ? `<span class="sync-banner-meta">+${extra} more</span>` : ""}
-        </span>
-        <span class="sync-banner-actions">
-            <button class="btn btn-sm btn-primary" onclick="emailReviewAccept(${first.id})">Track application</button>
-            <button class="btn btn-sm btn-outline" onclick="emailReviewIgnore(${first.id})">Ignore</button>
-            <button class="btn btn-sm btn-outline" onclick="emailReviewIgnoreDomain(${first.id})" title="Never show from ${escapeHTML(domainLabel)}">Ignore ${escapeHTML(domainLabel)}</button>
-        </span>
+        ${visible.map(row).join("")}
+        ${items.length > 1 ? `
+            <div class="email-review-footer">
+                <button class="btn btn-sm btn-outline" onclick="toggleEmailReview()">
+                    ${extra > 0 ? `+${extra} more — review each` : "Show fewer"}
+                </button>
+            </div>
+        ` : ""}
     `;
+}
+
+function toggleEmailReview() {
+    state.emailReviewExpanded = !state.emailReviewExpanded;
+    renderEmailReviewBanner();
 }
 
 async function emailReviewAccept(id) {
@@ -4893,6 +4920,9 @@ async function triggerSyncAll() {
 
 let isApplyingJob = false;
 let extensionBridgeReady = false;
+// Guards the dossier loaders: opening job B must not let job A's slow responses paint into
+// B's panels (finding 176).
+let modalLoadSeq = 0;
 
 // The extension's dashboard bridge announces itself on load. Absence of that message is
 // what tells us to fall back to window.open + the materials drawer.
@@ -4903,6 +4933,38 @@ window.addEventListener("message", (event) => {
         extensionBridgeReady = true;
     } else if (event.data.type === "APPLY_SUBMITTED" && event.data.jobId) {
         confirmSubmission(event.data.jobId);
+    }
+});
+
+// Value-bearing actions are bound through data attributes instead of inline `onclick`:
+// escapeHTML turns an apostrophe into `&#039;`, which the HTML parser decodes back to `'`
+// before JS parses the attribute, so the old `onclick="f('...')"` broke (and could inject)
+// on any value containing a quote (finding 177).
+document.addEventListener("click", (event) => {
+    const el = event.target.closest("[data-action]");
+    if (!el) return;
+    const data = el.dataset;
+    switch (data.action) {
+        case "copy-answer":
+            copyToClipboard(data.answer || "");
+            break;
+        case "bridge-skill-gap":
+            bridgeSkillGapInTailoring(data.skill || "");
+            break;
+        case "add-city":
+            addCityKeyword(data.city || "");
+            break;
+        case "quick-add-company":
+            quickAddCompany(data.company || "");
+            break;
+        case "scan-company-radar":
+            scanAndOpenCompanyRadar(Number(data.companyId), data.company || "", el);
+            break;
+        case "draft-outreach":
+            draftRecruiterOutreachFromContact(
+                data.name || "", data.title || "", data.company || ""
+            );
+            break;
     }
 });
 
@@ -4935,16 +4997,32 @@ function openApplyInBrowser(jobs) {
     });
 }
 
-function openApplyFallback(jobs) {
+function openApplyFallback(jobs, popup = null) {
+    let target = popup;
     jobs.forEach((job) => {
-        if (job && job.url) window.open(job.url, "_blank");
+        if (!job || !job.url) return;
+        if (target && !target.closed) {
+            try {
+                target.location.href = job.url;
+            } catch (e) {
+                window.open(job.url, "_blank");
+            }
+        } else {
+            window.open(job.url, "_blank");
+        }
+        target = null;
     });
     openMaterialsDrawer(jobs);
 }
 
 async function confirmSubmission(jobId) {
     try {
-        await fetch(`${API_BASE}/api/jobs/${jobId}/confirm-submission`, { method: "POST" });
+        const res = await fetch(`${API_BASE}/api/jobs/${jobId}/confirm-submission`, { method: "POST" });
+        // A 404/401/500 is not a confirmation: the row's Submitted badge is driven by this
+        // flag, so a false toast would mislabel it permanently (finding 174).
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+        }
         showToast("✅ Submission confirmed.");
         await fetchJobs();
     } catch (e) {
@@ -5049,6 +5127,10 @@ async function launchApply(jobId) {
         showToast("⏳ Opening application session, please wait...");
         return;
     }
+    // Open a blank tab synchronously, inside the click gesture, then navigate it once the
+    // materials arrive. Calling window.open after an await is outside the gesture, so
+    // Chrome blocks it and the old code still reported success (finding 173).
+    const popup = window.open("about:blank", "_blank");
     isApplyingJob = true;
     startFastQueuePolling();
     try {
@@ -5056,19 +5138,27 @@ async function launchApply(jobId) {
         const res = await fetch(`${API_BASE}/api/jobs/${jobId}/apply`, { method: "POST" });
         const data = await res.json();
         if (!res.ok) {
+            if (popup && !popup.closed) popup.close();
             showToast(`⚠️ ${data.detail || data.message || "Could not prepare the application"}`);
             return;
         }
         const jobs = [data.apply];
         const result = await openApplyInBrowser(jobs);
         if (result.ok) {
+            if (popup && !popup.closed) popup.close();
             showToast(`🚀 Opening '${data.apply.title}' in your browser.`);
         } else {
-            openApplyFallback(jobs);
-            showToast("Opened the application and materials (extension not available).");
+            openApplyFallback(jobs, popup);
+            const opened = popup && !popup.closed;
+            showToast(
+                opened
+                    ? "Opened the application and materials (extension not available)."
+                    : "Materials ready below — your browser blocked the job tab. Allow pop-ups, then reopen."
+            );
         }
         await fetchJobs();
     } catch (e) {
+        if (popup && !popup.closed) popup.close();
         showToast("⚠️ Could not connect to agent backend.");
     } finally {
         stopFastQueuePolling();
@@ -5194,6 +5284,9 @@ function launchCustomBrowserAuth() {
 // Operations Log & Persistent Audit History
 // -------------------------------------------------------------
 let allOperationLogs = [];
+// A wedged backend accepts the connection and never answers; without a deadline the Operations
+// modal spins forever with no error and no retry (issue #92).
+const OPERATIONS_FETCH_TIMEOUT_MS = 8000;
 let currentOpFilter = 'all';
 
 async function openOperationsModal() {
@@ -5210,16 +5303,22 @@ function closeOperationsModal() {
 async function fetchOperationLogs(showToastMsg = false) {
     const loading = document.getElementById("operations-loading");
     const emptyState = document.getElementById("operations-empty");
-    const listContainer = document.getElementById("operations-log-list");
+    const errorState = document.getElementById("operations-error");
+    const errorMessage = document.getElementById("operations-error-message");
 
     if (loading) loading.classList.remove("hidden");
     if (emptyState) emptyState.classList.add("hidden");
+    if (errorState) errorState.classList.add("hidden");
 
     try {
-        const res = await fetch(`${API_BASE}/api/operations/logs?limit=100`);
-        if (!res.ok) throw new Error("Failed to load logs");
+        const res = await fetchWithTimeout(
+            `${API_BASE}/api/operations/logs?limit=100`,
+            {},
+            OPERATIONS_FETCH_TIMEOUT_MS
+        );
+        if (!res.ok) throw new Error(`server returned ${res.status}`);
         allOperationLogs = await res.json();
-        
+
         updateOperationCounts();
         renderOperationLogs();
 
@@ -5227,7 +5326,21 @@ async function fetchOperationLogs(showToastMsg = false) {
             showToast(`Refreshed ${allOperationLogs.length} operation log record(s).`);
         }
     } catch (e) {
-        showToast("⚠️ Could not load operation logs: " + e.message);
+        // A dead or wedged backend must read as a failure the user can act on, never as an
+        // eternal "Loading operation logs..." spinner (issue #92).
+        const detail =
+            e && e.name === "TimeoutError"
+                ? "the backend did not respond in time - it may have restarted or be unreachable"
+                : e && e.message
+                  ? e.message
+                  : "unknown error";
+        showToast("⚠️ Could not load operation logs: " + detail);
+        if (errorState) {
+            errorState.classList.remove("hidden");
+            if (errorMessage) {
+                errorMessage.innerText = `Could not load operation logs: ${detail}. Use Refresh to retry.`;
+            }
+        }
     } finally {
         if (loading) loading.classList.add("hidden");
     }
@@ -5256,6 +5369,51 @@ function filterOperationLogs(filterType) {
         btn.classList.toggle("active", btn.getAttribute("data-op-filter") === filterType);
     });
     renderOperationLogs();
+}
+
+function renderOperationDetails(parsed) {
+    // Structured runs (external sync) carry the per-job outcome; lead with it so the operator can
+    // see WHICH application moved, then fall back to the human-readable bullets and raw JSON.
+    const parts = [];
+
+    const changes = Array.isArray(parsed.status_changes) ? parsed.status_changes : [];
+    if (changes.length) {
+        const items = changes.map(c => {
+            const job = c.job_id ? `<a href="#" onclick="return false;">#${c.job_id}</a> ` : "";
+            const from = c.from || "unknown";
+            return `<li>${job}<strong>${escapeHTML(c.title || "Untitled")}</strong> at ${escapeHTML(c.company || "unknown")}: ${escapeHTML(from)} → <strong>${escapeHTML(c.to || "?")}</strong>${c.subject ? ` <span style="color:#6c7086;">(“${escapeHTML(c.subject)}”)</span>` : ""}</li>`;
+        }).join("");
+        parts.push(`<div><strong>Status changes</strong><ul style="margin:6px 0 0 16px;">${items}</ul></div>`);
+    }
+
+    const opps = Array.isArray(parsed.opportunities) ? parsed.opportunities : [];
+    if (opps.length) {
+        const items = opps.map(o =>
+            `<li><strong>${escapeHTML(o.title || "Untitled")}</strong> at ${escapeHTML(o.company || "unknown")}${o.source ? ` <span style="color:#6c7086;">(${escapeHTML(o.source)})</span>` : ""}</li>`
+        ).join("");
+        parts.push(`<div><strong>Opportunities tracked</strong><ul style="margin:6px 0 0 16px;">${items}</ul></div>`);
+    }
+
+    const bullets = Array.isArray(parsed.details) ? parsed.details : [];
+    if (bullets.length) {
+        const items = bullets.map(d => `<li>${escapeHTML(String(d))}</li>`).join("");
+        parts.push(`<div><strong>Details</strong><ul style="margin:6px 0 0 16px;">${items}</ul></div>`);
+    }
+
+    const channels = parsed.channels && typeof parsed.channels === "object" ? parsed.channels : null;
+    if (channels) {
+        const items = Object.entries(channels).map(([name, c]) => {
+            const outcome = (c && c.outcome) || "unknown";
+            const note = (c && c.detail) ? ` — ${escapeHTML(String(c.detail))}` : "";
+            return `<li>${escapeHTML(name)}: <strong>${escapeHTML(String(outcome))}</strong>${note}</li>`;
+        }).join("");
+        parts.push(`<div><strong>Channels</strong><ul style="margin:6px 0 0 16px;">${items}</ul></div>`);
+    }
+
+    if (!parts.length) {
+        return `<pre style="white-space:pre-wrap; margin:0;">${escapeHTML(JSON.stringify(parsed, null, 2))}</pre>`;
+    }
+    return parts.join("");
 }
 
 function renderOperationLogs() {
@@ -5301,7 +5459,7 @@ function renderOperationLogs() {
                 const parsed = JSON.parse(log.details_json);
                 detailsHtml = `
                     <div id="op-details-${log.id}" class="op-log-details-content hidden">
-                        ${escapeHTML(JSON.stringify(parsed, null, 2))}
+                        ${renderOperationDetails(parsed)}
                     </div>
                 `;
             } catch (e) {
@@ -5421,7 +5579,7 @@ function renderQAMemory(items) {
                         ${simBadge}
                     </div>
                     <div style="display: flex; gap: 6px;">
-                        <button type="button" class="btn btn-sm btn-outline" style="padding: 2px 8px; font-size: 11px;" onclick="copyToClipboard('${escapeHTML((item.answer_text || item.answer || '').replace(/'/g, "\\'"))}')">📋 Copy</button>
+                        <button type="button" class="btn btn-sm btn-outline" style="padding: 2px 8px; font-size: 11px;" data-action="copy-answer" data-answer="${escapeHTML(item.answer_text || item.answer || '')}">📋 Copy</button>
                         <button type="button" class="btn btn-sm btn-outline text-danger" style="padding: 2px 8px; font-size: 11px;" onclick="deleteQAMemoryItem(${item.id})">✕</button>
                     </div>
                 </div>
@@ -6612,8 +6770,15 @@ function initTaskSSE() {
                     showToast(`🎉 Task '${prog.task_name}' complete! Discovered ${prog.items_discovered || 0} items.`);
                     fetchJobs();
                     fetchTasksStatus();
+                    if (prog.task_type === "gmail_sync") {
+                        // The Gmail sync only lands in the review queue + operations log.
+                        loadGmailSection();
+                        loadEmailReviewQueue();
+                        fetchOperationLogs();
+                    }
                 } else if (prog.status === "FAILED" || prog.status === "CANCELLED") {
                     fetchTasksStatus();
+                    if (prog.task_type === "gmail_sync") loadGmailSection();
                 }
             } catch (e) {}
         };

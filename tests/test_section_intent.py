@@ -330,3 +330,167 @@ class TestLineBreaksDisableSentenceSegmentation:
         flat = "Requirements: Python. Preferred Qualifications: Kubernetes."
         labels = [s.label for s in si.jd_section_spans(flat)]
         assert "preferred" in labels
+
+
+class TestAtsHeaderChrome:
+    """Issue #98: a portal metadata block must not become scored requirements.
+
+    ADP/Workday pages render title, department, location, worker category, job class,
+    posted-date badge, requisition number and the Apply/Save CTAs above the JD. Everything
+    before the first heading is `required`, so that block used to be mined as requirements.
+    """
+
+    HEADER_JD = (
+        "Principal Software Engineer\n"
+        "Development\n"
+        "Remote India, IN\n"
+        "Full Time\n"
+        "Professional\n"
+        "24 days ago\n"
+        "Requisition ID: 1427\n"
+        "Apply\n"
+        "Save\n"
+        "\n"
+        "The Desired Attributes:\n"
+        "\n"
+        "Bachelor's degree in computer science or a related field.\n"
+        "Strong expertise in Ruby on Rails.\n"
+        "Experience with Kafka preferred\n"
+    )
+
+    def test_metadata_block_before_the_first_heading_is_intro(self):
+        spans = si.jd_section_spans(self.HEADER_JD)
+        assert spans[0].label == "intro"
+        chrome = self.HEADER_JD[spans[0].start:spans[0].end]
+        assert "Requisition ID" in chrome
+        assert "Full Time" in chrome
+        assert "Ruby on Rails" not in chrome
+
+    def test_the_heading_after_the_block_keeps_its_own_label(self):
+        labels = [s.label for s in si.jd_section_spans(self.HEADER_JD)]
+        assert labels[0] == "intro"
+        assert "required" in labels
+
+    def test_flat_jd_opening_with_a_skills_list_is_untouched(self):
+        """The guard needs two chrome signals; a bare skills list has none."""
+        jd = "Kubernetes\nDocker\nTerraform\n"
+        assert [s.label for s in si.jd_section_spans(jd)] == ["required"]
+
+    def test_a_single_chrome_like_line_is_not_enough(self):
+        jd = "Apply\n\nWe build tools for engineers.\n"
+        assert si.jd_section_spans(jd)[0].label == "required"
+
+    def test_a_heading_is_never_swallowed_by_the_block(self):
+        jd = "Full Time\nProfessional\nPreferred Qualifications:\nRust experience.\n"
+        spans = si.jd_section_spans(jd)
+        assert "preferred" in [s.label for s in spans]
+
+
+class TestInlinePreferenceCue:
+    def test_trailing_preferred_marks_only_that_requirement(self):
+        """Issue #98: '... preferred' mid-list is nice-to-have, not must-have."""
+        jd = (
+            "Requirements:\n\n"
+            "Strong expertise in Ruby on Rails.\n"
+            "Experience with Kafka preferred\n"
+            "We also value curiosity.\n"
+        )
+        assert [s.label for s in si.jd_section_spans(jd)] == [
+            "required", "preferred", "required",
+        ]
+
+    def test_trailing_a_plus_is_detected(self):
+        jd = "Requirements:\n\nRust experience a plus\n"
+        assert "preferred" in [s.label for s in si.jd_section_spans(jd)]
+
+    def test_mid_sentence_a_plus_still_does_not_switch_sections(self):
+        jd = (
+            "Requirements:\n\n"
+            "Advanced degrees are a plus but not a substitute for shipping.\n"
+        )
+        assert [s.label for s in si.jd_section_spans(jd)] == ["required"]
+
+
+class TestHeadingEmbeddingMemo:
+    """The embedding fallback used to re-embed all 13 JD exemplars per unknown heading line.
+
+    Scoring profiles showed ~5 s of a 6.8 s five-posting run inside the ONNX session, because
+    every non-lexical line paid for the whole exemplar set. Headings repeat across a corpus, so
+    both the exemplar vectors and the per-text label are memoised per embedding backend.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_memo(self):
+        """The memo is thread-local, so a leftover label could leak into a later test."""
+        si.reset_heading_cache()
+        yield
+        si.reset_heading_cache()
+
+    @staticmethod
+    def _patch(monkeypatch, stamp=("test", "fake-model")):
+        from backend import embeddings
+
+        calls = {"n": 0}
+
+        def fake_embed(text, settings=None):
+            calls["n"] += 1
+            return [1.0, 0.0, 0.0]
+
+        monkeypatch.setattr(embeddings, "embed_text", fake_embed)
+        monkeypatch.setattr(embeddings, "last_embed_stamp", lambda: stamp)
+        return calls
+
+    @staticmethod
+    def _exemplar_count(domain="jd"):
+        return sum(len(samples) for samples in si._EMBED_EXEMPLARS[domain].values())
+
+    def test_exemplars_are_embedded_once_not_per_line(self, monkeypatch):
+        calls = self._patch(monkeypatch)
+        si.classify_heading("totally novel heading one", "jd")
+        assert calls["n"] == self._exemplar_count() + 1
+
+        si.classify_heading("totally novel heading two", "jd")
+        # The second unknown line costs exactly one query vector, not the whole exemplar set.
+        assert calls["n"] == self._exemplar_count() + 2
+
+    def test_repeated_heading_costs_no_embedding(self, monkeypatch):
+        calls = self._patch(monkeypatch)
+        si.classify_heading("a heading nobody listed", "jd")
+        before = calls["n"]
+        si.classify_heading("a heading nobody listed", "jd")
+        assert calls["n"] == before
+
+    def test_memo_is_invalidated_by_a_backend_change(self, monkeypatch):
+        calls = self._patch(monkeypatch, stamp=("standalone", "model-a"))
+        si.classify_heading("a heading nobody listed", "jd")
+        before = calls["n"]
+
+        monkeypatch.setattr(
+            "backend.embeddings.last_embed_stamp", lambda: ("standalone", "model-b")
+        )
+        si.classify_heading("a heading nobody listed", "jd")
+        assert calls["n"] > before, "a different backend must not reuse the previous labels"
+
+    def test_hash_backend_is_unknown_and_memoised(self, monkeypatch):
+        calls = self._patch(monkeypatch, stamp=("hash", "hash"))
+        assert si.classify_heading("a heading nobody listed", "jd") == "unknown"
+        before = calls["n"]
+        assert si.classify_heading("a heading nobody listed", "jd") == "unknown"
+        assert calls["n"] == before
+
+    def test_lexical_headings_never_reach_the_embedding_tier(self, monkeypatch):
+        calls = self._patch(monkeypatch)
+        assert si.classify_heading("Minimum Qualifications", "jd") == "required"
+        assert calls["n"] == 0
+
+
+class TestPreferenceFilterSectionReset:
+    def test_skip_topic_after_a_non_must_have_heading_does_not_reject(self):
+        """The must-have section ends at the next recognised heading (finding 94)."""
+        pf = PreferenceFilter(PreferenceCriteria(skip_topics=["gym"]))
+        reason = pf.rejection_reason(
+            "Software Engineer",
+            "",
+            "Requirements:\nPython and Go.\n\nPerks:\nfree gym membership",
+        )
+        assert reason is None

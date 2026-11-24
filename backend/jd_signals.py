@@ -31,6 +31,16 @@ _NON_TECHNOLOGY = {
     "register", "more", "details", "description", "overview", "print", "copy",
 }
 
+# Seniority/role nouns that can follow "N+ years in" without naming a technology
+# (issue #98: "1+ year in Principal Software Engineering role" produced the technology
+# "Principal" and a meaningless tenure requirement beside the real seniority one).
+SENIORITY_ROLE_WORDS = {
+    "principal", "staff", "senior", "sr", "junior", "jr", "mid", "entry", "lead",
+    "architect", "manager", "director", "engineer", "developer", "analyst", "consultant",
+    "specialist", "officer", "head", "chief", "president", "vp", "intern", "trainee",
+    "graduate", "associate", "supervisor", "administrator", "scientist",
+}
+
 _EXPERIENCE_PATTERNS = [
     (re.compile(rf"{_YEARS_NUM}\s*(?:\+|plus)\s*{_YEARS_UNIT}", re.I), "min"),
     (re.compile(rf"{_YEARS_NUM}\s*(?:-|–|—|to)\s*{_YEARS_NUM}\s*(?:or\s+more\s+)?{_YEARS_UNIT}", re.I), "range"),
@@ -126,7 +136,12 @@ def parse_experience(text: str) -> List[ExperienceHint]:
             follow = _EXPERIENCE_CONNECTOR.match(tail) or _SCOPE_FOLLOW.match(tail)
             if follow:
                 token = follow.group(1).rstrip(".-")
-                if token.lower() not in _NON_TECHNOLOGY and token[:1].isupper():
+                lowered = token.lower()
+                if (
+                    lowered not in _NON_TECHNOLOGY
+                    and lowered not in SENIORITY_ROLE_WORDS
+                    and token[:1].isupper()
+                ):
                     scope, technology = "technology", token
             key = (lo, hi, scope, technology)
             if key in seen:

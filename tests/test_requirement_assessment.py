@@ -66,3 +66,28 @@ def test_empty_inputs_raise():
         assess_job_requirements("", "job")
     with pytest.raises(ValueError):
         assess_job_requirements("resume", "")
+
+
+def test_unknown_requirements_leave_the_coverage_denominator():
+    """The prompt tells the model to reserve 'unknown' for an unreadable resume because it is
+    excluded from the denominator: two met + two unknown is 100% coverage, not 50%."""
+    from backend.match_scoring import compute_match
+
+    assessment = RequirementAssessment(requirements=[
+        _item("Python", "met", kind="skill"),
+        _item("Go", "met", kind="skill"),
+        _item("Kubernetes", "unknown", kind="skill"),
+        _item("Terraform", "unknown", kind="skill"),
+    ])
+    result = compute_match(assessment)
+
+    assert result.must_coverage == 1.0
+    assert result.score == 100.0
+
+
+def test_the_prompt_reserves_unknown_for_an_unreadable_resume():
+    from backend.prompts import requirement_extraction_system
+
+    prompt = requirement_extraction_system()
+    assert "Use 'missing' when the posting requires" in prompt
+    assert "'unknown' is only for an unreadable resume" in prompt

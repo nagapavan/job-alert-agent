@@ -196,9 +196,9 @@ class TestSyncAllSessionHygiene:
 class TestLinkedInScanMutualExclusion:
     """Only one LinkedIn saved-jobs scan may drive the single-owner browser profile (#114/#115)."""
 
-    @patch("backend.main._submit_queued_linkedin_scan", return_value="tsk_queued01")
-    @patch("backend.main.has_consent", return_value=True)
-    @patch("backend.main.is_feature_enabled", return_value=True)
+    @patch("backend.routers.linkedin._submit_queued_linkedin_scan", return_value="tsk_queued01")
+    @patch("backend.routers.linkedin.has_consent", return_value=True)
+    @patch("backend.routers.linkedin.is_feature_enabled", return_value=True)
     def test_manual_sync_is_queued_while_a_scan_runs(
         self, _flag, _consent, _submit, db_session
     ):
@@ -222,14 +222,14 @@ class TestLinkedInScanMutualExclusion:
         assert row.id == body["request_id"]
 
     @patch("backend.playwright_app.is_profile_in_use", return_value=False)
-    @patch("backend.main.has_consent", return_value=True)
-    @patch("backend.main.is_feature_enabled", return_value=True)
+    @patch("backend.routers.linkedin.has_consent", return_value=True)
+    @patch("backend.routers.linkedin.is_feature_enabled", return_value=True)
     def test_background_stage_skips_while_a_scan_runs(
         self, _flag, _consent, _profile, db_session
     ):
         assert _LINKEDIN_SCAN_GATE.try_acquire()
         try:
-            with patch("backend.main.get_db", return_value=_iter_db(db_session)):
+            with patch("backend.routers.linkedin.get_db", return_value=_iter_db(db_session)):
                 result = _run_linkedin_sync_task_runner()
         finally:
             _LINKEDIN_SCAN_GATE.release()
@@ -272,7 +272,7 @@ class TestLinkedInScanQueue:
         t2.join(5)
         assert order == ["first", "second"]
 
-    @patch("backend.main._sync_linkedin_alerts_and_saved")
+    @patch("backend.routers.linkedin._sync_linkedin_alerts_and_saved")
     def test_queued_request_runs_and_completes_when_gate_frees(
         self, mock_sync, db_session
     ):
@@ -290,7 +290,7 @@ class TestLinkedInScanQueue:
             message="LinkedIn sync complete: scanned 3.",
         )
 
-        with patch("backend.main.get_db", return_value=_iter_db(db_session)):
+        with patch("backend.routers.linkedin.get_db", return_value=_iter_db(db_session)):
             result = _run_queued_linkedin_scan(row_id)
 
         assert result["saved_jobs_added"] == 1
@@ -302,7 +302,7 @@ class TestLinkedInScanQueue:
         assert _LINKEDIN_SCAN_GATE.try_acquire()
         _LINKEDIN_SCAN_GATE.release()
 
-    @patch("backend.main._sync_linkedin_alerts_and_saved")
+    @patch("backend.routers.linkedin._sync_linkedin_alerts_and_saved")
     def test_cancelled_waiter_never_scans(self, mock_sync, db_session):
         row = linkedin_scan_queue.enqueue(db_session, origin="manual")
         row_id = row.id
@@ -310,7 +310,7 @@ class TestLinkedInScanQueue:
         try:
             token = CancellationToken()
             token.cancel()
-            with patch("backend.main.get_db", return_value=_iter_db(db_session)):
+            with patch("backend.routers.linkedin.get_db", return_value=_iter_db(db_session)):
                 result = _run_queued_linkedin_scan(row_id, cancel_token=token)
         finally:
             _LINKEDIN_SCAN_GATE.release()
@@ -330,7 +330,7 @@ class TestLinkedInScanQueue:
         res = client.post("/api/linkedin/sync/stop")
 
         assert res.status_code == 200
-        assert "stopped" in res.json()["message"]
+        assert "1 queued scan(s) cancelled" in res.json()["message"]
         db_session.expunge_all()
         assert (
             db_session.get(LinkedInScanRequest, row_id).status
@@ -363,7 +363,7 @@ class TestLinkedInScanQueue:
 class TestAtsScrapeBatchCommits:
     """The scrape must not hold the SQLite write lock for the whole company loop (#114)."""
 
-    @patch("backend.main.scrape_greenhouse_jobs")
+    @patch("backend.scraper.scrape_greenhouse_jobs")
     def test_commits_once_per_company(self, mock_gh, db_session):
         db_session.add_all(
             [
@@ -398,3 +398,27 @@ class TestAtsScrapeBatchCommits:
         # One batch commit per company plus the closing OperationLog write.
         assert mock_commit.call_count >= 3
 
+
+
+class TestSyncAllReporting:
+    """A stage that did not run must not be counted as completed."""
+
+    @patch("backend.main.is_feature_enabled", side_effect=lambda db, f: f == "ats_hirist")
+    @patch("backend.main.get_feature_flags")
+    @patch("backend.main._execute_external_sync")
+    @patch("backend.main._execute_ats_scrape")
+    def test_a_skipped_stage_is_reported_as_skipped(
+        self, mock_ats, mock_ext, mock_flags, _mock_flag, db_session
+    ):
+        mock_flags.return_value = {"ats_portals": True, "google_jobs": False, "linkedin_sync": False}
+        mock_ats.return_value = {"skipped": "cooling_down"}
+        mock_ext.return_value = ExternalSyncResponse(message="ok")
+
+        with patch("backend.main.get_db", return_value=_iter_db(db_session)):
+            result = _run_sync_all_task_runner()
+
+        stages = {s["stage"]: s for s in result["stages"]}
+        assert stages["ats_portals"]["status"] == "skipped"
+        assert "cooling_down" in stages["ats_portals"]["detail"]
+        assert result["skipped"] >= 1
+        assert result["completed"] == 1

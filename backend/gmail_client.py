@@ -3,15 +3,21 @@ Gmail API client (BYOK OAuth, opt-in, privacy-scoped).
 
 Design principles (see plan §/docs):
 - Never enumerate the mailbox: every messages.list call carries a narrow `q` and `maxResults`.
-- Fetch metadata + snippet only (never full message bodies).
+- Fetch metadata and snippets; a message classified as a job alert may also be fetched with a
+  bounded body so the posting can be read (never the whole mailbox).
 - Read-only scope; refresh token stored encrypted via backend.config.
 - Google API libraries are imported lazily so the app and tests run without them installed.
 """
 import base64
 import html
+import json
 import logging
+import math
+import os
 import re
-from datetime import datetime, timezone
+import secrets
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("gmail_client")
@@ -21,24 +27,154 @@ GMAIL_REDIRECT_URI = "http://localhost:8000/api/gmail/oauth2callback"
 PAGE_SIZE = 50
 MAX_PAGES = 2
 
-# Code-owned narrow query: job-board senders + decision/interview subjects only.
-# Label scope: no labelIds are passed to messages().list, so Gmail searches ALL
-# labels (Inbox, Updates, Promotions, Social, plus any user labels) except
-# Spam/Trash. The narrow q keeps this privacy-scoped (no mailbox enumeration).
-GMAIL_QUERY = (
-    'newer_than:90d (from:greenhouse.io OR from:lever.co OR from:ashbyhq.com '
-    'OR from:myworkdayjobs.com OR from:workday.com OR from:smartrecruiters.com '
-    'OR from:workable.com OR from:icims.com OR from:taleo.net OR from:linkedin.com '
-    'OR from:googlealerts-noreply@google.com '
+# Code-owned narrow queries, split into two passes. Label scope: no labelIds are passed to
+# messages().list, so Gmail searches ALL labels (Inbox, Updates, Promotions, Social, plus any
+# user labels) except Spam/Trash. The narrow q keeps this privacy-scoped (no mailbox
+# enumeration).
+#
+# The split exists because alert digests arrive 5+ times a day and used to occupy a single
+# 100-message window, starving the status/outreach mail behind them.
+GMAIL_STATUS_SENDERS = (
+    "from:greenhouse.io OR from:lever.co OR from:ashbyhq.com "
+    "OR from:myworkdayjobs.com OR from:workday.com OR from:smartrecruiters.com "
+    "OR from:workable.com OR from:icims.com OR from:taleo.net "
+    # LinkedIn *message* notifications (recruiter outreach), not the alert digests.
+    "OR from:hit-reply@linkedin.com OR from:inmail-hit-reply@linkedin.com "
+    "OR from:messages-noreply@linkedin.com OR from:messaging-digest-noreply@linkedin.com "
+    "OR from:googlealerts-noreply@google.com"
+)
+
+GMAIL_STATUS_SUBJECT_CUES = (
     'OR subject:interview OR subject:offer OR subject:"next steps" '
     'OR subject:regret OR subject:"not moving forward" '
     'OR subject:applying OR subject:availability OR subject:scheduling '
     'OR subject:assessment OR subject:"your application" OR subject:"was viewed" '
-    'OR subject:"job alert" OR subject:opportunity OR subject:application)'
+    'OR subject:opportunity OR subject:application '
+    # Employer career-portal digests: "New jobs at <Employer>", "New jobs posted from
+    # careers.<employer>.com", "New job(s) match your search", "Jobs for you", "Top jobs".
+    'OR subject:"new job" OR subject:"new jobs" OR subject:"job match" '
+    'OR subject:"jobs for you" OR subject:"top jobs" OR subject:"match your search" '
+    'OR subject:"open positions" OR subject:"career opportunities" OR subject:"job opportunity"'
+)
+
+# Alert senders never appear in the status pass, so their volume cannot push status mail out
+# of the window.
+GMAIL_ALERT_SENDERS = (
+    "from:jobalerts-noreply@linkedin.com OR from:jobs-noreply@linkedin.com "
+    "OR from:googlealerts-noreply@google.com"
+)
+GMAIL_STATUS_EXCLUDES = (
+    "-from:jobalerts-noreply@linkedin.com -from:jobs-noreply@linkedin.com "
+    "-from:googlealerts-noreply@google.com"
 )
 
 # Emails that map to an application-pipeline status change.
 STATUS_EVENT_TYPES = ("interview", "rejection", "application_received", "offer", "screening")
+
+# LinkedIn alert senders carry a card-per-posting digest rather than Google Alerts text.
+LINKEDIN_ALERT_SENDERS = ("jobalerts-noreply@linkedin.com", "jobs-noreply@linkedin.com")
+
+# LinkedIn *message* notifications relay a recruiter, not an employer decision.
+LINKEDIN_MESSAGE_SENDERS = (
+    "hit-reply@linkedin.com",
+    "inmail-hit-reply@linkedin.com",
+    "messages-noreply@linkedin.com",
+    "messaging-digest-noreply@linkedin.com",
+)
+
+# One digest can list 30+ postings. Cap what a single mail may contribute; the rest is left
+# for the operator to triage manually rather than flooding the feed.
+ALERT_DIGEST_MAX_JOBS = 5
+
+# Gmail messages.list accepts 500 per page; the cap is ours, and is per pass.
+PAGE_SIZE_MAX = 500
+STATUS_WINDOW_DAYS = int(os.environ.get("GMAIL_STATUS_WINDOW_DAYS", "90"))
+ALERT_WINDOW_DAYS = int(os.environ.get("GMAIL_ALERT_WINDOW_DAYS", "7"))
+STATUS_MAX_MESSAGES = int(os.environ.get("GMAIL_STATUS_MAX_MESSAGES", "500"))
+ALERT_MAX_MESSAGES = int(os.environ.get("GMAIL_ALERT_MAX_MESSAGES", "200"))
+
+# Where the last successful pass left off, so a run does not re-walk the whole window.
+SYNC_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "gmail_sync_state.json"
+
+
+def is_linkedin_alert_sender(sender: str) -> bool:
+    """True for the LinkedIn alert-digest senders (never recruiter message notifications)."""
+    lowered = (sender or "").lower()
+    return any(addr in lowered for addr in LINKEDIN_ALERT_SENDERS)
+
+
+def is_linkedin_message_sender(sender: str) -> bool:
+    """True for the LinkedIn message-notification senders (recruiter outreach)."""
+    lowered = (sender or "").lower()
+    return any(addr in lowered for addr in LINKEDIN_MESSAGE_SENDERS)
+
+
+def is_google_alerts_sender(sender: str) -> bool:
+    """True for Google Alerts digests (the only sender whose body the Google parser reads)."""
+    return "googlealerts-noreply@google.com" in (sender or "").lower()
+
+
+def _window_clause(after: Optional[str], window_days: int) -> str:
+    """``after:`` from the stored watermark (one day of overlap), else a rolling window.
+
+    Gmail's ``after:`` is day-granular, so the previous day is re-scanned; ``ProcessedEmail``
+    dedup makes the overlap free.
+    """
+    if after:
+        try:
+            since = datetime.strptime(str(after)[:10], "%Y-%m-%d").date() - timedelta(days=1)
+            return f"after:{since:%Y/%m/%d}"
+        except ValueError:
+            logger.warning(f"Gmail watermark '{after}' is not a date; using a rolling window.")
+    return f"newer_than:{max(1, window_days)}d"
+
+
+def build_status_query(after: Optional[str] = None, window_days: int = STATUS_WINDOW_DAYS) -> str:
+    """Narrow query for application status mail and recruiter outreach."""
+    window = _window_clause(after, window_days)
+    return (
+        f"{window} ({GMAIL_STATUS_SENDERS} {GMAIL_STATUS_SUBJECT_CUES}) "
+        f"{GMAIL_STATUS_EXCLUDES}"
+    )
+
+
+def build_alert_query(after: Optional[str] = None, window_days: int = ALERT_WINDOW_DAYS) -> str:
+    """Narrow query for alert digests only (their own window and cap)."""
+    window = _window_clause(after, window_days)
+    return f"{window} ({GMAIL_ALERT_SENDERS})"
+
+
+# Kept for callers that just want "the" query; the sync itself uses both passes.
+GMAIL_QUERY = build_status_query()
+
+
+def load_sync_state() -> Dict[str, Any]:
+    """Reads the per-pass watermarks (``{"status": {"after": "YYYY-MM-DD"}, ...}``)."""
+    try:
+        if SYNC_STATE_FILE.exists():
+            data = json.loads(SYNC_STATE_FILE.read_text("utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception as exc:  # pragma: no cover - a corrupt state file is not fatal
+        logger.warning(f"Could not read Gmail sync state: {exc}")
+    return {}
+
+
+def save_sync_state(state: Dict[str, Any]) -> None:
+    """Persists the watermarks; failure only costs a re-scan, never a missed mail."""
+    try:
+        SYNC_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SYNC_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning(f"Could not persist Gmail sync state: {exc}")
+
+
+def list_message_ids_for(service, query: str, max_messages: int) -> List[str]:
+    """Lists up to ``max_messages`` ids, paging at the API maximum."""
+    cap = max(1, int(max_messages))
+    page = min(PAGE_SIZE_MAX, cap)
+    pages = max(1, math.ceil(cap / page))
+    return list_message_ids(service, query=query, max_results=page, max_pages=pages)[:cap]
 
 
 def _require_google_libs():
@@ -72,17 +208,24 @@ def _flow(client_id: str, client_secret: str, redirect_uri: str):
 
 
 def build_auth_url(client_id: str, client_secret: str, redirect_uri: str = GMAIL_REDIRECT_URI,
-                   state: str = "job-alert-agent") -> Dict[str, str]:
+                   state: str = "") -> Dict[str, str]:
     """
     Builds the Google consent URL for the loopback OAuth flow.
-    Returns the URL plus the PKCE code_verifier, which MUST be persisted and supplied
-    again at token exchange (the flow spans two separate HTTP requests).
+
+    A random ``state`` nonce is generated unless the caller supplies one; it MUST be persisted
+    with the PKCE verifier and matched on the redirect, or a cross-site navigation can force-connect
+    a mailbox the operator never chose. Returns ``auth_url``, ``code_verifier`` and ``state``.
     """
+    nonce = (state or "").strip() or secrets.token_urlsafe(32)
     flow = _flow(client_id, client_secret, redirect_uri)
     url, _ = flow.authorization_url(
-        access_type="offline", include_granted_scopes="true", prompt="consent", state=state
+        access_type="offline", include_granted_scopes="true", prompt="consent", state=nonce
     )
-    return {"auth_url": url, "code_verifier": getattr(flow, "code_verifier", "") or ""}
+    return {
+        "auth_url": url,
+        "code_verifier": getattr(flow, "code_verifier", "") or "",
+        "state": nonce,
+    }
 
 
 def exchange_code_for_tokens(code: str, client_id: str, client_secret: str,
@@ -195,12 +338,13 @@ def fetch_message_metadata(service, message_id: str) -> Dict[str, str]:
     msg = service.users().messages().get(
         userId="me", id=message_id, format="metadata",
         metadataHeaders=["From", "Subject", "Date"],
-        fields="id,snippet,payload/headers",
+        fields="id,threadId,snippet,payload/headers",
     ).execute()
     headers = {h.get("name", "").lower(): h.get("value", "")
                for h in (msg.get("payload", {}) or {}).get("headers", [])}
     return {
         "id": msg.get("id", message_id),
+        "thread_id": msg.get("threadId", ""),
         "sender": headers.get("from", ""),
         "subject": headers.get("subject", ""),
         "date": headers.get("date", ""),
@@ -273,11 +417,40 @@ def fetch_message_body(service, message_id: str, max_chars: int = 6000) -> str:
     return text[:max_chars].strip()
 
 
-def run_gmail_sync(db) -> List[Dict[str, Any]]:
+_STATUS_SUBJECT_CUE_RE = re.compile(
+    r"\b(?:interview|screening|screen|rejection|rejected|regret|not\s+moving\s+forward|"
+    r"offer|application|next\s+steps|schedul\w*|availability|assessment)\b",
+    re.I,
+)
+
+
+def _thread_is_linked(db, thread_id: str) -> bool:
+    """True when this thread already names a tracked application."""
+    if not thread_id:
+        return False
+    try:
+        from backend.database import EmailApplicationLink
+
+        return (
+            db.query(EmailApplicationLink)
+            .filter(EmailApplicationLink.thread_id == thread_id)
+            .first()
+            is not None
+        )
+    except Exception:  # pragma: no cover - never let attribution break the sync
+        return False
+
+
+def run_gmail_sync(db, stats: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
-    Runs the opt-in Gmail API sync. Returns classified application events
-    (interview/rejection/application_received) for the caller to map to the DB.
-    Marks each processed message id to guarantee dedup.
+    Runs the opt-in Gmail API sync in two passes (status/outreach, then alert digests).
+    Returns classified application events (interview/rejection/application_received plus
+    opportunity) for the caller to map to the DB. Marks each processed message id to
+    guarantee dedup.
+
+    ``stats`` (optional) is filled with ``messages_matched`` / ``new_processed`` (and the
+    per-pass counts) so the caller can persist an honest operation record instead of
+    guessing from the event count.
     """
     from backend.config import get_gmail_settings
     from backend.database import ProcessedEmail
@@ -285,6 +458,7 @@ def run_gmail_sync(db) -> List[Dict[str, Any]]:
     from backend.scraper import (
         extract_company_and_role_from_email_header,
         parse_google_alerts_digest,
+        parse_linkedin_alert_cards,
         _sender_domain,
     )
 
@@ -293,16 +467,32 @@ def run_gmail_sync(db) -> List[Dict[str, Any]]:
         raise RuntimeError("Gmail is not connected. Add your OAuth client and connect first.")
 
     service = build_service(settings["client_id"], settings["client_secret"], settings["refresh_token"])
-    message_ids = list_message_ids(service)
 
     events: List[Dict[str, Any]] = []
     new_count = 0
-    for mid in message_ids:
+    seen_ids: set = set()
+
+    def process(mid: str) -> None:
+        nonlocal new_count
+        # A message can match both passes; pending rows are not query-visible with
+        # autoflush off, so dedupe within the run as well as against ProcessedEmail.
+        if mid in seen_ids:
+            return
+        seen_ids.add(mid)
         if db.query(ProcessedEmail).filter(ProcessedEmail.message_id == mid).first():
-            continue
+            return
         meta = fetch_message_metadata(service, mid)
         cls = classify_email(meta["subject"], meta["snippet"], meta["sender"])
         classification = cls["category"]
+        # A LinkedIn *message* notification relays a recruiter: a body-borne "next steps" must
+        # not become an interview event. Require the cue in the subject, or an existing link.
+        if (
+            classification in STATUS_EVENT_TYPES
+            and is_linkedin_message_sender(meta["sender"])
+            and not _STATUS_SUBJECT_CUE_RE.search(meta["subject"] or "")
+            and not _thread_is_linked(db, meta.get("thread_id") or "")
+        ):
+            classification = "job_alert"
         # A status event only becomes actionable once we can attach an employer. If no company
         # resolves (or it's not a status/job-alert email at all), do NOT mark it processed: a
         # later pattern fix should be able to re-evaluate it (issue #76 poisoned-dedup fix).
@@ -325,15 +515,28 @@ def run_gmail_sync(db) -> List[Dict[str, Any]]:
                     "snippet": meta["snippet"],
                     "sender": meta["sender"],
                     "date": meta["date"],
+                    # Attribution keys: the message id makes the decision a record, and the
+                    # thread id lets a follow-up inherit this application.
+                    "message_id": meta.get("id") or mid,
+                    "thread_id": meta.get("thread_id") or "",
                 })
                 processed = True
         elif classification == "job_alert":
             # Opportunities from alerts/recruiter digests — tracked even without an application.
             # Recruiter/JD outreach is body-borne, so fetch the full body (bounded) to score it.
             body = fetch_message_body(service, mid)
-            opportunities = parse_google_alerts_digest(
-                body or meta["snippet"], meta["subject"]
-            )
+            opportunities = []
+            if is_linkedin_alert_sender(meta["sender"]):
+                opportunities = parse_linkedin_alert_cards(
+                    body or meta["snippet"], meta["subject"], max_jobs=ALERT_DIGEST_MAX_JOBS
+                )
+            # The Google Alerts text parser only understands Google's own block format. Running
+            # it on an employer digest ("New jobs posted from careers.ey.com") invents rows from
+            # prose, so it is gated to the sender it was written for.
+            if not opportunities and is_google_alerts_sender(meta["sender"]):
+                opportunities = parse_google_alerts_digest(
+                    body or meta["snippet"], meta["subject"]
+                )
             if not opportunities:
                 extracted = extract_company_and_role_from_email_header(
                     meta["subject"], body or meta["snippet"], meta["sender"]
@@ -366,14 +569,60 @@ def run_gmail_sync(db) -> List[Dict[str, Any]]:
                     "snippet": (body or meta["snippet"])[:4000],
                     "sender": meta["sender"],
                     "date": meta["date"],
+                    # Attribution keys: the message id makes the decision a record, and the
+                    # thread id lets a follow-up inherit this application.
+                    "message_id": meta.get("id") or mid,
+                    "thread_id": meta.get("thread_id") or "",
                 })
                 processed = True
         if processed:
             db.add(ProcessedEmail(message_id=mid))
             new_count += 1
 
+    state = load_sync_state()
+    truncated_passes: List[str] = []
+    alerts_had_watermark = bool((state.get("alerts") or {}).get("after"))
+    matched = 0
+    per_pass: Dict[str, int] = {}
+    for pass_name, query, cap in (
+        ("status", build_status_query((state.get("status") or {}).get("after")), STATUS_MAX_MESSAGES),
+        ("alerts", build_alert_query((state.get("alerts") or {}).get("after")), ALERT_MAX_MESSAGES),
+    ):
+        ids = list_message_ids_for(service, query, cap)
+        per_pass[pass_name] = len(ids)
+        matched += len(ids)
+        for mid in ids:
+            process(mid)
+        # Advance the watermark only for a pass that ran to completion. A failure above raises
+        # before this point; a pass that hit its cap has not seen the rest of the window, so
+        # advancing would skip everything older than today permanently.
+        if len(ids) >= cap:
+            logger.warning(
+                f"Gmail {pass_name} pass hit its cap ({cap}); keeping the previous watermark so "
+                "the remainder of the window is read next run."
+            )
+            truncated_passes.append(pass_name)
+            continue
+        now = datetime.now(timezone.utc)
+        state[pass_name] = {"after": now.date().isoformat(), "synced_at": now.isoformat()}
+        save_sync_state(state)
+
     db.flush()
-    logger.info(f"Gmail API sync: {len(message_ids)} messages matched, {new_count} new processed, {len(events)} events.")
+    if stats is not None:
+        stats["messages_matched"] = matched
+        stats["new_processed"] = new_count
+        stats["status_messages_matched"] = per_pass.get("status", 0)
+        stats["alert_messages_matched"] = per_pass.get("alerts", 0)
+        # A first run that matches no alert mail means the query/scope is wrong, not that
+        # the mailbox is quiet: the caller uses this to decide on the browser fallback.
+        stats["alerts_had_watermark"] = alerts_had_watermark
+        # Passes that hit their cap: the caller can tell a complete window from a partial one.
+        stats["truncated_passes"] = truncated_passes
+    logger.info(
+        f"Gmail API sync: {matched} messages matched "
+        f"({per_pass.get('status', 0)} status/outreach, {per_pass.get('alerts', 0)} alerts), "
+        f"{new_count} new processed, {len(events)} events."
+    )
     return events
 
 
